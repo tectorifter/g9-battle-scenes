@@ -1,0 +1,23 @@
+{
+  "id": "g9-Battle-Scene",
+  "name": "g9-Battle-Scene",
+  "version": "0.1.0",
+  "api": 2,
+  "entry": "main.lua",
+  "profile": "content",
+  "game_version": ">=0.1.45",
+  "games": [
+    "gen2"
+  ],
+  "category": "GAMEPLAY",
+  "priority": 100,
+  "permissions": [
+    "engine_internals"
+  ],
+  "dependencies": [
+    "g9-battle-engine-beta"
+  ],
+  "optional_dependencies": [],
+  "description": "Fork of g2-Battle-Scene, tightly coupled to g9-battle-engine-beta -- unlike that mod (a standalone library, left untouched), this one owns no combat rules of its own at all. Turn resolution calls mod.exports.resolveTurnActions on g9-battle-engine-beta (STAB/Tera/Protect/damage/accuracy/sub-effects all live there, per the standing 'combat logic lives in g9-battle-engine-beta only' rule), while EXP/catch call the real native Gen 2 primitives (Battle:awardExperience, src/battle/gen2/Catching.lua) directly rather than a hand-ported copy. Same named battle-layout index (layouts/<name>.lua presets) and rendering as g2-Battle-Scene; a calling mod picks a preset by name and supplies the battler roster via mod.exports.pushLayoutBattle.",
+  "repo": ""
+}
