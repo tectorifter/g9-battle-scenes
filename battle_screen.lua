@@ -2268,10 +2268,7 @@ return function(mod)
       "g9-Battle-Scene: g9-battle-engine-beta not loaded or missing resolveTurnActions")
     local battle = buildBattle(game, data)
     local inst = Screen.new(game, world, data, combat, game.data, battle, g9dex)
-<<<<<<< HEAD
     lastScreen = inst
-=======
->>>>>>> ba85788952563b71704304209b1e035b3289e132
     world.battleActive = true
     local opts = { trainer = data.trainer }
     if world.playBattleMusic then world:playBattleMusic(opts) end
