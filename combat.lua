@@ -16,7 +16,20 @@ return function(mod)
   -- table here -- g9-battle-engine-beta owns real per-mon stat stages now
   -- (combat/showdown_primitives.lua's mon.volatile.boosts), not a
   -- parallel copy in this mod.
+  --
+  -- mon.multiSide, explicit user request (2026-08-28): tags the RAW mon
+  -- table itself (not just this wrapper) with its real side -- the one
+  -- real signal g9-battle-engine-beta's own N-way Battle:sideOf override
+  -- (combat/move_targeting.lua) reads to correctly classify a battler
+  -- beyond the primary pair, instead of the native hard-binary "not
+  -- battle.player therefore enemy" check that used to misclassify one.
+  -- Combat-only, not permanent: cleared on battle.ended
+  -- (battle_screen.lua's own listener), the same "own it, then clean it
+  -- up when combat ends" discipline this whole ability/status system
+  -- already uses (g9-battle-engine-beta's own naturalAbility/
+  -- stockpileLayers fields).
   function Combat.newBattler(mon, side)
+    if mon then mon.multiSide = side end
     return {
       mon = mon,
       side = side, -- "player" or "enemy"
