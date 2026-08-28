@@ -502,6 +502,18 @@ return function(mod)
   -- against an NPC trainer team where a downed mon sits out until the
   -- trainer sends the next one in.
   --
+  -- `shownHp` is the DISPLAYED hit points -- Screen:shownHpOf's chasing
+  -- value while a turn is being narrated, the live mon.hp otherwise (see
+  -- Screen:stepHpAnim's own header). Everything hp-derived in here reads
+  -- it rather than mon.hp: the bar's fill width, the bar's own green/
+  -- yellow/red palette (native keys that to the DISPLAYED bar too, for
+  -- the same reason -- src/ui/gen2/BattleState.lua:1161), the numeric
+  -- readout, AND the empty-slot test above. That last one matters: the
+  -- whole turn's damage is already committed to the real mons before the
+  -- first line of text shows (Screen:advanceResolving), so testing
+  -- mon.hp made a fainted battler's box wink out before its own "X
+  -- fainted!" line had even been announced.
+  --
   -- Line 1: name (shrunk to fit -- see drawScaledText/fitName) + "LvNN"
   -- + gender. Line 2: the real HP bar, unlabeled, 3px thick, stretched
   -- to nearly the box's own width -- and for the enemy, that's the
@@ -520,9 +532,18 @@ return function(mod)
   -- sizeMul: a plain multiplier on BOX_SCALE (1.0 = default; applied on
   -- top of BOX_SCALE, not instead of it, so the box's own established
   -- 47%-shrink baseline is unchanged when sizeMul is left at 1.0).
-  local function drawGuiBox(tx, ty, tw, th, battler, data, showNumeric, anchorRight, sizeMul)
+  local function drawGuiBox(tx, ty, tw, th, battler, data, showNumeric, anchorRight, sizeMul, shownHp)
     local mon = battler and battler.mon
-    if not mon or battler.fainted or (mon.hp or 0) <= 0 then return end
+    if not mon then return end
+    -- `battler.caught` is still checked by name (Screen:throwBall sets it
+    -- alongside .fainted on a mon that was caught at full health, so
+    -- "is its bar empty" would not catch that case), but .fainted itself
+    -- deliberately is not: it is set the instant resolution finishes,
+    -- which is exactly the beat this whole change exists to stop
+    -- trusting.
+    if battler.caught then return end
+    if shownHp == nil then shownHp = mon.hp or 0 end
+    if shownHp <= 0 then return end
 
     local effectiveScale = BOX_SCALE * (sizeMul or 1)
     local anchorX = anchorRight and ((tx + tw) * 8) or (tx * 8)
@@ -547,10 +568,10 @@ return function(mod)
     local barY = textY + 9
     local palettes = data and data.gen2Palettes
     if palettes then
-      drawHpFill(palettes, mon.hp, mon.maxHp, textX, barY, barW, barH)
+      drawHpFill(palettes, shownHp, mon.maxHp, textX, barY, barW, barH)
     end
     if showNumeric then
-      local label = string.format("%d/%d", mon.hp or 0, mon.maxHp or 0)
+      local label = string.format("%d/%d", shownHp, mon.maxHp or 0)
       drawScaledText(label, textX, barY + barH + 3, 0.75)
     end
 
@@ -589,7 +610,14 @@ return function(mod)
     -- real Battle instance's own opts.trainer (see buildBattle), not
     -- this flag.
     self.isTrainerBattle = payload.trainer ~= nil and payload.trainer ~= false
-    self.pendingMessages = {}
+    -- The turn's events, whole tables, NOT just their .text -- see
+    -- Screen:advanceResolving for why the rest of each event now matters.
+    self.pendingEvents = {}
+    -- The chasing HP the HUD actually draws, keyed by the real mon table
+    -- (see Screen:snapshotHp for why the mon and not the battler and not
+    -- the side). Screen:shownHpOf reads it; Screen:stepHpAnim walks it.
+    self.shownHp = {}
+    self.hpAnim = nil
     -- Read fresh from this mod's own active layout preset (layouts.lua)
     -- rather than baked in -- see that file's own header for the preset
     -- file shape/naming and how the active one is chosen.
@@ -613,8 +641,251 @@ return function(mod)
     -- guessed position. moveAnim is nil when nothing is playing.
     self.spriteAnchor = {}
     self.moveAnim = nil
+    self:installEventProbe()
     self:beginTurn()
     return self
+  end
+
+  ------------------------------------------------------------------
+  -- TURN PACING -- the display lags the resolution
+  --
+  -- The engine mod owns turn resolution and resolves the WHOLE turn in
+  -- one call (Combat.resolveTurn -> g9-battle-engine-beta's
+  -- mod.exports.resolveTurnActions, combat/turn_order.lua:298), so every
+  -- hit point this turn will ever cost is already gone from the real mon
+  -- tables before a single line of text is on screen. Nothing below
+  -- changes that -- splitting resolution per action is the ENGINE mod's
+  -- contract to change, not this one's, and the honest cost of faking it
+  -- from here (re-deriving priority/Speed/Trick Room/RNG order to feed
+  -- resolveTurnActions one actor at a time) is a second, silently
+  -- diverging copy of the exact math turn_order.lua's own header spends
+  -- fifty lines explaining why nobody should write. Rejected.
+  --
+  -- What changes instead is the DISPLAY: the HUD chases the real numbers
+  -- one narrated step at a time, which is what the cart does anyway.
+  -- native's own Gen 2 screen is built exactly this way and says so --
+  -- "The engine has already finished the whole turn's math by the time
+  -- the first message shows, so drawing mon.hp directly would spoil
+  -- every hit before its own line ran" (src/ui/gen2/BattleState.lua:435-
+  -- 440). This is that same shownHp chase, widened from two fixed sides
+  -- to an arbitrary roster.
+  --
+  -- ATTRIBUTION, the part that is not just a port. native keys its chase
+  -- off event.side, which cannot work here: Battle:sideOf is the hard
+  -- binary `(mon == self.player) and "player" or "enemy"`
+  -- (src/battle/gen2/Battle.lua:447-449), so in a bossFight (layouts/
+  -- bossFight.lua, allyCount = 4) every battler that is not literally
+  -- battle.player is tagged "enemy" and all four player bars would chase
+  -- one number. The engine mod hit the identical wall on the Speed side
+  -- and documented it (combat/turn_order.lua:258-272, "sideOf is a hard
+  -- binary ... corrupting stat-stage boosts across unrelated battlers").
+  -- Damage/heal events carry `hp` but no mon reference at all
+  -- (Battle.lua:1267-1271, :1327-1328), so there is nothing on the event
+  -- to key on and no repair to make short of patching the engine.
+  --
+  -- So this does not try to attribute anything. It records, at the
+  -- moment each event is EMITTED -- which is the moment its own hit
+  -- point cost has just landed and nothing after it has -- a snapshot of
+  -- every roster mon's hp. Attribution becomes unnecessary: the display
+  -- replays the whole HP vector, and whichever bars moved between one
+  -- event and the next are exactly the bars that animate. A spread move
+  -- that hits three battlers drains three bars at once, correctly, with
+  -- no per-event side tag existing anywhere.
+  --
+  -- Keyed by the real mon TABLE, not the battler wrapper: a switch
+  -- replaces self.playerBattlers[slot] with a brand new wrapper
+  -- (Screen:advanceResolving), so wrapper identity does not survive a
+  -- turn, while a mon table does.
+  ------------------------------------------------------------------
+
+  -- Every roster mon's hp, right now. Cheap enough to run per emitted
+  -- event: a turn emits tens of events and a roster is at most a
+  -- handful of mons.
+  function Screen:snapshotHp()
+    local snap = {}
+    for _, b in ipairs(self.enemyBattlers) do
+      if b.mon then snap[b.mon] = b.mon.hp or 0 end
+    end
+    for _, b in ipairs(self.playerBattlers) do
+      if b.mon then snap[b.mon] = b.mon.hp or 0 end
+    end
+    return snap
+  end
+
+  -- Shadows Battle:emit (Battle.lua:404-407) on THIS ONE INSTANCE only:
+  -- assigning the field raw on the battle table wins over the class
+  -- method the metatable would otherwise reach, so the shared engine
+  -- file is untouched and every other Battle in the process is
+  -- unaffected -- the same instance-only override technique
+  -- Screen:startMoveAnim already uses on an AnimRunner's object pool.
+  -- Safe to do blind: every event this mod ever sees goes through
+  -- battle:emit, confirmed by direct read of both the engine
+  -- (Battle.lua) and g9-battle-engine-beta (its combat/ and abilities/
+  -- files call battle:emit / self:emit and never push to battle.events
+  -- themselves), and nothing on either side reassigns battle.emit.
+  --
+  -- Also carries the attacker/defender through: Battle:useMove is where
+  -- the engine mod drives every action (turn_order.lua:325) and its
+  -- signature is (attacker, defender, moveId), so wrapping it names the
+  -- two battlers every event emitted underneath it belongs to. That is
+  -- the identity `side` cannot give -- used by Screen:startMoveAnimFor
+  -- to point a move animation at the right pair of sprites in a 4v1.
+  function Screen:installEventProbe()
+    local battle = self.battle
+    if not battle or self.eventProbeInstalled then return end
+    self.eventProbeInstalled = true
+    local screen = self
+    local baseEmit = battle.emit
+    if type(baseEmit) == "function" then
+      battle.emit = function(b, event)
+        if type(event) == "table" then
+          -- Never overwrite: an event handed back through emit twice
+          -- (nothing does today) must keep its FIRST, earliest snapshot.
+          if event.g9SceneHp == nil then event.g9SceneHp = screen:snapshotHp() end
+          if event.g9SceneActor == nil then
+            event.g9SceneActor = screen.probeAttacker
+            event.g9SceneTarget = screen.probeDefender
+          end
+        end
+        return baseEmit(b, event)
+      end
+    end
+    local baseUseMove = battle.useMove
+    if type(baseUseMove) == "function" then
+      battle.useMove = function(b, attacker, defender, moveId, ...)
+        local prevA, prevD = screen.probeAttacker, screen.probeDefender
+        screen.probeAttacker, screen.probeDefender = attacker, defender
+        -- pcall'd so a raise inside the engine's own pipeline cannot
+        -- leave the probe pointing at a stale pair for the rest of the
+        -- battle; the error is re-raised unchanged afterward. Safe to
+        -- wrap in a pcall specifically because nothing under useMove
+        -- yields -- checked, not assumed: neither src/battle/gen2/
+        -- Battle.lua nor g9-battle-engine-beta's combat/ uses coroutines
+        -- at all (switch_primitives.lua's own header explains why the
+        -- one place that wanted to could not).
+        local ok, a, bb, c = pcall(baseUseMove, b, attacker, defender, moveId, ...)
+        screen.probeAttacker, screen.probeDefender = prevA, prevD
+        if not ok then error(a, 0) end
+        return a, bb, c
+      end
+    end
+  end
+
+  -- The battler wrapper standing on a given mon table, or nil. Linear
+  -- over a roster that is never more than a handful long.
+  function Screen:battlerFor(mon)
+    if not mon then return nil end
+    for _, b in ipairs(self.playerBattlers) do
+      if b.mon == mon then return b end
+    end
+    for _, b in ipairs(self.enemyBattlers) do
+      if b.mon == mon then return b end
+    end
+    return nil
+  end
+
+  -- What the HUD draws for `mon`. Only the resolving phase lags: outside
+  -- it nothing is being narrated, so the live value is the honest one --
+  -- and it also means a Potion thrown from the BAG, a catch, or a switch
+  -- (all of which move hp with no event behind them) shows immediately
+  -- instead of needing its own snapshot plumbing.
+  function Screen:shownHpOf(mon)
+    if not mon then return 0 end
+    if self.phase ~= "resolving" then return mon.hp or 0 end
+    local shown = self.shownHp[mon]
+    if shown == nil then return mon.hp or 0 end
+    return shown
+  end
+
+  -- Seeds the chase from the live roster -- called once, at the top of a
+  -- resolution pass, BEFORE any of this turn's math has run.
+  function Screen:syncShownHp()
+    self.shownHp = {}
+    self.hpAnim = nil
+    self.hpAnimHolds = false
+    for mon, hp in pairs(self:snapshotHp()) do self.shownHp[mon] = hp end
+  end
+
+  -- Points the chase at `snapshot` (an event's g9SceneHp). A mon the
+  -- chase has never seen -- switched in mid-turn by a U-turn/Roar the
+  -- engine drove itself -- snaps rather than sliding in from a value
+  -- that was never on screen, the same way native snaps a bar on `send`
+  -- (src/ui/gen2/BattleState.lua:1545-1547).
+  function Screen:armHpAnim(snapshot)
+    if type(snapshot) ~= "table" then return end
+    local pending = nil
+    for mon, hp in pairs(snapshot) do
+      if self.shownHp[mon] == nil then
+        self.shownHp[mon] = hp
+      elseif self.shownHp[mon] ~= hp then
+        pending = pending or {}
+        pending[mon] = hp
+      end
+    end
+    self.hpAnim = pending
+  end
+
+  -- One frame of the chase, over every bar at once.
+  --
+  -- Step size is the cart's own, per mon: under 48 max HP the bar moves
+  -- one hit point a frame (_AnimateHPBar's ShortAnim_UpdateVariables);
+  -- from 48 up it moves one PIXEL a frame, i.e. maxHp/48 hit points
+  -- (LongAnim_UpdateVariables) -- engine/battle/anim_hp_bar.asm:42-82,
+  -- ported here off src/ui/gen2/BattleState.lua:1013-1039 rather than
+  -- reinvented as a seconds-based lerp, so a bar drains at exactly the
+  -- rate the native screen drains it at. Screen:update, like
+  -- BattleState:update(_dt) (:2113), ignores dt and runs once a frame,
+  -- so "a frame" means the same thing on both screens.
+  --
+  -- Widened from native's single anim.side to every mon with a pending
+  -- target, because a spread move legitimately drains several bars in
+  -- the same beat here and there is no reason to serialize them.
+  --
+  -- Returns true while it still had work, so the caller can hold the
+  -- message queue the way AnimateHPBar's own loop holds the cart
+  -- (BattleState.lua:2183-2185).
+  function Screen:stepHpAnim()
+    local pending = self.hpAnim
+    if not pending then return false end
+    local moved, remaining = false, false
+    for mon, target in pairs(pending) do
+      local shown = self.shownHp[mon]
+      if shown == nil then
+        self.shownHp[mon] = target
+      elseif shown ~= target then
+        local maxHp = mon.maxHp or (mon.stats and mon.stats.hp) or 0
+        local step = 1
+        if maxHp >= HpBar.LENGTH_PX then
+          step = math.max(1, math.ceil(maxHp / HpBar.LENGTH_PX))
+        end
+        if shown < target then
+          shown = math.min(target, shown + step)
+        else
+          shown = math.max(target, shown - step)
+        end
+        self.shownHp[mon] = shown
+        moved = true
+        if shown ~= target then remaining = true end
+      end
+    end
+    -- Cleared on the same frame the last hit point lands, so the hold
+    -- ends the instant the bars are honest again. Every walk above is a
+    -- clamped integer step of at least 1 toward a fixed target, so this
+    -- always terminates -- the chase cannot stall a battle even if an
+    -- event ever carried a nonsense number.
+    if not remaining then self.hpAnim = nil end
+    return moved
+  end
+
+  -- The escape hatch. Anything that can hold the queue has to be
+  -- skippable, or a bad snapshot is a hung battle with no way out --
+  -- so A/B during a drain finishes it on the spot instead of being
+  -- swallowed.
+  function Screen:snapHpAnim()
+    local pending = self.hpAnim
+    if not pending then return end
+    for mon, target in pairs(pending) do self.shownHp[mon] = target end
+    self.hpAnim = nil
   end
 
   -- Real vanilla battle-exit sequence, mirrored from World:startBattle's
@@ -1793,21 +2064,63 @@ return function(mod)
     self.moveQueue = moveActions
     self.movesResolved = false
     self.currentMessage = nil
-    self.pendingMessages = {}
+    self.pendingEvents = {}
     self.phase = "resolving"
+    -- Seeded BEFORE anything resolves, so the bars start this pass
+    -- showing what the player was looking at when they picked their
+    -- moves -- the whole point of the chase. Must come after
+    -- phase = "resolving": Screen:shownHpOf only lags in that phase.
+    self:syncShownHp()
     self:advanceResolving()
   end
 
+  -- Consumes the turn one VISIBLE step at a time. A step ends when
+  -- something changed on screen that the player is owed a look at:
+  -- either a new line of text, or a bar that has started moving.
+  --
+  -- Before this, the whole turn's events were flattened to their .text
+  -- and everything else on them thrown away, which is what left the
+  -- HUD showing the turn's final numbers from the very first frame.
+  -- Events are queued whole now and dequeued here in emit order, so a
+  -- textless damage/heal event -- of which there are many; the engine
+  -- emits the number separately from the line that explains it
+  -- (Battle.lua:1267-1292) -- becomes its own beat: it arms the drain
+  -- and leaves the line that CAUSED it standing while the bar moves.
+  -- That is the ordering the cart has ("X used TACKLE!" stays up while
+  -- the bar empties underneath it), and it falls out of emit order for
+  -- free rather than needing the events reordered or looked ahead at.
   function Screen:advanceResolving()
-    if #self.pendingMessages > 0 then
-      self.currentMessage = table.remove(self.pendingMessages, 1)
-      return
+    self.hpAnimHolds = false
+    while #self.pendingEvents > 0 do
+      local event = table.remove(self.pendingEvents, 1)
+      self:armHpAnim(event.g9SceneHp)
+      if event.kind == "move" then self:startMoveAnimFor(event) end
+      if event.text then
+        self.currentMessage = event.text
+        return
+      end
+      -- No text: whatever is already on screen stays there. Hold only
+      -- if this event actually moved a bar -- an event that is neither
+      -- seen nor heard is not a step, and making the player press A for
+      -- each one would turn a turn into a dozen empty presses.
+      if self.hpAnim then
+        self.hpAnimHolds = true
+        return
+      end
     end
     if #self.switchQueue > 0 then
       -- The newly-sent-out mon simply has no action queued of its own
       -- this turn, so it never gets to act again until next turn.
       local action = table.remove(self.switchQueue, 1)
       self.playerBattlers[action.actorSlot] = self.combat.newBattler(action.mon, "player")
+      -- The incoming mon has never been on this screen, so the chase has
+      -- no entry for it -- seed it at its real hp so its bar is right
+      -- from the "Go, X!" line onward. Without this it would fall
+      -- through to the live value anyway (Screen:shownHpOf's own
+      -- fallback), but only until the first snapshot that mentions it,
+      -- which would then slide the bar from wherever the fallback left
+      -- it rather than from where it was actually drawn.
+      self.shownHp[action.mon] = action.mon.hp or 0
       self.currentMessage = "Go, " .. displayName(action.mon) .. "!"
       return
     end
@@ -1830,11 +2143,15 @@ return function(mod)
       -- pipeline, not this mod's). This only translates its drained
       -- events into the existing message-pacing queue.
       --
-      -- Deferred, not carried over from g2-Battle-Scene: the WATER_GUN-
-      -- only move animation trigger. That gated on resolveAction's own
-      -- per-action success/failure signal, which collapsing to one
-      -- per-turn call no longer exposes per-action -- real future work,
-      -- not silently dropped without saying so.
+      -- The move animation trigger this comment used to record as
+      -- deferred ("gated on resolveAction's own per-action success/
+      -- failure signal, which collapsing to one per-turn call no longer
+      -- exposes per-action") is back, from a different seam: the
+      -- per-action signal was in the drained events all along, on the
+      -- `move` event the engine emits once per action that actually got
+      -- to run. Screen:startMoveAnimFor fires off it as the event is
+      -- dequeued, so the animation plays under its own announcement
+      -- rather than after the whole turn.
       local events = self.combat.resolveTurn(self.g9dex, self.battle, self.moveQueue)
       -- EXP: real native Battle:awardExperience, fired for each enemy
       -- newly fainted by the moves just resolved -- `.fainted` doubles
@@ -1871,13 +2188,16 @@ return function(mod)
         end
       end
       for _, e in ipairs(self.battle:takeEvents()) do events[#events + 1] = e end
+      -- Queued WHOLE, in emit order -- not flattened to .text any more.
+      -- Screen:installEventProbe has already stamped each one with the
+      -- HP vector as of its own emit, which is the entire reason the
+      -- bars can now lag the math they were spoiling.
       for _, event in ipairs(events) do
-        if event.text then self.pendingMessages[#self.pendingMessages + 1] = event.text end
+        self.pendingEvents[#self.pendingEvents + 1] = event
       end
-      if #self.pendingMessages > 0 then
-        self.currentMessage = table.remove(self.pendingMessages, 1)
-        return
-      end
+      -- Straight back to the top: movesResolved is already true, so this
+      -- cannot loop, and a proper tail call costs no stack.
+      return self:advanceResolving()
     end
     self:finishTurn()
   end
@@ -1902,9 +2222,98 @@ return function(mod)
     self:beginTurn()
   end
 
+  -- Three things can be holding a narrated turn, in the same priority
+  -- order native's own battle loop holds it in (src/ui/gen2/BattleState
+  -- .lua:2176-2185): a move animation owns the screen while it runs,
+  -- then the bar drain owns it, and only then does the line wait for a
+  -- button.
+  --
+  -- Every one of those holds is skippable with the SAME A/B the player
+  -- is already pressing, and none of them can outlast a press --
+  -- deliberately, because a hold that only ends on its own terms is a
+  -- hung battle with no way out the moment anything upstream misbehaves.
+  -- A press during a hold ends that hold and nothing else; it never also
+  -- eats the line underneath, so no message can be skipped unread.
   function Screen:updateResolving(input)
-    if input:wasPressed("a") or input:wasPressed("b") then
+    local pressed = input:wasPressed("a") or input:wasPressed("b")
+    -- Screen:update already stepped self.moveAnim this frame and cleared
+    -- it if the runner reported itself finished.
+    if self.moveAnim then
+      if pressed then self.moveAnim = nil end
+      return
+    end
+    if self.hpAnim then
+      if pressed then
+        self:snapHpAnim()
+      else
+        self:stepHpAnim()
+      end
+      if self.hpAnim then return end
+      -- The drain has landed. If it was the thing holding the queue --
+      -- a textless damage/heal beat, with the line that caused it still
+      -- on screen -- carry on to the next step by itself rather than
+      -- charging the player a press for a beat that had no line of its
+      -- own to read.
+      if self.hpAnimHolds then
+        self.hpAnimHolds = false
+        self:advanceResolving()
+      end
+      return
+    end
+    if pressed then
       self:advanceResolving()
+    end
+  end
+
+  -- Plays the real Gen 2 move animation for a dequeued `move` event.
+  --
+  -- This is the trigger Screen:advanceResolving's own header used to say
+  -- was "deferred, not carried over from g2-Battle-Scene ... real future
+  -- work, not silently dropped": startMoveAnim itself was already
+  -- written and already wired into Screen:update/Screen:drawContent, and
+  -- only the call was missing, because collapsing to one whole-turn
+  -- resolveTurnActions call left nothing per-action to hang it off. The
+  -- events were always that per-action signal; nothing was reading them.
+  --
+  -- Fires on the `move` event, which IS the "X used Y!" line, so the
+  -- animation plays under its own announcement the way the cart's does.
+  -- A move that missed or failed plays nothing: the engine keeps that
+  -- event around specifically so the miss paths can mark it
+  -- (Battle.lua:1370, :1470-1478), because
+  -- BattleCommand_MoveAnimNoSub opens on `ld a, [wAttackMissed] / and a
+  -- / jp nz, BattleCommand_MoveDelay` (engine/battle/effect_commands
+  -- .asm:1958) and burns the delay instead. Same gate the native screen
+  -- uses (src/ui/gen2/BattleState.lua:1753). The whole turn has already
+  -- resolved by the time this event is dequeued, so `.missed` is final.
+  --
+  -- Not carried through, and not pretended otherwise: event.animParam
+  -- (Battle.lua:1591, FLY/DIG's charge frame) and event.effectiveness,
+  -- both of which the native screen feeds its own animForMove.
+  -- Screen:startMoveAnim hardcodes param = 0 and has no hit-sound path
+  -- at all, so there is nothing here to hand them to yet.
+  --
+  -- Both battlers come from the probe, not from event.side: side is the
+  -- hard player/enemy binary that cannot name one of four allies (see
+  -- the TURN PACING header). Screen:startMoveAnim needs real battler
+  -- WRAPPERS -- it reads .side for the animation's own turn flag and
+  -- indexes self.spriteAnchor by wrapper -- so both are mapped back
+  -- through Screen:battlerFor. No attacker, no animation: guessing which
+  -- sprite to throw a Water Gun from is worse than throwing none.
+  function Screen:startMoveAnimFor(event)
+    if not (event and event.move) or event.missed then return end
+    local actor = self:battlerFor(event.g9SceneActor)
+    if not actor then return end
+    local target = self:battlerFor(event.g9SceneTarget)
+    -- pcall'd for the same reason every other art/data lookup on this
+    -- screen is: a missing or malformed animation script is a battle
+    -- that plays no animation, never a battle that crashes.
+    local ok, err = pcall(function()
+      self:startMoveAnim({ id = event.move }, actor, target)
+    end)
+    if not ok then
+      self.moveAnim = nil
+      mod.log:warn("g9_Battle_Scene: move animation for %s failed: %s",
+        tostring(event.move), tostring(err))
     end
   end
 
@@ -1974,7 +2383,8 @@ return function(mod)
     for i, battler in ipairs(self.enemyBattlers) do
       local gx, gy = self:pos("enemyGui" .. i, 0, (i - 1) * GUI_STACK_TY)
       local gs = self:sizeMul("enemyGui" .. i)
-      drawGuiBox(gx, gy, GUI_TW, ROW_H, battler, self.data, false, false, gs)
+      drawGuiBox(gx, gy, GUI_TW, ROW_H, battler, self.data, false, false, gs,
+        self:shownHpOf(battler.mon))
 
       local slotW = SPRITE_ZONE_TW / #self.enemyBattlers
       local sx, sy = self:pos("enemySprite" .. i, enemyZoneTx + (i - 1) * slotW, 0)
@@ -1992,7 +2402,8 @@ return function(mod)
 
       local gx, gy = self:pos("playerGui" .. i, GUI_RIGHT_TX, ROW_H + (i - 1) * GUI_STACK_TY)
       local gs = self:sizeMul("playerGui" .. i)
-      drawGuiBox(gx, gy, GUI_TW, ROW_H, battler, self.data, true, true, gs)
+      drawGuiBox(gx, gy, GUI_TW, ROW_H, battler, self.data, true, true, gs,
+        self:shownHpOf(battler.mon))
     end
 
     -- Move animation, on top of every sprite/GUI box but under F/E (so
