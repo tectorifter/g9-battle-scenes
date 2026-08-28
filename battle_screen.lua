@@ -1734,7 +1734,39 @@ return function(mod)
       self.game.save.party[#self.game.save.party + 1] = target.mon
       self.overMessage = "Gotcha! " .. name .. " was caught!"
     else
-      self.overMessage = "Gotcha! " .. name .. " was caught! Party's full -- no PC yet."
+      -- A full party sends the catch to the CURRENT BOX, the same as
+      -- `.SendToPC` / `predef SendMonIntoBox` (item_effects.asm:548-550, 604)
+      -- and the same as native's own pushCaught
+      -- (src/ui/gen2/BattleState.lua:2882-2900).
+      --
+      -- This used to say "no PC yet" and then drop the mon on the floor: the
+      -- message claimed a catch, the battle recorded `outcome = "caught"`,
+      -- and nothing was ever written anywhere.  A player who caught something
+      -- with six in the party simply lost it.
+      --
+      -- Inserted at the HEAD, not appended, because SendMonIntoBox's species
+      -- loop cascades every existing entry one slot down (move_mon.asm:954-965)
+      -- so the catch lands in slot 1.  Boxes.deposit is deliberately NOT used:
+      -- that is the PC's own party-to-box move and carries the last-healthy-mon
+      -- and mail refusals, which have nothing to do with a capture.
+      local okBox = pcall(function()
+        local Boxes = require("src.core.gen2.Boxes")
+        local save = self.game.save
+        local index = math.max(1, math.min(Boxes.NUM_BOXES,
+          math.floor(tonumber(save.currentBox) or 1)))
+        local box = Boxes.box(save, index)
+        table.insert(box, 1, target.mon)
+        -- SendMonIntoBox refills the boxed slot's PP before it closes SRAM
+        -- (move_mon.asm:1062-1063).
+        if type(Boxes.enterBox) == "function" then Boxes.enterBox(target.mon) end
+        self.overMessage = "Gotcha! " .. name .. " was caught! It was sent to "
+          .. (Boxes.name and Boxes.name(save, index) or "the PC") .. "."
+      end)
+      if not okBox then
+        -- Said honestly rather than claiming a catch that did not happen.
+        self.overMessage = "Gotcha! " .. name
+          .. " was caught! ...but the PC could not be reached."
+      end
     end
     self.outcome = "caught"
     self.phase = "over"
