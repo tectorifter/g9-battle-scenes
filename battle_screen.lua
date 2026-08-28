@@ -362,6 +362,28 @@ return function(mod)
     end
     local img = path and loadSprite(path)
     if not img then return nil end
+    -- Animated art arrives through a SECOND seam: pokemon.sprite above picks
+    -- the file, battle.mon_pic swaps the current frame into the image on its
+    -- way to the screen -- which is why a sprite mod's animated sets showed
+    -- here as a still first frame. An animator keys its clock off the battler
+    -- it is handed and advances on its own, so raising this once per draw is
+    -- the whole of it; there is no tick to run here.
+    if Runtime.wantsHook("battle.mon_pic") then
+      local pctx = {
+        species = mon.species,
+        side = (spriteField == "spriteBack") and "back" or "front",
+        mon = mon,
+        battler = battler,
+        -- Only `.data` is read off this (an animator uses it to find the
+        -- species' battle-scale fields), and drawSprite is handed that
+        -- data already -- so this carries the real table rather than
+        -- reaching for a screen `self` that is not in scope here.
+        battle = data and { data = data } or nil,
+      }
+      local ok, swapped = pcall(Runtime.call, "battle.mon_pic",
+        function(value) return value end, img, pctx)
+      if ok and swapped then img = swapped end
+    end
     local iw, ih = img:getDimensions()
     local scale = (SPRITE_BOX * (sizeMul or 1)) / math.max(iw, ih)
     local dw, dh = iw * scale, ih * scale
