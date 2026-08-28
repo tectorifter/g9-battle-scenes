@@ -148,6 +148,36 @@ return function(mod)
   -- nothing since the moment this mod was created.
   local CUSTOM_BUTTON_EVENT = "mod.g9-Battle-Scene.customButton"
 
+  -- Two-choice prompt: the phase name plus the live-screen registry the
+  -- exports resolve against. Both declared HERE, at module scope, rather
+  -- than beside the prompt section itself (search "TWO-CHOICE PROMPT"
+  -- below, where every function that uses them lives) for one concrete
+  -- Lua reason: Screen:finishBattleExit is defined ~500 lines above that
+  -- section and has to clear liveScreen, and a local declared after a
+  -- function that names it is not captured as an upvalue at all -- the
+  -- function would silently read/write a GLOBAL of the same name instead.
+  --
+  -- Namespaced with this mod's own id so it can never collide with one of
+  -- this screen's own phase strings, including one added later. Nothing
+  -- outside the prompt section should compare against it --
+  -- mod.exports.battleChoiceActive is the supported query.
+  local PROMPT_PHASE = "g9-Battle-Scene:prompt"
+  -- The Screen instance currently on the stack, so a caller holding only
+  -- a Battle (which is all any battle.* event payload hands it) can still
+  -- raise a prompt. Written by pushDoubleBattleScreen, cleared by
+  -- Screen:finishBattleExit. A single upvalue is safe here in a way it
+  -- was NOT for the sibling mod's native-screen version of this feature:
+  -- that one wrote its live screen from a permanently-installed class
+  -- wrap belonging to the FIRST run of the file, so a mod reload left the
+  -- wrap writing run 1's upvalue while run 2's exports read run 2's. This
+  -- file installs no wrap -- pushDoubleBattleScreen is re-registered by
+  -- the same run that declares this local, so the writer and the readers
+  -- are always the same generation. The honest cost of a reload mid-
+  -- battle is that the in-flight screen (a run-1 object, carrying run-1
+  -- methods) is invisible to run 2's registry, which is correct: it is
+  -- genuinely a different object graph.
+  local liveScreen = nil
+
   -- Plain data, read fresh once per battle (Screen.new) from this mod's
   -- own settings.lua at its root -- never cached across battles (same
   -- reasoning as layouts.lua's own loadLayoutFile: a stale positive read
@@ -643,6 +673,13 @@ return function(mod)
   function Screen:finishBattleExit()
     if self.exited or not self.world then return end
     self.exited = true
+    -- Deregister BEFORE anything else: from this point on the screen is
+    -- being torn down, so mod.exports.askBattleChoice(battle_or_nil, ...)
+    -- must stop resolving to it rather than park a question on a screen
+    -- that is one frame from being popped. Guarded by identity, not set
+    -- to nil unconditionally -- a stale screen's own late exit must never
+    -- deregister a NEWER battle that has already claimed the slot.
+    if liveScreen == self then liveScreen = nil end
     self.world.battleActive = nil
     -- WildBattleScript's reloadmapafterbattle: only a wild fight sets
     -- this (a trainer rematch has its own, separate cooldown handling
@@ -1923,6 +1960,273 @@ return function(mod)
   end
 
   ------------------------------------------------------------------
+  -- TWO-CHOICE PROMPT -- a PRIMITIVE any mod can raise on this screen,
+  -- deliberately not a policy. The caller supplies the question, the two
+  -- labels and a callback; nothing below knows or cares which species,
+  -- HP threshold, trainer class or story flag made the question worth
+  -- asking. Baking one consumer's trigger rule in here would impose that
+  -- rule on every other consumer, which is exactly the mistake this mod
+  -- already refuses to make everywhere else (layouts.lua's own header:
+  -- "this mod never builds the roster itself"; this file's own: it owns
+  -- no encounter-trigger logic at all).
+  --
+  -- The motivating case -- a boss at its 1 HP last stand offering
+  -- "CATCH it" / "LEAVE it", with BOTH answers ending the battle -- is
+  -- implementable entirely as a CALLER, and is deliberately not in this
+  -- file. Its two answers reach for two methods this screen already had
+  -- before this feature existed, both public on the instance handed to
+  -- the callback:
+  --   * catch  -> screen:throwBall(ballId), which runs the real native
+  --     formula (Catching.attempt calls battle:caught(mon) itself) and
+  --     sets self.outcome="caught" / self.phase="over" on success.
+  --   * leave  -> screen:chooseMenuItem("RUN"), which sets
+  --     self.outcome="run", calls self:finishBattleExit() and pops.
+  --
+  -- REJECTED: adding answerWithCatch/answerWithRun helpers to this API.
+  -- They would be exactly one line each, and each one is a POLICY
+  -- decision (which ball? which enemy? is running even allowed here?)
+  -- dressed up as a primitive -- the first consumer that wants an ULTRA
+  -- BALL, or a third answer, or a catch that does not end the battle,
+  -- would need the helper widened or bypassed. The two methods are
+  -- already public and already documented above; a helper would add
+  -- surface without adding capability. The API reports the answer and
+  -- gets out of the way.
+  --
+  -- REJECTED: a separate battle_prompt.lua sibling file (the shape the
+  -- sibling mod's own native-screen version of this feature takes, see
+  -- Gen9Dex combat/battle_prompt.lua). That one had to be a separate
+  -- file because it works by WRAPPING a class it does not own. This
+  -- screen is ours: the prompt is a phase, and a phase here means a
+  -- branch in Screen:update's own dispatch chain and two branches in
+  -- Screen:drawContent's own F/E chains, plus reads of self.fTextX/
+  -- fChars/eTextX. Splitting it out would mean publishing the Screen
+  -- class table purely so another file could reach back into it -- a
+  -- bigger structural change than the feature, for no isolation gain.
+  -- It lives beside gimmickSelect, the phase it is most like.
+  --
+  -- Built in this screen's ONE input idiom, the one Screen:
+  -- chooseMenuItem's own header already names -- "a cursor over a list,
+  -- A confirms, B cancels" -- and drawn in this screen's own vanilla
+  -- text-box-plus-menu split: the question wraps into F exactly the way
+  -- a resolving message does, the two labels sit in E exactly the way
+  -- FIGHT/BAG/PKMN/RUN do, same 11px rows and same cursor column
+  -- (Screen:drawActionMenuEList). No second input style, no second
+  -- chrome.
+  --
+  -- REJECTED: the sibling mod's "hold the question for one A/B press
+  -- before the box opens" step. That mirrors native BattleState's own
+  -- messageTimer, which five engine ask-* prompts key off and which this
+  -- screen has no equivalent of at all -- every one of this screen's own
+  -- list phases (moveSelect, targetSelect, gimmickSelect) is live on the
+  -- frame it opens, and a prompt that needed an extra press first would
+  -- be the odd one out here rather than the familiar one.
+  ------------------------------------------------------------------
+
+  -- The only two phases a prompt may interrupt, both quiescent by
+  -- definition: "actionMenu" is this screen parked on FIGHT/BAG/PKMN/RUN
+  -- waiting for the player, "resolving" is the message pump waiting for
+  -- an A/B between lines. Everything else is excluded for a real reason,
+  -- not by omission:
+  --   * moveSelect/targetSelect/gimmickSelect -- the player is already
+  --     mid-question with their own cursor state; interrupting one with
+  --     a second question is the rudeness this file would be adding.
+  --   * submenu -- Gen2PackMenu/Gen2PartyMenu is on top of the stack and
+  --     owns update() entirely (StateStack only updates its top state,
+  --     see Screen:update's own note), so this screen would not even be
+  --     running the frame the box was supposed to appear.
+  --   * over -- terminal: the outcome is already decided and overMessage
+  --     is already on screen. A pending prompt that reaches this is
+  --     DROPPED with a log, never answered with an invented index (see
+  --     Screen:promotePendingPrompt).
+  local PROMPT_INTERRUPTIBLE = { actionMenu = true, resolving = true }
+
+  -- Same 11px rows and same cursor column drawActionMenuEList uses --
+  -- referenced by name rather than repeated as a literal so the prompt
+  -- can never drift out of alignment with the action menu it sits in
+  -- place of.
+  local PROMPT_ROW_GAP = 11
+  local PROMPT_LABEL_INSET = 10
+
+  -- "The screen owns this frame for something the player is watching."
+  -- Only moveAnim qualifies: Screen:update steps it independently of
+  -- phase (its own note: an animation keeps stepping underneath the
+  -- message text), so promoting mid-animation would drop a question over
+  -- a move still playing out. suppressInputFrame is in here too because
+  -- it means a native sub-menu popped back THIS frame and the physical
+  -- press that closed it has not been consumed yet -- see Screen:
+  -- openBag's own header for the double-pop bug that flag exists for.
+  function Screen:promptBusy()
+    return self.moveAnim ~= nil or self.suppressInputFrame == true
+  end
+
+  -- raise() writes exactly ONE field of the screen, self.phase, which is
+  -- what makes restore() below trivially its exact inverse. The question
+  -- text and the labels live on the record, and drawPromptF/drawPromptE
+  -- read them from there -- deliberately NOT staged through self.message
+  -- / self.currentMessage, which would displace a line the player has
+  -- not read yet and give restore() three fields to get right instead of
+  -- one. While the prompt is up, F and E are drawn entirely by the two
+  -- prompt draws, so nothing else is competing for them anyway.
+  function Screen:raisePrompt(ask)
+    ask.savedPhase = self.phase
+    self.prompt = ask
+    self.phase = PROMPT_PHASE
+    -- The same guard every callback in this file that hands control back
+    -- to this screen sets (openBag/openSwitchMenu's own onClose/onChoose
+    -- closures): the press that CAUSED the prompt -- the A that advanced
+    -- a resolving message into the listener that asked -- must not also
+    -- be readable as the press that ANSWERS it. One skipped frame, the
+    -- house fix for exactly this class of bug.
+    self.suppressInputFrame = true
+  end
+
+  function Screen:restorePrompt(ask)
+    self.phase = ask.savedPhase
+  end
+
+  -- Restore FIRST, then call onAnswer -- chosen deliberately over its
+  -- inverse ("call, then restore only if the callback did not move the
+  -- phase"). Restoring first means:
+  --   * a callback that ends the battle (screen:throwBall(...),
+  --     screen:chooseMenuItem("RUN")) simply writes over a phase that
+  --     was already valid, and needs no cooperation from this file;
+  --   * a callback that does nothing leaves the battle exactly where the
+  --     question interrupted it;
+  --   * a callback that THROWS still cannot strand the battle, because
+  --     the screen was already back in a phase Screen:update dispatches
+  --     before the callback ever ran. The inverse ordering has no such
+  --     guarantee -- it would have to inspect self.phase after an error
+  --     to work out what the callback half-did, which is unknowable.
+  -- The pcall is the same "a broken consumer degrades to a warning, not
+  -- a broken battle" contract this file already applies to every other
+  -- foreign call it makes (Screen:enterGimmickSelect pcalls every single
+  -- battle_forms entry point).
+  function Screen:answerPrompt(index)
+    local ask = self.prompt
+    if ask == nil then return end
+    self.prompt = nil
+    self:restorePrompt(ask)
+    self.suppressInputFrame = true
+    local ok, err = pcall(ask.onAnswer, index, self, ask.request)
+    if not ok then
+      mod.log:warn("g9_Battle_Scene: battle prompt %s onAnswer(%d) errored: %s",
+        tostring(ask.id), index, tostring(err))
+    end
+  end
+
+  function Screen:updatePrompt(input)
+    local ask = self.prompt
+    -- WATCHDOG. The phase is set but the record is not -- reachable only
+    -- via a bug in this file or another mod writing self.phase directly.
+    -- Screen:update's dispatch chain has no trailing else and
+    -- drawContent's F/E chains have no default branch, so an unhandled
+    -- phase here is not merely undrawn, it is a hard softlock: no input
+    -- is read and no queue advances, forever, with the battle still on
+    -- screen. Recovered into beginTurn rather than into a bare
+    -- self.phase="actionMenu": enterActionMenu reads self.turnSlots[self
+    -- .slotPtr], which after a mid-resolution strand is past the end of
+    -- the array, so actingSlotIdx would be nil and the first FIGHT would
+    -- index playerBattlers[nil]. beginTurn rebuilds turnSlots from the
+    -- live roster and falls through to beginResolving when nobody can
+    -- act, so it is valid from ANY state -- the price is re-picking this
+    -- turn's actions, which is the right price for an impossible state.
+    if ask == nil then
+      mod.log:warn("g9_Battle_Scene: recovered a stranded battle-prompt phase")
+      self:beginTurn()
+      return
+    end
+    if input:wasPressed("b") then
+      -- B answers rather than being swallowed, matching every other
+      -- two-option box in the games. A caller that genuinely must not be
+      -- escaped passes cancel=false, and B then does nothing at all --
+      -- the prompt is still answerable, only not dismissable.
+      if ask.cancel then self:answerPrompt(ask.cancel) end
+      return
+    end
+    if input:wasPressed("a") then
+      self:answerPrompt(ask.index)
+      return
+    end
+    -- Exactly two rows, so every direction is the same toggle: there is
+    -- only ever one other place to be. The same shortcut Screen:
+    -- updateGimmickSelect takes over its own fixed 2x2 ("row = row == 1
+    -- and 2 or 1"), and left/right are accepted for the same reason it
+    -- accepts them -- a player who nudges the stick sideways at a
+    -- two-option box means "the other one", not "nothing".
+    if input:wasPressed("up") or input:wasPressed("down")
+        or input:wasPressed("left") or input:wasPressed("right") then
+      ask.index = ask.index == 1 and 2 or 1
+    end
+  end
+
+  -- F: the question, wrapped to F's own real interior width exactly the
+  -- way a resolving message is (drawWrapped, self.fChars) -- so a long
+  -- question degrades to more lines, never to text running past the box
+  -- border. Both draws no-op on a nil record so the one frame between a
+  -- stranded phase and the watchdog clearing it draws an empty box
+  -- rather than erroring inside love.graphics.
+  function Screen:drawPromptF()
+    local ask = self.prompt
+    if not ask then return end
+    drawWrapped(ask.text, self.fTextX, self.fTextY, self.fChars)
+  end
+
+  -- E: the two labels where FIGHT/BAG/PKMN/RUN normally sit, same rows,
+  -- same cursor column. Truncated through fitName (glyph advances, not
+  -- byte count) against the same E_INTERIOR_W-10 budget the CUSTOM
+  -- button's own arbitrary user text already uses -- an over-long label
+  -- clips instead of running past E's border, and neither the box nor
+  -- the cursor moves under it.
+  function Screen:drawPromptE()
+    local ask = self.prompt
+    if not ask then return end
+    for i = 1, 2 do
+      local label = fitName(ask.choices[i], E_INTERIOR_W - PROMPT_LABEL_INSET, 0)
+      Font.draw(label, self.eTextX + PROMPT_LABEL_INSET,
+        self.eTextY + (i - 1) * PROMPT_ROW_GAP)
+    end
+    Font.drawCode(CURSOR_CODE, self.eTextX, self.eTextY + (ask.index - 1) * PROMPT_ROW_GAP)
+  end
+
+  -- Promotion runs at the TAIL of Screen:update, after the phase
+  -- dispatch, never before it. The dispatch is what settles self.phase
+  -- for this frame, so asking first would test last frame's screen -- and
+  -- the motivating consumer asks from INSIDE the dispatch (a listener
+  -- firing during resolveTurnActions, which runs inside updateResolving),
+  -- so promoting afterwards puts the box up on the very same frame the
+  -- question was asked instead of one frame later.
+  --
+  -- REJECTED: waiting for the resolving message queue to drain before
+  -- promoting, so the interrupted line gets read first. It sounds
+  -- politer and is actually worse: the queue does not drain into an idle
+  -- "resolving", it drains into finishTurn, which for a turn that ended
+  -- the battle goes straight to "over" -- and a prompt whose whole
+  -- premise is "this mon is down to its last" would then be dropped for
+  -- being too late, every time, which is the one case the feature
+  -- exists for. Displacing the current line and putting it back verbatim
+  -- afterwards (restorePrompt leaves self.currentMessage untouched, so
+  -- the very next resolving frame redraws the same line) costs the
+  -- player one extra A press and never loses the question.
+  function Screen:promotePendingPrompt()
+    local pending = self.pendingPrompt
+    if pending == nil then return end
+    if self.exited or self.phase == "over" then
+      -- Dropped with a log rather than answered with a synthetic index:
+      -- a caller cannot tell a real answer from an invented one, and
+      -- "CATCH it" fired at a battle that is already over is worse than
+      -- silence. mod.exports.battleChoiceActive is how a caller checks.
+      self.pendingPrompt = nil
+      mod.log:warn("g9_Battle_Scene: battle prompt %s dropped, battle ended first",
+        tostring(pending.id))
+      return
+    end
+    if PROMPT_INTERRUPTIBLE[self.phase] and not self:promptBusy() then
+      self.pendingPrompt = nil
+      self:raisePrompt(pending)
+    end
+  end
+
+  ------------------------------------------------------------------
   -- dispatch
   ------------------------------------------------------------------
   function Screen:update(dt)
@@ -1935,7 +2239,23 @@ return function(mod)
     end
 
     local input = self.game.input
-    if not input then return end
+    if not input then
+      -- No input device at all (a headless boot, a test harness) can
+      -- never answer a question, so a prompt that is up here would hold
+      -- the battle open forever. Answered with its own cancel index --
+      -- what a player who refuses to engage with the box would press --
+      -- rather than left hanging or dropped silently. A prompt raised
+      -- with cancel=false has no such answer, so it falls back to the
+      -- row the cursor is actually on, which is the only other honest
+      -- reading of "nobody can press anything".
+      if self.phase == PROMPT_PHASE and self.prompt then
+        local ask = self.prompt
+        mod.log:warn("g9_Battle_Scene: battle prompt %s answered %d, no input device",
+          tostring(ask.id), ask.cancel or ask.index)
+        self:answerPrompt(ask.cancel or ask.index)
+      end
+      return
+    end
     -- See Screen:openBag's own note: the frame right after a native
     -- sub-menu (Gen2PackMenu/Gen2PartyMenu) pops back to this screen
     -- skips input entirely, so the same physical B/A press that closed
@@ -1952,6 +2272,7 @@ return function(mod)
     elseif self.phase == "moveSelect" then self:updateMoveSelect(input)
     elseif self.phase == "targetSelect" then self:updateTargetSelect(input)
     elseif self.phase == "gimmickSelect" then self:updateGimmickSelect(input)
+    elseif self.phase == PROMPT_PHASE then self:updatePrompt(input)
     elseif self.phase == "resolving" then self:updateResolving(input)
     elseif self.phase == "over" then self:updateOver(input)
     -- "submenu": Gen2PackMenu/Gen2PartyMenu is on top of the stack and
@@ -1959,6 +2280,12 @@ return function(mod)
     -- this branch is never actually reached while that's true, kept
     -- only so an unexpected extra frame here is a no-op, not an error.
     end
+
+    -- After the dispatch, never before it -- see Screen:
+    -- promotePendingPrompt's own header for why, and for why this is the
+    -- one placement that lets a question asked from inside the dispatch
+    -- (the motivating case) appear on the same frame it was asked.
+    self:promotePendingPrompt()
   end
 
   function Screen:drawContent()
@@ -2037,6 +2364,8 @@ return function(mod)
         self:drawTargetSelect()
       elseif self.phase == "gimmickSelect" then
         self:drawGimmickSelect()
+      elseif self.phase == PROMPT_PHASE then
+        self:drawPromptF()
       elseif self.phase == "resolving" then
         drawWrapped(self.currentMessage or "", self.fTextX, self.fTextY, self.fChars)
       elseif self.phase == "over" then
@@ -2048,7 +2377,13 @@ return function(mod)
       love.graphics.setColor(1, 1, 1, 1)
       drawBoxNoGap(ex, ey, E_TW, BOTTOM_H)
       love.graphics.setColor(0, 0, 0, 1)
-      if self.phase == "actionMenu" then self:drawActionMenuE() end
+      -- The prompt's two labels go where FIGHT/BAG/PKMN/RUN normally sit
+      -- -- the same vanilla text-box-plus-menu split this box exists for
+      -- (see drawContent's own note above), so a question reads as the
+      -- action menu temporarily offering two different actions rather
+      -- than as a foreign box dropped on the field.
+      if self.phase == "actionMenu" then self:drawActionMenuE()
+      elseif self.phase == PROMPT_PHASE then self:drawPromptE() end
     end)
   end
 
@@ -2151,6 +2486,13 @@ return function(mod)
       "g9-Battle-Scene: g9-battle-engine-beta not loaded or missing resolveTurnActions")
     local battle = buildBattle(game, data)
     local inst = Screen.new(game, world, data, combat, game.data, battle, g9dex)
+    -- Registered here rather than inside Screen.new: the constructor also
+    -- runs for a screen that never reaches the stack (a transition that
+    -- refuses, a caller building one to inspect), and a registry entry
+    -- means "mod.exports.askBattleChoice may aim a question at this",
+    -- which is only true of a screen actually being played. Cleared by
+    -- Screen:finishBattleExit.
+    liveScreen = inst
     world.battleActive = true
     local opts = { trainer = data.trainer }
     if world.playBattleMusic then world:playBattleMusic(opts) end
@@ -2162,5 +2504,161 @@ return function(mod)
     return inst
   end
 
-  mod.log:info("g9_Battle_Scene: battle_screen installed")
+  ------------------------------------------------------------------
+  -- TWO-CHOICE PROMPT: the public API. See the "TWO-CHOICE PROMPT"
+  -- section above for the design and for what was rejected.
+  ------------------------------------------------------------------
+
+  -- `target` may be this mod's own battle Screen (what the callback is
+  -- handed, and what pushLayoutBattle/pushDoubleBattleScreen return), a
+  -- native Battle model (what every battle.* event payload carries -- a
+  -- listener holds the model and never the screen), or nil for "whatever
+  -- battle is on screen".
+  --
+  -- A Battle resolves ONLY while it is the one actually being played:
+  -- aiming a question at a backgrounded or finished battle and having it
+  -- land on the live screen would put the box on the wrong fight, which
+  -- is worse than refusing.
+  local function resolvePromptTarget(target)
+    if target == nil then return liveScreen end
+    if type(target) == "table" and getmetatable(target) == Screen then return target end
+    if liveScreen ~= nil and liveScreen.battle == target then return liveScreen end
+    return nil
+  end
+
+  -- askBattleChoice(target, request) -> true | false, reason
+  --
+  --   target   this mod's battle Screen, a Battle, or nil (see above).
+  --   request  { text     = "ETERNATUS is barely standing!",  -- required
+  --              choices  = { "CATCH it", "LEAVE it" },       -- required, 2
+  --              onAnswer = function(index, screen, request) end, -- required
+  --              default  = 1,      -- optional, row the cursor opens on
+  --              cancel   = 2,      -- optional, index B answers with;
+  --                                 -- false makes B inert
+  --              id       = "..." } -- optional, appears in this mod's logs
+  --
+  -- onAnswer receives the 1-based index of the chosen label, the Screen,
+  -- and the caller's own request table back, and is called with the
+  -- battle ALREADY restored to the phase the question interrupted. That
+  -- is the whole contract: the answer is reported and the callback does
+  -- whatever it wants with a screen that is in a valid, running state --
+  -- nothing, or something that ends the battle. Both real endings are
+  -- one public method call, and neither is wrapped in a helper here (the
+  -- section header explains why):
+  --
+  --   screen:throwBall("POKE_BALL")   -- real native Catching.attempt;
+  --       on a catch it files the mon, sets outcome="caught" and moves
+  --       to "over" (the player presses A and the screen pops); on a
+  --       break-free it consumes the acting slot's action and resolves
+  --       the turn, exactly as a ball thrown from the BAG would. Note it
+  --       does NOT re-check Screen:catchAllowed -- that gate belongs to
+  --       Screen:useItem, the BAG path. A caller offering a catch is by
+  --       definition asserting a catch is allowed right now; this API
+  --       does not second-guess it.
+  --   screen:chooseMenuItem("RUN")    -- outcome="run", finishBattleExit,
+  --       stack pop. Ends the battle immediately, with no further press.
+  --
+  -- Standing gap a consumer of this API has to know about, found while
+  -- reading those two paths and NOT fixed here (out of scope, flagged
+  -- rather than silently worked around): this screen never emits
+  -- "battle.ended" for any ending at all. finishTurn, throwBall and the
+  -- RUN branch each just set self.outcome and self.phase="over";
+  -- Battle:endBattle -- the only Runtime.emit("battle.ended") site in
+  -- the engine -- is never reached from here. So a caller must NOT wait
+  -- on battle.ended to learn that its own answer ended the battle: the
+  -- onAnswer call itself is the signal, and screen.outcome is readable
+  -- from inside it the moment the ending method returns.
+  --
+  -- Returns false plus a reason string rather than throwing. Every
+  -- refusal below is a condition a caller can legitimately hit at
+  -- runtime (no battle on screen, a battle that ended a frame earlier, a
+  -- second question while one is up) and none of them is a programming
+  -- error worth killing a battle over.
+  mod.exports.askBattleChoice = function(target, request)
+    if type(request) ~= "table" then return false, "request must be a table" end
+    local choices = request.choices
+    if type(choices) ~= "table" or #choices ~= 2
+        or type(choices[1]) ~= "string" or type(choices[2]) ~= "string" then
+      return false, "request.choices must be exactly two strings"
+    end
+    if type(request.onAnswer) ~= "function" then
+      return false, "request.onAnswer must be a function"
+    end
+    if type(request.text) ~= "string" or request.text == "" then
+      return false, "request.text must be a non-empty string"
+    end
+    local screen = resolvePromptTarget(target)
+    if screen == nil then return false, "no live g9-Battle-Scene battle screen" end
+    if screen.exited or screen.phase == "over" then return false, "battle is over" end
+    -- One question at a time. Stacking would mean the second raise saving
+    -- the FIRST prompt's phase (PROMPT_PHASE itself) as the context to
+    -- restore to, which puts the screen back into the prompt phase with
+    -- no record -- the exact stranded state Screen:updatePrompt's
+    -- watchdog exists to clean up after. Refusing is cheaper than
+    -- recovering.
+    if screen.prompt ~= nil or screen.pendingPrompt ~= nil then
+      return false, "a prompt is already up"
+    end
+    local ask = {
+      id = request.id or "unnamed",
+      request = request,
+      text = request.text,
+      -- Copied, not aliased: the caller's table stays theirs to mutate,
+      -- and a label changing between the raise and the next draw would
+      -- move the cursor's own row labels under the player.
+      choices = { choices[1], choices[2] },
+      index = (request.default == 2) and 2 or 1,
+      onAnswer = request.onAnswer,
+    }
+    -- cancel=false disables B outright; anything else (nil included)
+    -- defaults to 2, matching every two-option box in the games where B
+    -- is the second/negative option.
+    if request.cancel == false then
+      ask.cancel = nil
+    elseif request.cancel == 1 then
+      ask.cancel = 1
+    else
+      ask.cancel = 2
+    end
+    -- Parked, not raised on the spot: Screen:promotePendingPrompt raises
+    -- it on the first frame the screen is genuinely interruptible, so a
+    -- caller may ask from anywhere -- a battle.damage listener firing
+    -- mid-resolution, a faint handler mid-animation -- without having to
+    -- know anything about this screen's phases.
+    screen.pendingPrompt = ask
+    return true
+  end
+
+  -- "pending" (asked for, waiting for an interruptible frame) and
+  -- "active" (the box is up) are reported separately because they mean
+  -- different things to a caller: a pending prompt may still be dropped
+  -- if the battle ends first, an active one will always reach onAnswer.
+  mod.exports.battleChoiceActive = function(target)
+    local screen = resolvePromptTarget(target)
+    if screen == nil then return nil end
+    if screen.prompt ~= nil then return "active" end
+    if screen.pendingPrompt ~= nil then return "pending" end
+    return nil
+  end
+
+  -- Withdraws a question without answering it -- for a caller whose own
+  -- reason for asking evaporated (the mon it was about fainted to
+  -- residual damage while the box was up). onAnswer is NOT called: there
+  -- was no answer. The displaced phase is put back exactly as an answer
+  -- would put it back, so this is always safe to call.
+  mod.exports.cancelBattleChoice = function(target)
+    local screen = resolvePromptTarget(target)
+    if screen == nil then return false end
+    if screen.pendingPrompt ~= nil then
+      screen.pendingPrompt = nil
+      return true
+    end
+    local ask = screen.prompt
+    if ask == nil then return false end
+    screen.prompt = nil
+    screen:restorePrompt(ask)
+    return true
+  end
+
+  mod.log:info("g9_Battle_Scene: battle_screen installed (prompt API: askBattleChoice, battleChoiceActive, cancelBattleChoice)")
 end
