@@ -339,6 +339,27 @@ return function(mod)
     if not mon then return nil end
     local def = data and data.pokemon and data.pokemon[mon.species]
     local path = def and def[spriteField]
+    -- Resolve through the engine's own art seam instead of drawing the raw
+    -- species-record field. National Dex sets spriteFront/spriteBack to its
+    -- OWN placeholder for every species past the cart's roster, so reading
+    -- the field directly drew that placeholder -- a "?" for every combatant
+    -- -- while a sprite mod sat on the real art. src/ui/gen2/BattleState.lua
+    -- raises this same hook with these same ctx keys for the native screen,
+    -- so this is the seam every other mon-pic consumer on Gen 2 already uses.
+    if path and Runtime.wantsHook("pokemon.sprite") then
+      local ctx = {
+        species = mon.species,
+        side = (spriteField == "spriteBack") and "back" or "front",
+        kind = "battle",
+        mon = mon,
+        trueColor = (def and def.trueColor) and true or false,
+        data = data,
+        shiny = mon.shiny and true or false,
+      }
+      local hooked = Runtime.call("pokemon.sprite",
+        function(value) return value end, path, ctx)
+      if type(hooked) == "string" and hooked ~= "" then path = hooked end
+    end
     local img = path and loadSprite(path)
     if not img then return nil end
     local iw, ih = img:getDimensions()
@@ -803,13 +824,41 @@ return function(mod)
   -- exactly as it already does for a native-turn-loop battle.
   function Screen:enterGimmickSelect()
     local battleForms = mod:find("battle_forms")
-    local registry = battleForms and battleForms.exports and battleForms.exports.transforms
-    local armState = battleForms and battleForms.exports and battleForms.exports.armState
-    if not (registry and armState) then
+    local api = battleForms and battleForms.exports
+    -- battle_forms publishes a DOCUMENTED api (src/formapi.lua): gimmicks(),
+    -- arm(), armed(). It does NOT publish transforms/armState -- those are
+    -- its internal dep names, and asking for them found nil, which is why this
+    -- menu answered "No Gimmicks available." for every mon regardless of what
+    -- the trainer was carrying. Shimmed to the real surface rather than the
+    -- other way round: formapi.lua's header states plainly that the internals
+    -- are not the peer contract.
+    if not (api and type(api.gimmicks) == "function" and type(api.arm) == "function") then
       self.message = "No Gimmicks available."
       self.phase = "actionMenu"
       return
     end
+    -- gimmicks(battle) already applies this mod's own eligibility AND the
+    -- barred-species rule, and returns { id, label, available } rows.
+    local okList, rows = pcall(api.gimmicks, self.battle)
+    if not okList or type(rows) ~= "table" then rows = {} end
+    local registry = { all = function()
+      local out = {}
+      for _, row in ipairs(rows) do
+        local ready = row.available and true or false
+        out[#out + 1] = { id = row.id, label = row.label,
+                          available = function() return ready end }
+      end
+      return out
+    end }
+    -- The once-per-battle limit is enforced by arm() itself: State:toggle
+    -- validates the spent flag, so a spent id refuses and the caller's own
+    -- "couldn't be armed" branch reports it. usedAny/used are not published,
+    -- so they answer false here rather than guessing at internal state.
+    local armState = {
+      usedAny = function() return false end,
+      used = function() return false end,
+      toggle = function(_, id) return api.arm(id) == true end,
+    }
     -- The once-per-battle limit itself: spentAny (any mechanic already
     -- used this battle) or this specific id already spent both mean the
     -- cell has nothing to offer, matching src/overlay.lua's own "every
