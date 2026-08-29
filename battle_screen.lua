@@ -1031,6 +1031,46 @@ return function(mod)
   function Screen:finishBattleExit()
     if self.exited or not self.world then return end
     self.exited = true
+
+    -- THE ONE EVENT THIS SCREEN NEVER SENT.
+    --
+    -- `battle.ended` is emitted in exactly one place in the engine --
+    -- Battle:endBattle (src/battle/gen2/Battle.lua) -- and this screen never
+    -- calls it: finishTurn, throwBall and RUN each just set `self.outcome`
+    -- and `self.phase = "over"`.  So for any fight drawn here the event
+    -- simply never happened, and every listener waiting on it waited for
+    -- ever.  Including this file's own: the mod.events:on("battle.ended")
+    -- above, which clears the mon.multiSide tag combat.lua sets, has never
+    -- once fired for a battle this screen drew.
+    --
+    -- Confirmed consequences outside this mod, in wild_forms:
+    --
+    --   * static legendaries retire and despawn on this event, so a boss
+    --     beaten in a scene fight stayed standing on the map for ever and
+    --     could not be spoken to again.
+    --   * its two-phase bosses take their raised HP ceiling back down here,
+    --     so an Eternamax ceiling could persist onto the caught Pokemon.
+    --   * its diagnostic trace flushes here, so the end of every scene fight
+    --     was missing from the log.
+    --
+    -- Emitted rather than routed through Battle:endBattle, deliberately: that
+    -- method also drives native's own end-of-battle bookkeeping for a screen
+    -- this mod is standing in for, and calling it here would run that
+    -- bookkeeping twice.  The payload is the same one it sends, so a listener
+    -- cannot tell the difference.
+    --
+    -- Once per battle: `exited` above is already the guard every other line
+    -- in this function relies on.  pcall'd because a raising listener in some
+    -- other mod must not strand the player in a battle that cannot exit --
+    -- every line below this one still has to run.
+    local okEnded, errEnded = pcall(function()
+      Runtime.emit("battle.ended", { battle = self.battle, result = self.outcome })
+    end)
+    if not okEnded then
+      mod.log:warn("g9_Battle_Scene: a battle.ended listener raised: %s",
+        tostring(errEnded))
+    end
+
     self.world.battleActive = nil
     -- WildBattleScript's reloadmapafterbattle: only a wild fight sets
     -- this (a trainer rematch has its own, separate cooldown handling
