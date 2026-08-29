@@ -2677,6 +2677,40 @@ return function(mod)
     local g9dex = mod:find("g9-battle-engine-beta")
     assert(g9dex and g9dex.exports and g9dex.exports.resolveTurnActions,
       "g9-Battle-Scene: g9-battle-engine-beta not loaded or missing resolveTurnActions")
+    -- A SCENE MUST REPLACE A BATTLE, NEVER LAYER OVER ONE.
+    --
+    -- buildBattle below calls Battle.new, and Battle.new emits
+    -- `battle.started` from inside its own constructor
+    -- (src/battle/gen2/Battle.lua) with no way to opt out.  That is correct
+    -- and wanted: this IS the battle being played, and peers like
+    -- battle_forms need the event to set themselves up for it.
+    --
+    -- It is only wrong when the caller has ALSO let the engine start one.
+    -- Then two Battle objects are live for one encounter, `battle.started`
+    -- fires twice, and every peer that remembers the battle it was told
+    -- about is now holding the one that is not on screen.  That is not
+    -- hypothetical: it cost a real player their transformation menu for a
+    -- whole session, and it is invisible from in-game -- battle_forms'
+    -- diagnostic said `armState=another battle ... offered=0` while every
+    -- input it reported was correct.
+    --
+    -- `world.battleActive` is the engine's own "a battle screen this world
+    -- pushed is up" flag, set by World:startBattle at the moment it pushes
+    -- (src/world/gen2/World.lua) and cleared on the way out, and this file
+    -- already sets and clears it too.  So it answers the question exactly.
+    --
+    -- A warning, not a refusal: the scene is what the caller asked for and
+    -- the player is better served by the fight they were promised than by a
+    -- silent no.  What this buys is that the mistake is loud at the moment
+    -- it is made, instead of being diagnosed days later from a peer's own
+    -- trace.
+    if world.battleActive then
+      mod.log:warn("g9_Battle_Scene: a battle was already running when this "
+        .. "scene was pushed -- the caller should replace the engine's "
+        .. "battle, not layer over it. Two Battle objects are now live for "
+        .. "one encounter, so battle.started has fired twice and any mod "
+        .. "holding the battle it was told about is holding the wrong one.")
+    end
     local battle = buildBattle(game, data)
     local inst = Screen.new(game, world, data, combat, game.data, battle, g9dex)
     lastScreen = inst
