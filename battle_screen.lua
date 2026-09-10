@@ -201,6 +201,70 @@ return function(mod)
   Screen.isOpaque = true
 
   local VW, VH = 320, 160
+  -- Intro send-out pacing. Player mons and every trainer-battle mon
+  -- (enemy and player) are THROWN from a pokeball: the ball arcs from
+  -- the trainer's side to the mon's platform, lands with a white poof,
+  -- and the mon materializes there (the native ball-throw beat, drawn
+  -- procedurally -- the real thing is BattleAnim_SendOutMon inside the
+  -- battle_anims scripting system this screen doesn't run). Only a WILD
+  -- mon gets the vanilla slide-in: it drops from the top of the screen
+  -- onto its own platform.
+  local BALL_FLIGHT = 0.45    -- ball in the air
+  local BALL_POOF = 0.18      -- landing flash
+  local BALL_APPEAR = 0.3     -- mon materializing at the landing spot
+  local BALL_THROW_TOTAL = BALL_FLIGHT + BALL_POOF + BALL_APPEAR
+  local BALL_RADIUS = 6
+  -- Ball arc: throw origin (trainer's hand, just off that side's edge),
+  -- arc apex, then the mon's platform (computed per-slot at draw time).
+  -- Player throws from off the left edge up-forward toward center; the
+  -- enemy throws from off the right edge (the direction its trainer pic
+  -- slid off).
+  local BALL_PLAYER_OX, BALL_PLAYER_OY = 0, 86
+  local BALL_PLAYER_AX, BALL_PLAYER_AY = 96, 18
+  local BALL_ENEMY_OX, BALL_ENEMY_OY = 330, 10
+  local BALL_ENEMY_AX, BALL_ENEMY_AY = 292, 2
+  local WILD_DROP_DURATION = 0.5
+  -- Trainer/intro pic slides, ported from the native screen's own frame
+  -- counts (src/ui/gen2/BattleState.lua:124-129): the enemy trainer's
+  -- class front-pic slides OFF to the right in TRAINER_SLIDE_FRAMES=16
+  -- frames (8 steps x 2 frames), the player trainer's back-pic slides OFF
+  -- to the left in BACKPIC_SLIDE_FRAMES=18 (9 steps x 2). Duration here
+  -- is frames/60 (the native screen advances once per 60fps frame), and
+  -- each step is one 8px tile.
+  local TRAINER_SLIDE_STEPS = 8
+  local BACKPIC_SLIDE_STEPS = 9
+  local TRAINER_SLIDE_DURATION = 16 / 60
+  local BACKPIC_SLIDE_DURATION = 18 / 60
+  -- `time` (seconds) into a `duration`-long slide -> the cumulative 8px
+  -- tile offset at that instant, matching native's per-frame step
+  -- (px += floor(frameCount/2)*8). nil time (no slide) is 0.
+  local function slideStepPx(time, duration, steps)
+    if not time then return 0 end
+    local p = math.min(1, time / duration)
+    return math.floor(p * steps) * 8
+  end
+  -- The classic multi-target ("hits every adjacent opponent") move ids,
+  -- used by Screen:isSpreadMove as the LAST-resort check when the move
+  -- def carries no `target` field and the engine mod is too old to
+  -- export isSpreadMove. The authoritative answer stays the engine's
+  -- (national_dex target archetype); this list only keeps the picker
+  -- skipped when that answer can't be asked at all. Curated to moves
+  -- that are unambiguously multi-target (single-target moves like Body
+  -- Slam/Hyper Voice/Sweet Kiss are deliberately absent -- wrongly
+  -- listing one would silently drop the target picker).
+  local SPREAD_MOVE_IDS = {
+    LEER = true, GROWL = true, TAIL_WHIP = true, STRING_SHOT = true,
+    POISON_GAS = true, SWEET_SCENT = true, BUBBLE = true, ICY_WIND = true,
+    ROCK_SLIDE = true, RAZOR_LEAF = true, SWIFT = true, TWISTER = true,
+    SURF = true, EARTHQUAKE = true, EXPLOSION = true, SELF_DESTRUCT = true,
+    MUDDY_WATER = true, HEAT_WAVE = true, BLIZZARD = true, ERUPTION = true,
+    WATER_SPOUT = true, DISCHARGE = true, DAZZLING_GLEAM = true,
+    MORTALSPIN = true, BOOMBURST = true,
+  }
+  -- Lose outro: how long the faint-to-black takes to climb the whole
+  -- canvas after your last mon falls (vanilla's blackout). Purely
+  -- cosmetic -- the defeat box draws over it and A/B still exits.
+  local OUTRO_BLACKOUT_DURATION = 1.2
   local CURSOR_CODE = 0xED
   -- Theme.cursorHollow (src/ui/Theme.lua:12, charmap.asm $EC) -- the same
   -- hollow-arrow marker the engine's own party/list reordering leaves on
@@ -471,7 +535,7 @@ return function(mod)
   -- battler's sprite actually landed this frame (move animations, see
   -- Screen:startMoveAnim) read this instead of re-deriving the same
   -- tx/ty/scale math a second time.
-  local function drawSprite(tx, ty, tw, th, battler, spriteField, data, anchorRight, sizeMul)
+  local function drawSprite(tx, ty, tw, th, battler, spriteField, data, anchorRight, sizeMul, offX, offY, appear)
     local mon = battler and battler.mon
     if not mon then return nil end
     local def = data and data.pokemon and data.pokemon[mon.species]
@@ -523,12 +587,70 @@ return function(mod)
     end
     local iw, ih = img:getDimensions()
     local scale = (SPRITE_BOX * (sizeMul or 1)) / math.max(iw, ih)
+    -- `appear` (0..1) scales the sprite in from its bottom-center -- the
+    -- "materializing" phase of a pokeball send-out: the mon grows out of
+    -- the ground at the spot the ball landed on.
+    if appear then scale = scale * appear end
     local dw, dh = iw * scale, ih * scale
     local slotX, slotY, slotW, slotH = tx * 8, ty * 8, tw * 8, th * 8
-    local dx = anchorRight and (slotX + slotW - dw) or slotX
+    local dx = (anchorRight and (slotX + slotW - dw) or slotX) + (offX or 0)
+    local dy = slotY + slotH - dh + (offY or 0)
     love.graphics.setColor(1, 1, 1, 1)
-    love.graphics.draw(img, dx, slotY + slotH - dh, 0, scale, scale)
-    return dx + dw / 2, slotY + slotH
+    love.graphics.draw(img, dx, dy, 0, scale, scale)
+    return dx + dw / 2, dy + dh
+  end
+
+  -- Draws a raw image -- a trainer's pic, which has no species record --
+  -- the same way drawSprite floats a mon: bottom-anchored in the zone,
+  -- uniformly scaled to the zone's own height (trainer pics are 6/7-tile
+  -- squares on native, read as a bit larger than a mon's box). offX
+  -- shifts it horizontally -- the trainer slides' 8px tile steps. Returns
+  -- the bottom-center position, or nil if nothing drew.
+  local function drawRawImage(pathOrImg, tx, ty, tw, th, offX)
+    local img = pathOrImg
+    if type(img) == "string" then img = loadSprite(img) end
+    if not img then return nil end
+    local iw, ih = img:getDimensions()
+    local scale = (th * 8) / math.max(iw, ih)
+    local dw, dh = iw * scale, ih * scale
+    local slotX, slotY, slotW, slotH = tx * 8, ty * 8, tw * 8, th * 8
+    local dx = slotX + (offX or 0)
+    local dy = slotY + slotH - dh
+    love.graphics.setColor(1, 1, 1, 1)
+    love.graphics.draw(img, dx, dy, 0, scale, scale)
+    return dx + dw / 2, dy + dh
+  end
+
+  -- Draws a pokeball as primitives (no asset dependency -- the native
+  -- ball is a frame of the battle_anims sprite sheet this screen doesn't
+  -- load) at `cx,cy` with radius `r`. `spin` (0..1 over the flight) turns
+  -- the ball one-and-a-half times so the red/white split visibly tumbles.
+  local function drawPokeball(cx, cy, r, spin)
+    love.graphics.push()
+    love.graphics.translate(cx, cy)
+    love.graphics.rotate((spin or 0) * 2 * math.pi * 1.5)
+    love.graphics.setColor(0.85, 0.12, 0.12, 1) -- red top half
+    love.graphics.arc("fill", "pie", 0, 0, r, math.pi, 2 * math.pi)
+    love.graphics.setColor(1, 1, 1, 1)          -- white bottom half
+    love.graphics.arc("fill", "pie", 0, 0, r, 0, math.pi)
+    love.graphics.setColor(0.1, 0.1, 0.1, 1)    -- center band + button
+    love.graphics.rectangle("fill", -r, -1.5, 2 * r, 3)
+    love.graphics.circle("fill", 0, 0, 2.2)
+    love.graphics.setColor(1, 1, 1, 1)
+    love.graphics.pop()
+  end
+
+  -- 0..1 scale for a mon materializing at the end of a pokeball throw
+  -- (nil when that slot has no active throw -- i.e. draw at full size).
+  -- A revealed slot draws through this so the mon grows out of the
+  -- ground exactly where the ball landed, over BALL_APPEAR seconds after
+  -- the poof.
+  local function ballAppearFor(screen, side, slot)
+    local bt = screen.ballThrow
+    if not bt or bt.side ~= side or bt.slot ~= slot then return nil end
+    if bt.t < BALL_FLIGHT + BALL_POOF then return 0 end
+    local ta = math.min(1, (bt.t - BALL_FLIGHT - BALL_POOF) / BALL_APPEAR)
+    return 1 - (1 - ta) * (1 - ta)
   end
 
   -- Draws text shrunk by `scale` (a plain graphics transform around the
@@ -747,6 +869,11 @@ return function(mod)
     -- real Battle instance's own opts.trainer (see buildBattle), not
     -- this flag.
     self.isTrainerBattle = payload.trainer ~= nil and payload.trainer ~= false
+    -- The raw payload.trainer, kept for the intro/outro narration
+    -- ("{TRAINER} wants to battle!", "You defeated {TRAINER}!") -- nil for
+    -- a wild fight, true for a legacy nameless trainer, else the real
+    -- trainer table (buildBattle's own header documents its shape).
+    self.trainerData = payload.trainer
     -- The turn's events, whole tables, NOT just their .text -- see
     -- Screen:advanceResolving for why the rest of each event now matters.
     self.pendingEvents = {}
@@ -779,7 +906,48 @@ return function(mod)
     self.spriteAnchor = {}
     self.moveAnim = nil
     self:installEventProbe()
-    self:beginTurn()
+    -- Real vanilla entry sequence: narration lines ("Wild X appeared!"
+    -- / "{TRAINER} wants to battle!" + sent-out lines), then "Go! P!"
+    -- per player battler thrown from a pokeball, and only then the first
+    -- action menu. A battle with no narration at all (no enemies?) skips
+    -- straight to the menu.
+    -- Trainer-intro state (native-faithful order): in a TRAINER battle
+    -- both trainer pics stand in their slots while "{TRAINER} wants to
+    -- battle!" reads, the enemy trainer's class front-pic slides off
+    -- right before each enemy mon is sent out (thrown from a pokeball),
+    -- the player trainer's back-pic slides off left before each "Go! P!"
+    -- (also a pokeball throw), and only then do the mons' own sprites/
+    -- HUDs exist. In a WILD battle there is no enemy trainer -- each
+    -- wild mon drops in from the top of the screen onto its platform,
+    -- and the player back-pic leads (native's BattleIntroSlidingPics).
+    -- enemyRevealed/playerRevealed gate each slot's sprite AND HUD box
+    -- (both hidden until that mon is actually sent out); reveal flags
+    -- are read by drawContent and set by advanceIntro's beats / the
+    -- entrance clocks' completion.
+    self.showPlayerTrainer = false
+    self.showEnemyTrainer = false
+    self.playerTrainerImage = nil
+    self.enemyTrainerImage = nil
+    self.trainerSlide = nil
+    self.backpicSlide = nil
+    self.enemyRevealed = {}
+    self.playerRevealed = {}
+    self:resolveTrainerArt()
+    -- WILD mons are NOT pre-revealed: their "drop" intro beat slides each
+    -- one down from the top of the screen onto its platform (the vanilla
+    -- wild entry -- see buildIntroSequence), which is what gates sprite
+    -- AND HUD until it lands.
+    self.introSequence = self:buildIntroSequence()
+    self.introIdx = 0
+    self.ballThrow = nil
+    self.wildDrop = nil
+    self.outroT = nil
+    if #self.introSequence > 0 then
+      self.phase = "intro"
+      self:advanceIntro()
+    else
+      self:finishIntro()
+    end
     return self
   end
 
@@ -1131,8 +1299,76 @@ return function(mod)
   -- screen from OUTSIDE its own update loop -- but the real, primary
   -- call is finishBattleExit above, invoked explicitly at the actual
   -- exit sites, the same place-and-timing native's own onDone uses.
+  -- The OTHER half of native's exit closure, and the reason a scene
+  -- TRAINER battle used to strand the player: handing control back to the
+  -- overworld SCRIPT that opened the fight.
+  --
+  -- A scripted battle (a sight-trainer approach, a talk, a `startbattle`)
+  -- runs on the World's script VM. The VM's `startbattle` opcode yields a
+  -- {kind="battle"} request and PARKS (src/script/gen2/Vm.lua:1040);
+  -- Vm:resume then calls the World's startBattle hook and hands it an
+  -- `onDone(outcome)` thunk whose only job is `vm:resume(outcome)`
+  -- (Vm.lua:2686). Native runs that thunk at the very end of its own
+  -- battle-exit closure (World:startBattle's onDone). A caller that routes
+  -- the battle through THIS screen instead -- registerTrainer's combatType,
+  -- Sample-Battle-Scene-G9's tryDoublesTrainer, wild_forms's boss scene --
+  -- returns before native ever runs, so that thunk was dropped: the VM
+  -- stayed parked, vm:running() stayed true, World:busy() kept refusing
+  -- overworld input, and the player could not move after the fight. A wild
+  -- STEP encounter parks no script, which is exactly why those recovered
+  -- fine on their own.
+  --
+  -- Resumed here rather than through a caller-supplied callback because the
+  -- scene is the ONE place every routed battle leaves through, and it
+  -- already mirrors the rest of native's exit closure in finishBattleExit
+  -- (battleActive, wildCooldown, lastBattleResult, restoreMapMusic). This is
+  -- the last missing piece of that same closure. The parked request is read
+  -- straight off world.vm.pending -- nil (or a non-battle kind) for a wild
+  -- encounter or any battle this screen drew that no script opened, so
+  -- nothing is resumed in those cases and an unrelated parked request can
+  -- never be resumed by a battle screen coming down.
+  --
+  -- Called from Screen:exit -- i.e. the state-stack POP -- and NOT from
+  -- finishBattleExit, deliberately: native pops the screen and only THEN
+  -- calls onDone, and a resumed script can itself push a screen (a rematch
+  -- `startbattle`, a reloadmap that opens the map-name box). Resuming
+  -- before the pop would let THIS screen's pop take that new screen back
+  -- down instead of leaving it on top of the overworld.
+  function Screen:resumeParkedWorldScript()
+    if self.worldScriptResumed then return end
+    self.worldScriptResumed = true
+    local world = self.world
+    local vm = world and world.vm
+    if not (vm and vm.running and vm.resume) then return end
+    local okRunning, running = pcall(vm.running, vm)
+    if not okRunning or not running then return end
+    local req = vm.pending
+    if type(req) ~= "table" or req.kind ~= "battle" then return end
+    -- Native hands the VM the branch's own raw outcome string
+    -- (BattleState.lua:2412 -- `onDone(self.battle.outcome)`), NOT a
+    -- pre-collapsed win/lose: the VM's startbattle arm maps it through
+    -- BATTLE_RESULTS = {win=0, lose=1, draw=2} with an `or .win` fallback
+    -- for anything else (run, caught), and scripts branch on the resulting
+    -- wScriptVar via iftrue/iffalse (Vm.lua:1040-1051). Passing
+    -- self.outcome verbatim reproduces that mapping exactly -- including a
+    -- real DRAW mapping to 2 (truthy), which a win/lose collapse would
+    -- have silently turned into a win. nil is the only value with no native
+    -- battle equivalent here, and it is guarded because a nil resume is the
+    -- VM's own "script aborted" signal (the same branch a nil onDone hits).
+    local outcome = self.outcome or "win"
+    local ok, err = pcall(vm.resume, vm, outcome)
+    if not ok then
+      mod.log:warn("g9_Battle_Scene: could not resume the parked world script: %s",
+        tostring(err))
+    end
+  end
+
   function Screen:exit()
     self:finishBattleExit()
+    -- After finishBattleExit, i.e. during the pop: see
+    -- resumeParkedWorldScript's own header for why this ordering is the
+    -- one that matters.
+    self:resumeParkedWorldScript()
   end
 
   -- Returns the EFFECTIVE tx,ty for a layout element `id`: the tuned
@@ -1207,6 +1443,191 @@ return function(mod)
       return
     end
     self:enterActionMenu()
+  end
+
+  -- Loads the trainer intro pics the native screen shows before any mon
+  -- is sent out: the PLAYER trainer's back-pic standing in the player
+  -- slot, and for a trainer battle the ENEMY trainer's class front-pic
+  -- standing in the enemy slot. Mirrors native's own lookups
+  -- (src/ui/gen2/BattleState.lua:430-511): playerBack -- playerBackFemale
+  -- for a female hero (Gen2Save.isFemale == save.player.gender "female")
+  -- -- and trainerArt(data, classId) with classId = trainer.classId or
+  -- trainer.class. Any missing/unloadable art leaves its flag false and
+  -- the intro just skips that slide -- the same graceful fallback native
+  -- uses when a cache has no trainer pic (the mon stands in for the
+  -- whole intro).
+  function Screen:resolveTrainerArt()
+    local hud = self.data and self.data.gen2MenuGfx and self.data.gen2MenuGfx.battleHud
+    local backPath = hud and hud.playerBack
+    local save = self.game and self.game.save
+    if hud and hud.playerBackFemale and save and save.player
+      and save.player.gender == "female" then
+      backPath = hud.playerBackFemale
+    end
+    local backImg = backPath and loadSprite(backPath)
+    if backImg then
+      self.playerTrainerImage = backImg
+      self.showPlayerTrainer = true
+    end
+    if self.isTrainerBattle and type(self.trainerData) == "table" then
+      local classId = self.trainerData.classId or self.trainerData.class
+      local classes = self.data and self.data.gen2Trainers and self.data.gen2Trainers.classes
+      local classDef = classes and classes[classId]
+      local path = (classDef and classDef.pic)
+        or (hud and hud.trainerPics and hud.trainerPics[classId])
+      local img = path and loadSprite(path)
+      if img then
+        self.enemyTrainerImage = img
+        self.showEnemyTrainer = true
+      end
+    end
+  end
+
+  -- The vanilla intro beats for THIS battle, in order -- the full
+  -- native sequence, not just the narration lines (the order the user
+  -- asked for: trainer pics first, then mons):
+  --   TRAINER: "{TRAINER} wants to battle!" -> trainerSlide (enemy class
+  --     front-pic slides off right, only when art loaded) -> one
+  --     "sent out X!" per enemy (each is THROWN from a pokeball onto
+  --     its platform) -> backpicSlide (player back-pic slides off left,
+  --     only when art loaded) -> one "Go! P!" per living player battler
+  --     (also thrown from a pokeball).
+  --   WILD:   one "Wild X appeared!" per enemy -- each drops in from the
+  --     top of the screen onto its platform (the vanilla wild entry, the
+  --     ONLY slide-in left) -> backpicSlide -> "Go! P!" per player
+  --     battler (pokeball throw).
+  -- A battle with no enemies at all skips straight to the menu (empty
+  -- sequence). Kinds: "msg" narration only, "trainerSlide"/"backpicSlide"
+  -- start a pic's slide-off (the next beat advances when it completes),
+  -- "drop" slides the wild enemy in slot `slot` down from the top,
+  -- "throw" throws a pokeball from side `side` ("player"/"enemy") to
+  -- slot `slot`'s platform and materializes that battler there.
+  function Screen:buildIntroSequence()
+    local seq = {}
+    local tName = self:trainerDisplayName()
+    if tName then
+      seq[#seq + 1] = { text = tName .. " wants to battle!", kind = "msg" }
+      if self.showEnemyTrainer then
+        seq[#seq + 1] = { kind = "trainerSlide" }
+      end
+      for i, b in ipairs(self.enemyBattlers) do
+        seq[#seq + 1] = { text = tName .. " sent out " .. displayName(b.mon) .. "!",
+          kind = "throw", side = "enemy", slot = i }
+      end
+    else
+      for i, b in ipairs(self.enemyBattlers) do
+        seq[#seq + 1] = { text = "Wild " .. displayName(b.mon) .. " appeared!",
+          kind = "drop", slot = i }
+      end
+    end
+    if self.showPlayerTrainer then
+      seq[#seq + 1] = { kind = "backpicSlide" }
+    end
+    for i, b in ipairs(self.playerBattlers) do
+      if self.combat.isAlive(b) then
+        seq[#seq + 1] = { text = "Go! " .. displayName(b.mon) .. "!",
+          kind = "throw", side = "player", slot = i }
+      end
+    end
+    return seq
+  end
+
+  -- The trainer's name as the intro/outro should say it -- the real
+  -- name if the caller supplied one, else the class, else nil (a wild
+  -- fight). A legacy `true` trainer nobody could name falls back to the
+  -- generic "TRAINER".
+  function Screen:trainerDisplayName()
+    local t = self.trainerData
+    if t == true then return "TRAINER" end
+    if type(t) ~= "table" then return nil end
+    if type(t.name) == "string" and t.name ~= "" then return t.name end
+    if type(t.class) == "string" and t.class ~= "" then return t.class end
+    return nil
+  end
+
+  -- Shows the next intro beat, or hands off to the real turn loop when
+  -- the narration runs out. A "throw" beat arms the pokeball clock (ball
+  -- arcs to the mon's platform, lands, materializes the mon -- revealed
+  -- only when the ball lands, drawn in drawContent/drawBallThrow); a
+  -- "drop" beat arms the wild drop-in clock (that enemy mon slides down
+  -- from the top). The slide beats just arm their clocks (the dt stepper
+  -- in Screen:update and the A/B snap in updateIntro both finish them and
+  -- then call advanceIntro again for the NEXT beat -- so a pic slides
+  -- fully off before the next line reads, exactly like native's own held
+  -- queue).
+  function Screen:advanceIntro()
+    self.introIdx = self.introIdx + 1
+    local step = self.introSequence[self.introIdx]
+    if not step then
+      self:finishIntro()
+      return
+    end
+    self.currentMessage = step.text or nil
+    if step.kind == "throw" then
+      self.ballThrow = { side = step.side, slot = step.slot, t = 0 }
+    elseif step.kind == "drop" then
+      self.wildDrop = { slot = step.slot, t = 0 }
+    elseif step.kind == "trainerSlide" then
+      self.trainerSlide = 0
+    elseif step.kind == "backpicSlide" then
+      self.backpicSlide = 0
+    end
+  end
+
+  -- A wild drop-in has completed: reveal that battler (sprite + HUD
+  -- gate) and clear the entrance state. Called from the dt stepper once
+  -- the drop's clock passes its duration. (The pokeball throw reveals
+  -- and clears itself inline in Screen:update -- the reveal on landing,
+  -- the clear at the very end.)
+  function Screen:finishEntrance()
+    if self.wildDrop then
+      self.enemyRevealed[self.wildDrop.slot] = true
+      self.wildDrop = nil
+    end
+  end
+
+  -- The last intro beat is over: every reveal flag is now true (so
+  -- nothing is left half-hidden if a battle somehow ended up mid-intro),
+  -- the slide clocks are dead, both trainer pics are off, and the real
+  -- turn loop takes over.
+  function Screen:finishIntro()
+    self.ballThrow = nil
+    self.wildDrop = nil
+    self.trainerSlide = nil
+    self.backpicSlide = nil
+    self.showPlayerTrainer = false
+    self.showEnemyTrainer = false
+    for i in ipairs(self.enemyBattlers) do self.enemyRevealed[i] = true end
+    for i in ipairs(self.playerBattlers) do self.playerRevealed[i] = true end
+    self.currentMessage = nil
+    self:beginTurn()
+  end
+
+  -- Intro input: A/B advances the narration exactly like resolving's
+  -- message pump -- but a press during a hold (the pokeball throw or wild
+  -- drop-in, either trainer pic's slide-off) snaps it to done (the same
+  -- rule as every other hold: a press ends the hold and nothing else,
+  -- never skipping the line underneath it).
+  function Screen:updateIntro(input)
+    if input:wasPressed("a") or input:wasPressed("b") then
+      if self.ballThrow and self.ballThrow.t < BALL_THROW_TOTAL then
+        self.ballThrow.t = BALL_THROW_TOTAL
+        return
+      end
+      if self.wildDrop and self.wildDrop.t < WILD_DROP_DURATION then
+        self.wildDrop.t = WILD_DROP_DURATION
+        return
+      end
+      if self.trainerSlide ~= nil and self.trainerSlide < TRAINER_SLIDE_DURATION then
+        self.trainerSlide = TRAINER_SLIDE_DURATION
+        return
+      end
+      if self.backpicSlide ~= nil and self.backpicSlide < BACKPIC_SLIDE_DURATION then
+        self.backpicSlide = BACKPIC_SLIDE_DURATION
+        return
+      end
+      self:advanceIntro()
+    end
   end
 
   function Screen:enterActionMenu()
@@ -1909,6 +2330,28 @@ return function(mod)
     }
   end
 
+  -- Does this picked move hit every enemy at once (needs no target
+  -- picker)? Authoritative answer: g9-battle-engine-beta's isSpreadMove
+  -- (national_dex target archetype) -- trusted when the engine has it.
+  -- An OLD engine mod predating that export falls back to the move
+  -- def's own `target` field when one is present, then to the
+  -- module-local SPREAD_MOVE_IDS list -- so the picker is skipped even
+  -- with a stale engine. (The engine's resolveTurnActions still
+  -- re-resolves the full roster at resolution time either way, so
+  -- skipping the picker never limits who actually gets hit.)
+  function Screen:isSpreadMove(picked)
+    if not picked then return false end
+    local id = picked.slot and picked.slot.id
+    local eng = self.g9dex and self.g9dex.exports and self.g9dex.exports.isSpreadMove
+    if eng then
+      local ok, res = pcall(eng, id)
+      if ok then return res == true end
+    end
+    local tgt = picked.def and picked.def.target
+    if tgt == "all-opponents" or tgt == "all-other-pokemon" then return true end
+    return id and SPREAD_MOVE_IDS[id] == true or false
+  end
+
   function Screen:updateMoveSelect(input)
     local count = #self.usableMovesCache
     if input:wasPressed("up") then
@@ -1956,10 +2399,22 @@ return function(mod)
         if self.combat.isAlive(e) then aliveEnemies[#aliveEnemies + 1] = e end
       end
       if #aliveEnemies > 1 then
-        self.pendingPick = picked
-        self.targetCandidates = aliveEnemies
-        self.targetCursor = 1
-        self.phase = "targetSelect"
+        -- A move that targets every adjacent enemy by itself (LEER, Muddy
+        -- Water, Earthquake, ...) has nothing to choose -- the picker is
+        -- skipped entirely and the first alive enemy is queued as a
+        -- placeholder target; g9-battle-engine-beta's resolveTurnActions
+        -- re-resolves the full roster (resolveMoveTargets) at resolution
+        -- time, so the placeholder never limits who actually gets hit.
+        local spread = self:isSpreadMove(picked)
+        if spread then
+          self:queueAction(picked, aliveEnemies[1])
+          self:advanceSlotOrResolve()
+        else
+          self.pendingPick = picked
+          self.targetCandidates = aliveEnemies
+          self.targetCursor = 1
+          self.phase = "targetSelect"
+        end
       elseif #aliveEnemies == 1 then
         self:queueAction(picked, aliveEnemies[1])
         self:advanceSlotOrResolve()
@@ -2416,11 +2871,22 @@ return function(mod)
     local playersDown = self.combat.sideDefeated(self.playerBattlers)
     if enemiesDown or playersDown then
       self.phase = "over"
+      -- Starred here, not in updateOver: the blackout clock runs for the
+      -- whole over phase (update steps it independently of input), so it
+      -- reads as a continuous slow fade even while the player is mashing.
+      self.outroT = 0
       if enemiesDown and playersDown then
         self.overMessage = "Both sides down -- draw!"
         self.outcome = "draw"
       elseif enemiesDown then
-        self.overMessage = "You won the battle!"
+        -- Vanilla: "You won the battle!" for a wild fight, "You defeated
+        -- {TRAINER}!" for a trainer's team.
+        local tn = self:trainerDisplayName()
+        if tn then
+          self.overMessage = "You defeated " .. tn .. "!"
+        else
+          self.overMessage = "You won the battle!"
+        end
         self.outcome = "win"
       else
         self.overMessage = "Your team was defeated..."
@@ -2819,6 +3285,51 @@ return function(mod)
       if not self.moveAnim.runner:step() then self.moveAnim = nil end
     end
 
+    -- Same phase-independent stepping for the intro entrances (a pokeball
+    -- throw or wild drop-in finishes its animation even if the player
+    -- holds A) and the lose outro's blackout clock. A throw reveals its
+    -- battler the instant the ball lands (t >= BALL_FLIGHT -- the poof
+    -- and the mon's materialize phase then read over the HUD, matching
+    -- native) and clears itself at the very end.
+    if self.ballThrow then
+      local bt = self.ballThrow
+      bt.t = math.min(BALL_THROW_TOTAL, bt.t + dt)
+      if bt.t >= BALL_FLIGHT and not bt.revealed then
+        bt.revealed = true
+        if bt.side == "player" then self.playerRevealed[bt.slot] = true
+        else self.enemyRevealed[bt.slot] = true end
+      end
+      if bt.t >= BALL_THROW_TOTAL then self.ballThrow = nil end
+    end
+    if self.wildDrop then
+      self.wildDrop.t = self.wildDrop.t + dt
+      if self.wildDrop.t >= WILD_DROP_DURATION then self:finishEntrance() end
+    end
+    -- Same phase-independent stepping for the trainer-pic slide-offs:
+    -- the enemy trainer's class front-pic slides right off (then the
+    -- enemy mons are sent out), the player trainer's back-pic slides
+    -- left off (then "Go! P!" beats run). A completed slide hides its
+    -- pic (native: trainerSlide >= TRAINER_SLIDE_FRAMES ->
+    -- showEnemyTrainer = false, same for backpicSlide) and advances the
+    -- intro to the NEXT beat, so a slide never stalls the queue.
+    if self.trainerSlide ~= nil then
+      self.trainerSlide = self.trainerSlide + dt
+      if self.trainerSlide >= TRAINER_SLIDE_DURATION then
+        self.trainerSlide = nil
+        self.showEnemyTrainer = false
+        self:advanceIntro()
+      end
+    end
+    if self.backpicSlide ~= nil then
+      self.backpicSlide = self.backpicSlide + dt
+      if self.backpicSlide >= BACKPIC_SLIDE_DURATION then
+        self.backpicSlide = nil
+        self.showPlayerTrainer = false
+        self:advanceIntro()
+      end
+    end
+    if self.outroT ~= nil then self.outroT = self.outroT + dt end
+
     local input = self.game.input
     if not input then
       -- No input device at all (a headless boot, a test harness) can
@@ -2849,7 +3360,8 @@ return function(mod)
       return
     end
 
-    if self.phase == "actionMenu" then self:updateActionMenu(input)
+    if self.phase == "intro" then self:updateIntro(input)
+    elseif self.phase == "actionMenu" then self:updateActionMenu(input)
     elseif self.phase == "moveSelect" then self:updateMoveSelect(input)
     elseif self.phase == "targetSelect" then self:updateTargetSelect(input)
     elseif self.phase == "gimmickSelect" then self:updateGimmickSelect(input)
@@ -2869,6 +3381,48 @@ return function(mod)
     self:promotePendingPrompt()
   end
 
+  -- The pokeball itself: arcs from the thrower's side to the mon's
+  -- platform (a quadratic bezier through the arc apex), then a white poof
+  -- at the landing spot. The mon materializing is drawn by drawContent's
+  -- own sprite path through ballAppearFor -- this pass is only the ball
+  -- and the flash. A/B (updateIntro) can snap the whole thing to done.
+  function Screen:drawBallThrow()
+    local bt = self.ballThrow
+    if not bt then return end
+    local t = bt.t
+    local slotW = (bt.side == "player")
+      and (SPRITE_ZONE_TW / #self.playerBattlers)
+      or (SPRITE_ZONE_TW / #self.enemyBattlers)
+    local sxx, syy
+    if bt.side == "player" then
+      sxx, syy = self:pos("playerSprite" .. bt.slot, (bt.slot - 1) * slotW, ROW_H)
+    else
+      sxx, syy = self:pos("enemySprite" .. bt.slot, GUI_TW * 2 + GUI_GAP + (bt.slot - 1) * slotW, 0)
+    end
+    -- Landing spot = the slot zone's bottom-center, where drawSprite
+    -- bottom-anchors the mon (so the ball lands where the mon appears).
+    local tx = (sxx + slotW / 2) * 8
+    local ty = (syy + ROW_H) * 8
+    if t < BALL_FLIGHT then
+      local p = t / BALL_FLIGHT
+      local ox, oy, ax, ay
+      if bt.side == "player" then
+        ox, oy, ax, ay = BALL_PLAYER_OX, BALL_PLAYER_OY, BALL_PLAYER_AX, BALL_PLAYER_AY
+      else
+        ox, oy, ax, ay = BALL_ENEMY_OX, BALL_ENEMY_OY, BALL_ENEMY_AX, BALL_ENEMY_AY
+      end
+      local q = 1 - p
+      local x = q * q * ox + 2 * q * p * ax + p * p * tx
+      local y = q * q * oy + 2 * q * p * ay + p * p * ty
+      drawPokeball(x, y, BALL_RADIUS, p)
+    elseif t < BALL_FLIGHT + BALL_POOF then
+      local tp = (t - BALL_FLIGHT) / BALL_POOF
+      love.graphics.setColor(1, 1, 1, 1 - tp)
+      love.graphics.circle("fill", tx, ty, 4 + tp * 20)
+      love.graphics.setColor(1, 1, 1, 1)
+    end
+  end
+
   function Screen:drawContent()
     -- Every position below goes through self:pos(id, defaultTx,
     -- defaultTy): a tuned override baked into self.layout (Screen.new)
@@ -2882,27 +3436,81 @@ return function(mod)
     for i, battler in ipairs(self.enemyBattlers) do
       local gx, gy = self:pos("enemyGui" .. i, 0, (i - 1) * GUI_STACK_TY)
       local gs = self:sizeMul("enemyGui" .. i)
-      drawGuiBox(gx, gy, GUI_TW, ROW_H, battler, self.data, false, false, gs,
-        self:shownHpOf(battler.mon))
+      -- HUD box hidden until this mon is actually sent out (a trainer
+      -- battle's intro shows the trainer's pic, not the mon, in this
+      -- slot) -- drawGuiBox still hides it on its own for fainted/caught.
+      if self.enemyRevealed[i] then
+        drawGuiBox(gx, gy, GUI_TW, ROW_H, battler, self.data, false, false, gs,
+          self:shownHpOf(battler.mon))
+      end
 
       local slotW = SPRITE_ZONE_TW / #self.enemyBattlers
       local sx, sy = self:pos("enemySprite" .. i, enemyZoneTx + (i - 1) * slotW, 0)
       local ss = self:sizeMul("enemySprite" .. i)
-      local ax, ay = drawSprite(sx, sy, slotW, ROW_H, battler, "spriteFront", self.data, false, ss)
-      if ax then self.spriteAnchor[battler] = { x = ax, y = ay } end
+      -- Trainer-battle intro: the enemy trainer's class front-pic stands
+      -- in the enemy slot (native's InitEnemyTrainer) while "{TRAINER}
+      -- wants to battle!" reads, then slides right off in 8px steps
+      -- (native's SlideBattlePicOut) before the first mon is sent out.
+      if self.showEnemyTrainer and self.enemyTrainerImage and i == 1 then
+        drawRawImage(self.enemyTrainerImage, sx, sy, slotW, ROW_H,
+          slideStepPx(self.trainerSlide, TRAINER_SLIDE_DURATION, TRAINER_SLIDE_STEPS))
+      elseif self.wildDrop and self.wildDrop.slot == i
+          and (self:shownHpOf(battler.mon) or 0) > 0 and not battler.caught then
+        -- Wild entry: the wild mon drops in from the top of the screen
+        -- onto its platform -- the one slide-in left in the intro (every
+        -- other mon is thrown from a pokeball). Accelerates like a fall
+        -- (ease-in); HUD + sprite are revealed only once it lands.
+        local p = math.min(1, self.wildDrop.t / WILD_DROP_DURATION)
+        local eased = p * p
+        local offY = -(ROW_H * 8) * (1 - eased)
+        local ax, ay = drawSprite(sx, sy, slotW, ROW_H, battler, "spriteFront", self.data, false, ss, 0, offY)
+        if ax then self.spriteAnchor[battler] = { x = ax, y = ay } end
+      elseif self.enemyRevealed[i] and (self:shownHpOf(battler.mon) or 0) > 0 and not battler.caught then
+        -- A fainted/caught battler's sprite is gone -- the box already hides
+        -- on its own (drawGuiBox) and the sprite must follow, so a downed
+        -- mon reads as an empty slot and the outro's win/defeat line plays
+        -- over an empty field. Keyed off the CHASING hp (shownHpOf), so the
+        -- sprite vanishes exactly when its bar drains to zero under the
+        -- fainted narration, not the frame the whole turn's math commits.
+        local appear = ballAppearFor(self, "enemy", i)
+        local ax, ay = drawSprite(sx, sy, slotW, ROW_H, battler, "spriteFront", self.data, false, ss, 0, 0, appear)
+        if ax then self.spriteAnchor[battler] = { x = ax, y = ay } end
+      end
     end
 
     for i, battler in ipairs(self.playerBattlers) do
       local slotW = SPRITE_ZONE_TW / #self.playerBattlers
       local sx, sy = self:pos("playerSprite" .. i, (i - 1) * slotW, ROW_H)
       local ss = self:sizeMul("playerSprite" .. i)
-      local ax, ay = drawSprite(sx, sy, slotW, ROW_H, battler, "spriteBack", self.data, false, ss)
-      if ax then self.spriteAnchor[battler] = { x = ax, y = ay } end
+      -- Intro lead-in: the player trainer's back-pic stands in the player
+      -- slot (native's GetTrainerBackpic) until the very end of the
+      -- intro, then slides left off in 8px steps (native's backpic-slide)
+      -- just before the first "Go! P!". Only then is this mon drawn.
+      if self.showPlayerTrainer and self.playerTrainerImage and i == 1 then
+        drawRawImage(self.playerTrainerImage, sx, sy, slotW, ROW_H,
+          -slideStepPx(self.backpicSlide, BACKPIC_SLIDE_DURATION, BACKPIC_SLIDE_STEPS))
+      elseif self.playerRevealed[i] and (self:shownHpOf(battler.mon) or 0) > 0 and not battler.caught then
+        -- Pokeball send-out: the mon materializes at its platform (the
+        -- ball itself is drawn by drawBallThrow) -- scaled in from the
+        -- ground via ballAppearFor while its own "Go! P!" line reads.
+        local appear = ballAppearFor(self, "player", i)
+        local ax, ay = drawSprite(sx, sy, slotW, ROW_H, battler, "spriteBack", self.data, false, ss, 0, 0, appear)
+        if ax then self.spriteAnchor[battler] = { x = ax, y = ay } end
+      end
 
       local gx, gy = self:pos("playerGui" .. i, GUI_RIGHT_TX, ROW_H + (i - 1) * GUI_STACK_TY)
       local gs = self:sizeMul("playerGui" .. i)
-      drawGuiBox(gx, gy, GUI_TW, ROW_H, battler, self.data, true, true, gs,
-        self:shownHpOf(battler.mon))
+      if self.playerRevealed[i] then
+        drawGuiBox(gx, gy, GUI_TW, ROW_H, battler, self.data, true, true, gs,
+          self:shownHpOf(battler.mon))
+      end
+    end
+
+    -- Pokeball throw, drawn over every mon/GUI box but under F/E (so the
+    -- flying ball and its landing flash read above the field, below the
+    -- narration/menu).
+    if self.ballThrow then
+      self:drawBallThrow()
     end
 
     -- Move animation, on top of every sprite/GUI box but under F/E (so
@@ -2917,6 +3525,16 @@ return function(mod)
       self:drawMoveAnimObjects()
     end
 
+    -- Lose outro blackout: the canvas slowly fills from the bottom while
+    -- the defeat message sits over it (vanilla's faint-to-black after
+    -- your last mon falls). Drawn under F/E so the box stays legible.
+    if self.phase == "over" and self.outcome == "lose" and self.outroT then
+      local cover = math.min(VH, self.outroT / OUTRO_BLACKOUT_DURATION * VH)
+      love.graphics.setColor(0, 0, 0, 1)
+      love.graphics.rectangle("fill", 0, VH - cover, VW, cover)
+      love.graphics.setColor(1, 1, 1, 1)
+    end
+
     -- Bottom: F (message/move/target, wide) beside E (FIGHT/BAG/PKMN/RUN,
     -- narrow) -- vanilla's own text-box-plus-menu split, not one shared
     -- full-width box. Both go through Screen:withScale to apply their
@@ -2929,17 +3547,25 @@ return function(mod)
     -- from INSIDE that same withScale block below, where the transform
     -- itself does the scaling; fChars is the fixed default (F's own tile
     -- capacity doesn't change, only its on-screen size does).
+    -- Intro/outro narration draws a FULL-WIDTH message box -- vanilla
+    -- spans its battle text across the whole bottom row and only splits
+    -- off the E menu (FIGHT/BAG/PKMN/RUN) once the action menu is up.
+    -- F grows by E_TW; E is skipped entirely.
+    local narrationW = (self.phase == "intro" or self.phase == "over")
     local fx, fy = self:pos("fBox", 0, BOTTOM_Y)
     local ex, ey = self:pos("eBox", F_TW, BOTTOM_Y)
+    local fw = narrationW and (F_TW + E_TW) or F_TW
     self.fTextX, self.fTextY = (fx + 1) * 8 + 2, (fy + 1) * 8 + 2
     self.eTextX, self.eTextY = (ex + 1) * 8 + 2, (ey + 1) * 8 + 2
-    self.fChars = F_TW - 4
+    self.fChars = fw - 4
 
     self:withScale("fBox", fx, fy, function()
       love.graphics.setColor(1, 1, 1, 1)
-      drawBoxNoGap(fx, fy, F_TW, BOTTOM_H)
+      drawBoxNoGap(fx, fy, fw, BOTTOM_H)
       love.graphics.setColor(0, 0, 0, 1)
-      if self.phase == "actionMenu" then
+      if self.phase == "intro" then
+        drawWrapped(self.currentMessage or "", self.fTextX, self.fTextY, self.fChars)
+      elseif self.phase == "actionMenu" then
         self:drawActionMenuF()
       elseif self.phase == "moveSelect" then
         self:drawMoveSelect()
@@ -2956,18 +3582,20 @@ return function(mod)
       end
     end)
 
-    self:withScale("eBox", ex, ey, function()
-      love.graphics.setColor(1, 1, 1, 1)
-      drawBoxNoGap(ex, ey, E_TW, BOTTOM_H)
-      love.graphics.setColor(0, 0, 0, 1)
-      -- The prompt's two labels go where FIGHT/BAG/PKMN/RUN normally sit
-      -- -- the same vanilla text-box-plus-menu split this box exists for
-      -- (see drawContent's own note above), so a question reads as the
-      -- action menu temporarily offering two different actions rather
-      -- than as a foreign box dropped on the field.
-      if self.phase == "actionMenu" then self:drawActionMenuE()
-      elseif self.phase == PROMPT_PHASE then self:drawPromptE() end
-    end)
+    if not narrationW then
+      self:withScale("eBox", ex, ey, function()
+        love.graphics.setColor(1, 1, 1, 1)
+        drawBoxNoGap(ex, ey, E_TW, BOTTOM_H)
+        love.graphics.setColor(0, 0, 0, 1)
+        -- The prompt's two labels go where FIGHT/BAG/PKMN/RUN normally sit
+        -- -- the same vanilla text-box-plus-menu split this box exists for
+        -- (see drawContent's own note above), so a question reads as the
+        -- action menu temporarily offering two different actions rather
+        -- than as a foreign box dropped on the field.
+        if self.phase == "actionMenu" then self:drawActionMenuE()
+        elseif self.phase == PROMPT_PHASE then self:drawPromptE() end
+      end)
+    end
   end
 
   function Screen:draw()
