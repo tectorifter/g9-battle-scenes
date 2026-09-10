@@ -204,9 +204,11 @@ return function(mod)
   -- Intro send-out pacing. Player mons and every trainer-battle mon
   -- (enemy and player) are THROWN from a pokeball: the ball arcs from
   -- the trainer's side to the mon's platform, lands with a white poof,
-  -- and the mon materializes there (the native ball-throw beat, drawn
-  -- procedurally -- the real thing is BattleAnim_SendOutMon inside the
-  -- battle_anims scripting system this screen doesn't run). Only a WILD
+  -- and the mon materializes there. The ball is the game's own art (the
+  -- BATTLE_ANIM_OBJ_POKE_BALL frameset off the same battle_anims cache
+  -- the move animations use -- see drawNativeBall), thrown along this
+  -- screen's own per-slot arc rather than vanilla's fixed coordinate; the
+  -- primitive drawPokeball is only the fallback. Only a WILD
   -- mon gets the vanilla slide-in: it drops from the top of the screen
   -- onto its own platform.
   local BALL_FLIGHT = 0.45    -- ball in the air
@@ -621,10 +623,12 @@ return function(mod)
     return dx + dw / 2, dy + dh
   end
 
-  -- Draws a pokeball as primitives (no asset dependency -- the native
-  -- ball is a frame of the battle_anims sprite sheet this screen doesn't
-  -- load) at `cx,cy` with radius `r`. `spin` (0..1 over the flight) turns
-  -- the ball one-and-a-half times so the red/white split visibly tumbles.
+  -- Draws a pokeball as primitives at `cx,cy` with radius `r`. `spin`
+  -- (0..1 over the flight) turns the ball one-and-a-half times so the
+  -- red/white split visibly tumbles. This is now only the FALLBACK --
+  -- drawNativeBall below draws the game's own ball art -- kept for the
+  -- case where the cached battle_anims data or that sprite sheet is
+  -- missing, so a send-out still reads as a ball rather than nothing.
   local function drawPokeball(cx, cy, r, spin)
     love.graphics.push()
     love.graphics.translate(cx, cy)
@@ -638,6 +642,138 @@ return function(mod)
     love.graphics.circle("fill", 0, 0, 2.2)
     love.graphics.setColor(1, 1, 1, 1)
     love.graphics.pop()
+  end
+
+  ------------------------------------------------------------------
+  -- The native pokeball, for the send-out throw.
+  --
+  -- User-reported: the primitive ball above reads as a drawn stand-in,
+  -- not the game's own ball. The real one is just another object in the
+  -- battle_anims cache this file ALREADY receives (self.data.
+  -- gen2BattleAnims): BATTLE_ANIM_OBJ_POKE_BALL, whose object row names
+  -- BATTLE_ANIM_FRAMESET_POKE_BALL_1 -- the two-frame closed ball the
+  -- native throw flies (oamframe OAMSET_0A/0B alternating, the 4th frame
+  -- X-flipped, so the ball visibly tumbles) -- and BATTLE_ANIM_GFX_POKE_BALL,
+  -- the sheet, drawn through the SAME BattleAnimView + GbcPalette.objPalette
+  -- path Screen:drawMoveAnimObjects already uses, so the pixels and the
+  -- red OBJ palette (PAL_BATTLE_OB_RED, off the object row) are the cart's
+  -- own rather than a redrawn approximation.
+  --
+  -- Nothing native moves it: the throw's own arc is this screen's, because
+  -- a double battle's landing spot is a per-slot platform, not vanilla's
+  -- one fixed coordinate. So only the ball's OAM frame is taken from the
+  -- animation; its position comes from the caller's parabola. The OAM
+  -- entry math below is a faithful copy of AnimObjects.lua's
+  -- Pool:updateOam (tile = base + oamset.vtile + sprite.tile, and a
+  -- flipped frame mirrors each cell by -(offset+8) while toggling that
+  -- cell's own flip), fed back through BattleAnimView's real drawObjects
+  -- via a minimal stand-in runner.
+  local BALL_DRAW_SCALE = SPRITE_BOX / 56 -- native ball is 16px vs a 56px mon
+  -- The landing pose is drawn with its centre a little above the platform
+  -- bottom the mon is anchored to, so the open ball sits ON the ground.
+  local BALL_LAND_LIFT = 5
+  local BALL_OAM_XFLIP, BALL_OAM_YFLIP, BALL_OAM_PAL1 = 0x20, 0x40, 0x10
+  -- The struct origin (0-255 OAM space) of a 16x16 two-by-two OAM set sits
+  -- 8 right and 16 down of the ball's own centre (each cell draws at
+  -- x-8/y-16; the four cells span [Sx-16,Sx] x [Sy-24,Sy-8]), so a local
+  -- origin of (8,16) centres the ball on the draw origin the caller sets.
+  local BALL_LOCAL_X, BALL_LOCAL_Y = 8, 16
+
+  local function s8(value)
+    value = (value or 0) % 256
+    return value < 0x80 and value or value - 256
+  end
+
+  -- A frameset's drawable rows with their per-frame duration (60fps frames)
+  -- and flip flags, dropping the restart/end/delete pseudo-rows -- the same
+  -- walk AnimObjects.lua's Pool:getFrame does.
+  local function ballFramesetPlan(anims, framesetName)
+    local frames = anims.framesets and anims.framesets[framesetName]
+    if not frames then return nil end
+    local list, total = {}, 0
+    for _, row in ipairs(frames) do
+      if row[1] == "frame" then
+        local duration = row[3] or 1
+        list[#list + 1] = { oamset = row[2], flip = row[4] or 0, duration = duration }
+        total = total + duration
+      elseif row[1] == "wait" then
+        local duration = row[2] or 1
+        list[#list + 1] = { duration = duration }
+        total = total + duration
+      end
+    end
+    if total <= 0 then return nil end
+    return { list = list, total = total }
+  end
+
+  local function ballFrameAt(plan, elapsed)
+    local at = (math.floor(elapsed * 60) % plan.total) + 1
+    for _, frame in ipairs(plan.list) do
+      if at <= frame.duration then return frame end
+      at = at - frame.duration
+    end
+    return plan.list[#plan.list]
+  end
+
+  -- One frame of the native ball, centred on screen (cx,cy). `open` uses
+  -- the pose the native object switches to when the throw lands
+  -- (BATTLE_ANIM_FRAMESET_POKE_BALL_3) instead of the in-flight tumble;
+  -- it falls back to the in-flight frameset if that data is absent.
+  -- Returns false when the cache/sheet is unavailable, so the caller can
+  -- draw the primitive fallback instead.
+  local function drawNativeBall(screen, cx, cy, elapsed, open)
+    local anims = screen.data and screen.data.gen2BattleAnims
+    local object = anims and anims.objects and
+      anims.objects["BATTLE_ANIM_OBJ_POKE_BALL"]
+    if not object then return false end
+    local function oamsetAt(framesetName)
+      local plan = ballFramesetPlan(anims, framesetName)
+      local frame = plan and ballFrameAt(plan, elapsed)
+      return frame and frame.oamset and anims.oamsets and
+        anims.oamsets[frame.oamset], frame
+    end
+    local oamset, frame = oamsetAt(open and "BATTLE_ANIM_FRAMESET_POKE_BALL_3"
+      or object.frameset)
+    if not oamset and open then oamset, frame = oamsetAt(object.frameset) end
+    if not oamset then return false end
+    local sheet = anims.gfx and anims.gfx[object.gfx]
+    if not sheet then return false end
+    screen.animView = screen.animView or
+      BattleAnimView.new(anims, screen.data.gen2Palettes)
+    local view = screen.animView
+    local image = view:image(sheet.image)
+    if not image then return false end
+    local frameFlip = (frame and frame.flip) or 0
+    local xFlip = bit.band(frameFlip, BALL_OAM_XFLIP) ~= 0
+    local yFlip = bit.band(frameFlip, BALL_OAM_YFLIP) ~= 0
+    local entries = {}
+    for _, sprite in ipairs(oamset.sprites or {}) do
+      local ex, ey = s8(sprite.x), s8(sprite.y)
+      if xFlip then ex = -(ex + 8) end
+      if yFlip then ey = -(ey + 8) end
+      entries[#entries + 1] = {
+        x = BALL_LOCAL_X + ex,
+        y = BALL_LOCAL_Y + ey,
+        tile = (oamset.vtile or 0) + (sprite.tile or 0),
+        attr = bit.band(bit.bxor(sprite.attr or 0, frameFlip), 0xe0) +
+          bit.band(sprite.attr or 0, BALL_OAM_PAL1),
+        palette = object.palette,
+      }
+    end
+    -- BattleAnimView:drawObjects takes the runner by duck type: it only
+    -- reads runner:oam() and runner.loaded (sheetForTile's own list). No
+    -- AnimRunner instance is needed to draw a still frame -- and none
+    -- could place it here anyway, its motion is vanilla's fixed one.
+    local runner = {
+      loaded = { { tile = 0, tiles = sheet.tiles, gfx = object.gfx } },
+      oam = function() return entries end,
+    }
+    love.graphics.push()
+    love.graphics.translate(cx, cy)
+    love.graphics.scale(BALL_DRAW_SCALE, BALL_DRAW_SCALE)
+    view:drawObjects(runner, nil)
+    love.graphics.pop()
+    return true
   end
 
   -- 0..1 scale for a mon materializing at the end of a pokeball throw
@@ -2352,6 +2488,34 @@ return function(mod)
     return id and SPREAD_MOVE_IDS[id] == true or false
   end
 
+  -- ROUND 26 (2026-09-10): can this picked move legally be aimed at one
+  -- of the caster's OWN living teammates? Authoritative answer:
+  -- g9-battle-engine-beta's isAllyTargetable (national_dex's own target
+  -- archetype plus the selected-pokemon/heal records like Heal Pulse).
+  -- Trusted when the engine has it; an OLD engine predating that export
+  -- falls back to the move def's own target/healing fields, so the
+  -- picker still offers allies with a stale engine. Used only to widen
+  -- the target picker -- the ENGINE still decides at resolution time
+  -- whether a fainted ally means the move redirects (foe) or fails (ally).
+  function Screen:isAllyTargetable(picked)
+    if not picked then return false end
+    local id = picked.slot and picked.slot.id
+    local eng = self.g9dex and self.g9dex.exports and self.g9dex.exports.isAllyTargetable
+    if eng then
+      local ok, res = pcall(eng, id)
+      if ok then return res == true end
+    end
+    local def = picked.def
+    if def then
+      if def.target == "ally" or def.target == "user-or-ally" then return true end
+      if def.target == "selected-pokemon"
+          and ((def.healing or 0) > 0 or def.category == "heal") then
+        return true
+      end
+    end
+    return false
+  end
+
   function Screen:updateMoveSelect(input)
     local count = #self.usableMovesCache
     if input:wasPressed("up") then
@@ -2398,29 +2562,47 @@ return function(mod)
       for _, e in ipairs(self.enemyBattlers) do
         if self.combat.isAlive(e) then aliveEnemies[#aliveEnemies + 1] = e end
       end
-      if #aliveEnemies > 1 then
+      -- ROUND 26: a move that can legally be aimed at an ally (Heal Pulse,
+      -- Helping Hand, Aromatherapy-shaped support -- the engine's own
+      -- isAllyTargetable is the authority) also offers the acting
+      -- battler's OWN living teammates in the picker, listed first, so the
+      -- player can choose who to heal/support. Every other move keeps the
+      -- enemy-only picker exactly as before.
+      local candidates = aliveEnemies
+      if self:isAllyTargetable(picked) then
+        candidates = {}
+        local caster = self.playerBattlers[self.actingSlotIdx]
+        for _, a in ipairs(self.playerBattlers) do
+          if a ~= caster and self.combat.isAlive(a) then
+            candidates[#candidates + 1] = a
+          end
+        end
+        for _, e in ipairs(aliveEnemies) do
+          candidates[#candidates + 1] = e
+        end
+      end
+      if #candidates > 1 then
         -- A move that targets every adjacent enemy by itself (LEER, Muddy
         -- Water, Earthquake, ...) has nothing to choose -- the picker is
         -- skipped entirely and the first alive enemy is queued as a
         -- placeholder target; g9-battle-engine-beta's resolveTurnActions
         -- re-resolves the full roster (resolveMoveTargets) at resolution
         -- time, so the placeholder never limits who actually gets hit.
-        local spread = self:isSpreadMove(picked)
-        if spread then
-          self:queueAction(picked, aliveEnemies[1])
+        if self:isSpreadMove(picked) then
+          self:queueAction(picked, aliveEnemies[1] or candidates[1])
           self:advanceSlotOrResolve()
         else
           self.pendingPick = picked
-          self.targetCandidates = aliveEnemies
+          self.targetCandidates = candidates
           self.targetCursor = 1
           self.phase = "targetSelect"
         end
-      elseif #aliveEnemies == 1 then
-        self:queueAction(picked, aliveEnemies[1])
+      elseif #candidates == 1 then
+        self:queueAction(picked, candidates[1])
         self:advanceSlotOrResolve()
       else
-        -- Both enemies already down -- shouldn't reach here (the battle
-        -- would already have ended), kept defensive rather than assumed.
+        -- Nobody left to target -- shouldn't reach here (the battle would
+        -- already have ended), kept defensive rather than assumed.
         self:beginResolving()
       end
     end
@@ -2442,7 +2624,10 @@ return function(mod)
   end
 
   ------------------------------------------------------------------
-  -- TARGET SELECT (only entered when 2 enemies are alive)
+  -- TARGET SELECT -- entered when there is more than one candidate: two
+  -- or more living enemies, or an ally-targetable move (Heal Pulse and
+  -- friends) whose own living teammates join the list beside the foes
+  -- (round 26). B cancels back to the move list; A queues the pick.
   ------------------------------------------------------------------
   function Screen:updateTargetSelect(input)
     local count = #self.targetCandidates
@@ -3414,8 +3599,17 @@ return function(mod)
       local q = 1 - p
       local x = q * q * ox + 2 * q * p * ax + p * p * tx
       local y = q * q * oy + 2 * q * p * ay + p * p * ty
-      drawPokeball(x, y, BALL_RADIUS, p)
+      -- The game's own ball, tumbling on its native POKE_BALL_1 frameset
+      -- as it flies this screen's arc (drawPokeball only if that data
+      -- isn't in the cache).
+      if not drawNativeBall(self, x, y, t, false) then
+        drawPokeball(x, y, BALL_RADIUS, p)
+      end
     elseif t < BALL_FLIGHT + BALL_POOF then
+      -- Landed: show the ball's own opening pose on the platform (lifted
+      -- so it sits on the ground, not half-buried), under the white flash
+      -- that fades as the mon materializes.
+      drawNativeBall(self, tx, ty - BALL_LAND_LIFT, 0, true)
       local tp = (t - BALL_FLIGHT) / BALL_POOF
       love.graphics.setColor(1, 1, 1, 1 - tp)
       love.graphics.circle("fill", tx, ty, 4 + tp * 20)
