@@ -1,58 +1,22 @@
+-- Boss fight preset: four of your Pokemon against ONE boss.
+--
+-- Standardized 16:9 field geometry -- see battle_screen.lua's geometry
+-- header and layouts/singles.lua's own note -- with the two deliberate
+-- exceptions this preset exists for. First, `boss = true` makes the lone
+-- enemy stand at column e5 (col 5, just right of the centre seam) and draws
+-- it at the field's natural scale PLUS that +0.6 (x1 x 1.6 = x1.6), so it is
+-- clearly the biggest sprite on the field. The boss is CENTRED on e5 and
+-- anchored to the TOP of the field (its feet land BOSS_MUL bands down), so it
+-- towers over the upper/enemy half rather than standing down on the allies'
+-- own ground line. It uses its own headroom, so it is never clipped.
+-- Second, because the boss stands to the RIGHT of the centre seam
+-- and the four allies start at the far LEFT (cols 1..4), the two
+-- groups stay clear of each other.
+--
+-- Nothing here nudges a sprite or a HUD box: the grid places everything.
 return {
   allyCount = 4,
   enemyCount = 1,
-  layout = {
-    eBox = {
-      size = 0.85,
-      tx = 29.916666666667,
-      ty = 12.5,
-    },
-    enemyGui1 = {
-      size = 2.0111111111111,
-      tx = 0.25,
-      ty = -5.0416666666667,
-    },
-    enemySprite1 = {
-      size = 1.7166666666667,
-      tx = 18.375,
-      ty = -1.0416666666667,
-    },
-    fBox = {
-      size = 0.82222222222222,
-      tx = 0.41666666666667,
-      ty = 12.666666666667,
-    },
-    playerGui1 = {
-      tx = 25,
-      ty = -0.375,
-    },
-    playerGui2 = {
-      tx = 25,
-      ty = 2.1416666666667,
-    },
-    playerGui3 = {
-      tx = 25,
-      ty = 4.6166666666667,
-    },
-    playerGui4 = {
-      tx = 25,
-      ty = 7.175,
-    },
-    playerSprite1 = {
-      tx = 0.70833333333333,
-      ty = 7.5,
-    },
-    playerSprite2 = {
-      tx = 7.70833333333333,
-      ty = 7.5,
-    },
-    playerSprite3 = {
-      tx = 14.70833333333333,
-      ty = 7.5,
-    },
-    playerSprite4 = {
-      tx = 21.70833333333333,
-      ty = 7.5,
-    },
-  },
+  boss = true,
+  layout = {},
 }

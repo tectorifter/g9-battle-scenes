@@ -9,7 +9,7 @@ return {
   --   below is set.
   menuLayout = "grid",
 
-  -- "Gimmicks" -- real, permanent label, not a demo value. Explicit user
+  -- "FORMS" -- real, permanent label, not a demo value. Explicit user
   -- decision: battle_forms owns this button (Screen:chooseMenuItem's own
   -- "CUSTOM" branch calls straight into battle_forms's exposed
   -- mod.exports.transforms registry -- Mega Evolution, Dynamax, whatever
@@ -17,5 +17,5 @@ return {
   -- library this same button was left off in, since no specific mod was
   -- meant to own it there), g9-Battle-Scene is tightly coupled to
   -- specific combat mods by design -- see this mod's own manifest.json.
-  customButtonLabel = "Gimmicks",
+  customButtonLabel = "FORMS",
 }

@@ -1,5 +1,5 @@
 -- Named layout preset system: preset files live in this mod's own
--- layouts/<name>.lua (e.g. layouts/wildEncounter.lua, layouts/
+-- layouts/<name>.lua (e.g. layouts/singles.lua, layouts/
 -- bossFight.lua, layouts/horde.lua), each shaped exactly like the dev
 -- tool's own SELECT>SAVE export (g2-Battle-Scene-Dev/dev_layout.lua's
 -- EXPORT_KEY): { enemyCount, allyCount, layout }.
@@ -10,16 +10,23 @@
 -- mod.exports.pushLayoutBattle("bossFight", game, world,
 -- {enemies={boss}, players=party}). This mod never builds the roster
 -- itself: the caller already knows what a "boss" or a "horde" is and
--- hands over real Mon objects. A layout only decides WHERE things sit on
--- screen (positions/sizes) -- enemyCount/allyCount in the file are
--- informational (the roster size that preset was tuned against), not
--- something this mod enforces or auto-generates for an arbitrary caller.
--- This mod owns no encounter-trigger logic of its own at all -- every
--- caller (Sample-Battle-Scene's own wild-encounter hook included) reads
--- these two fields as an input to ITS OWN roster-building and supplies
+-- hands over real Mon objects. A layout decides WHERE things sit on
+-- screen (positions/sizes). allyCount in the file is informative only
+-- (the roster size that preset was tuned against) -- the caller/engine
+-- slices its own player roster, this mod never does. enemyCount is used
+-- as a CAP for a TRAINER's enemy roster: because the preset only has
+-- positions for enemyCount enemies (bossFight=1), any Pokemon past that
+-- is held on a bench (battle_screen.lua's Screen.enemyBench) and sent out
+-- one at a time as an active enemy faints (Screen:advanceEnemyReplacement)
+-- -- so a two-Pokemon bossFight trainer puts exactly one boss on the field
+-- at a time instead of stacking both in one slot. A WILD battle is never
+-- capped: there is no trainer to send a replacement, so every enemy stays
+-- active. This mod owns no encounter-trigger logic of its own at all --
+-- every caller (Sample-Battle-Scene's own wild-encounter hook included)
+-- reads these fields as an input to ITS OWN roster-building and supplies
 -- the final Mon array; this mod never builds one itself.
 return function(mod)
-  local ACTIVE_LAYOUT = "wildEncounter"
+  local ACTIVE_LAYOUT = "singles"
   mod.exports.ACTIVE_LAYOUT = ACTIVE_LAYOUT
 
   local LAYOUT_DIR = "layouts"
@@ -107,7 +114,7 @@ return function(mod)
   -- custom scene only ever appears behind a genuine, successful API call
   -- for a specific, present layout, never as a silent generic
   -- substitute. A caller gets nil back and is expected to fall through to
-  -- its own vanilla-combat path (Sample-Battle-Scene's own wildEncounter
+  -- its own vanilla-combat path (Sample-Battle-Scene's own wild-encounter
   -- trigger does exactly this when its preset is missing).
   function mod.exports.pushLayoutBattle(layoutName, game, world, payload)
     if not mod.exports.getLayoutData(layoutName) then

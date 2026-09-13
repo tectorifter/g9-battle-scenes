@@ -1,0 +1,1027 @@
+-- native.lua -- the generation backend for g9-Battle-Scene.
+--
+-- "Preserve gold/silver compatibility, but make sure g9-battle-scene works
+-- in gen 1."  Gold/Silver (generation 2) is this mod's original home and stays
+-- byte-for-byte behaviourally identical: every symbol below maps 1:1 onto the
+-- exact gen2 module or `data.gen2*` field the scene required before, so the
+-- Gen 2 path is unchanged by construction.  Red/Blue/Yellow (generation 1) is
+-- the new arm.
+--
+-- WHY A BACKEND FILE AT ALL.  The scene was written against the Gen 2 engine,
+-- which is model/view separated (`src.battle.gen2.Battle` is a pure model,
+-- `src.ui.gen2.BattleState` is the screen).  Gen 1 is NOT: `src.battle.
+-- BattleState` is one screen class that owns the model AND the presentation.
+-- The scene therefore needs a thin, per-generation shim for the handful of
+-- engine surfaces it touches, rather than a `if gen == 2` scattered through
+-- 5,200 lines.  This file is that shim; battle_screen.lua talks only to it.
+--
+-- WHAT IS GEN-SPECIFIC, and why:
+--   * Battle model      -- gen2 `Battle.new` (a real model) vs gen1 a
+--                          `BattleState` instance used purely as a model
+--                          (its move executor is the game's own).
+--   * Catching          -- gen2 `Catching.attempt({opts})` vs gen1
+--                          `Catching.attempt(ball, mon, def, rng, rate, opts)`.
+--   * EXP               -- gen2 `Battle:awardExperience` (screen-free model
+--                          method) vs gen1 `Experience.apply` (the pure module
+--                          `BattleState:awardExp` is built on; the method
+--                          itself is queue-coupled to the native screen).
+--   * HUD tiles         -- gen2 `src.ui.gen2.BattleHud` (VRAM $60-$78 tiles)
+--                          vs gen1 `src.render.HudTiles` ($62-$7F overlay).
+--                          The real Gen 2 HUD is used on Gen 1 too whenever
+--                          the Gen 2 menu graphics are present (see below).
+--   * menus             -- gen2 Gen2PartyMenu/Gen2PackMenu vs gen1
+--                          PartyMenu + a ball-only ListMenu.
+--   * move animations   -- TWO native engines, picked by the same
+--                          asset rule as everything else.  With the Gen 2
+--                          battle-anim tables present, gen2 AnimRunner/
+--                          BattleAnimView play (the Gen 2 arm's own engine,
+--                          wired into a Gen 1 boot too).  Without them -- a
+--                          stock Red/Blue/Yellow boot -- Gen 1's OWN
+--                          `src.battle.AnimPlayer` plays instead: a different
+--                          contract (compiled per-frame OAM steps over
+--                          data.battle_anims.moveAnims, not a running
+--                          script), so it gets its own arm rather than a
+--                          translation.  Both are the game's own data; there
+--                          is no "no animation" Gen 1 case any more.
+--   * trainer colours   -- gen2 TrainerPalettes via src.world.gen2.Palettes,
+--                          used whenever the Gen 2 palette table is present;
+--                          otherwise Gen 1 draws its trainer art raw (its SGB
+--                          colouring is a native-screen pipeline this scene
+--                          does not reproduce).
+--   * status labels     -- gen2 `data.gen2Statuses` when that table is
+--                          present, else gen1 `src.battle.Status.hudLabelFor`.
+--
+-- CALLING THE GEN 2 ASSETS INTO GEN 1.  A stock Red/Blue/Yellow boot carries
+-- no `data.gen2*` tables at all (src/core/Game2.lua loads them only for a
+-- Gold/Silver boot), so the Gen 1 arm treats them as an optional asset pack:
+-- when the live game data is found to carry any Gen 2 asset table -- an engine
+-- that bundles Gold's data, or a content mod that merges a `data.gen2*`
+-- registry -- the Gen 1 arm answers every asset question with the SAME table
+-- the Gen 2 arm reads (palette/menu-gfx/status/trainer/constants/anim data),
+-- builds the real Gen 2 battle HUD (so Gen 1 gets the cart's $60-$78 tiles and
+-- a real exp bar back), loads the Gen 2 move-animation engine, and colours
+-- trainer art through the Gen 2 palette rows.  With no Gen 2 assets present
+-- every path keeps its Gen 1 behaviour exactly, and none of the Gen 2 anim/HUD
+-- modules are even loaded.  The generation switch (`N.isGen2`) is NOT what
+-- selects this: the presence of the assets is.
+--
+-- COMBAT AUTHORITY.  The standing rule is "combat logic lives in
+-- g9-battle-engine only".  On Gen 2 that is exactly what happens:
+-- `resolveTurnActions(battle, acting)` drives the engine's whole pipeline and
+-- this mod owns none of it.  On Gen 1 the engine mod is a Gen 2 engine and
+-- cannot drive a Gen 1 `BattleState`, so the combat authority is the GAME'S
+-- OWN Gen 1 battle engine -- `BattleState:performMove` (accuracy, damage,
+-- effects, status, PP: the real thing, not a reimplementation) sequenced by
+-- the real `src.battle.TurnOrder`.  That is the same "call the native
+-- primitives" discipline the mod already applies to catch and EXP on Gen 2;
+-- no formula is duplicated.  A future gen-1-capable engine mod can take over
+-- by exporting `resolveTurnActionsForGen1(battle, acting)` -- checked first
+-- below -- with no change to this file's callers.
+--
+-- Loaded FIRST by main.lua, before battle_screen.lua.
+return function(mod)
+  local function tryRequire(name)
+    local ok, value = pcall(require, name)
+    if ok then return value end
+    return nil
+  end
+
+  -- A sibling file of this mod, returning whatever it returns (no mod arg --
+  -- this is for a plain data module, not a `return function(mod)` sibling).
+  local function loadSiblingFile(filename)
+    local body, readErr = mod:read(filename)
+    assert(body, readErr)
+    local chunk, err = loadstring(body, "@" .. mod.path .. "/" .. filename)
+    assert(chunk, err)
+    return chunk()
+  end
+
+  local GameVersion = tryRequire("src.core.GameVersion")
+  local gen = 1
+  if GameVersion and GameVersion.generation then
+    local ok, value = pcall(GameVersion.generation)
+    if ok and value then gen = value end
+  end
+
+  local N = { gen = gen, isGen2 = (gen == 2) }
+
+  ------------------------------------------------------------------
+  -- THE THROWN BALL -- the game's own colour, animation params and catch
+  -- loop, shared by both arms because they are static cart data/behaviour
+  -- rather than a module one generation owns.  Gen 2's own screen reads
+  -- exactly these (src/ui/gen2/BattleState.lua:3218-3322); the scene hands
+  -- them to the native ANIM_THROW_POKE_BALL script through AnimRunner.
+  ------------------------------------------------------------------
+
+  -- data/battle_anims/ball_colors.asm BallColors, in its own order.  Anything
+  -- not listed falls to the terminator row's PAL_BATTLE_OB_GRAY.  This is the
+  -- "native colour" the ball is drawn in: the animation's own object function
+  -- (BATTLE_ANIM_FUNC_POKEBALL/ballPal) stamps env.ballPalette onto the ball.
+  local BALL_COLORS = {
+    MASTER_BALL = "PAL_BATTLE_OB_GREEN",
+    ULTRA_BALL = "PAL_BATTLE_OB_YELLOW",
+    GREAT_BALL = "PAL_BATTLE_OB_BLUE",
+    POKE_BALL = "PAL_BATTLE_OB_RED",
+    HEAVY_BALL = "PAL_BATTLE_OB_GRAY",
+    LEVEL_BALL = "PAL_BATTLE_OB_BROWN",
+    LURE_BALL = "PAL_BATTLE_OB_BLUE",
+    FAST_BALL = "PAL_BATTLE_OB_BLUE",
+    FRIEND_BALL = "PAL_BATTLE_OB_YELLOW",
+    MOON_BALL = "PAL_BATTLE_OB_GRAY",
+    LOVE_BALL = "PAL_BATTLE_OB_RED",
+  }
+  local BALL_COLOR_DEFAULT = "PAL_BATTLE_OB_GRAY"
+
+  -- POKE_BALL's own item id (constants/item_constants.asm:13), for a cache
+  -- whose items table has no index on the row.
+  local POKE_BALL_ID = 5
+
+  -- data/battle/wobble_probabilities.asm WobbleProbabilities: catch rate, then
+  -- the chance out of 255 of wobbling again rather than breaking free.
+  local WOBBLE_PROBABILITIES = {
+    { 1, 63 }, { 2, 75 }, { 3, 84 }, { 4, 90 }, { 5, 95 }, { 7, 103 },
+    { 10, 113 }, { 15, 126 }, { 20, 134 }, { 30, 149 }, { 40, 160 },
+    { 50, 169 }, { 60, 177 }, { 80, 191 }, { 100, 201 }, { 120, 211 },
+    { 140, 220 }, { 160, 227 }, { 180, 234 }, { 200, 240 }, { 220, 246 },
+    { 240, 251 }, { 254, 253 }, { 255, 255 },
+  }
+
+  -- GetPokeBallWobble (engine/battle_anims/pokeball_wobble.asm), which
+  -- ANIM_THROW_POKE_BALL's own checkpokeball loop calls once per wobble: 0
+  -- wobble again, 1 click, 2 break free.  The counter goes up FIRST and the
+  -- fourth call ends the loop -- a caught mon clicks, anything else breaks
+  -- free.  Before that a caught mon always wobbles again and a doomed one
+  -- re-rolls: the first WobbleProbabilities row whose catch rate is at least
+  -- the final rate is the one whose byte the roll has to come in under.
+  -- `rand` is the battle's own random(n) (the scene passes self.battle.random,
+  -- the same function Catching.attempt rolls on).
+  N.ballWobble = function(caught, rate, rand)
+    local wobble = 0
+    return function()
+      wobble = wobble + 1
+      if wobble == 4 then return caught and 1 or 2 end
+      if caught then return 0 end
+      local chance = 0
+      for _, row in ipairs(WOBBLE_PROBABILITIES) do
+        if row[1] >= (rate or 0) then chance = row[2] break end
+      end
+      local roll = 0
+      if type(rand) == "function" then
+        local ok, value = pcall(rand, 256)
+        if ok and type(value) == "number" then roll = value end
+      end
+      return roll < chance and 0 or 2
+    end
+  end
+
+  -- GetBallAnimPal (engine/battle_anims/functions.asm:292): the PAL_BATTLE_OB_*
+  -- name the thrown ball wears, resolved for the item being thrown.
+  N.ballPalette = function(ballId)
+    return BALL_COLORS[ballId] or BALL_COLOR_DEFAULT
+  end
+
+  -- wBattleAnimParam for the throw: the item's own id, except that everything
+  -- past POKE_BALL (the Kurt balls) is thrown with POKE_BALL's -- `cp POKE_BALL
+  -- + 1 / jr c, .not_kurt_ball / ld a, POKE_BALL` (item_effects.asm:396).  It
+  -- is what BattleAnim_ThrowPokeBall's anim_if_param_equal rows branch on
+  -- (data/moves/animations.asm:305-308).
+  N.ballAnimParam = function(data, ballId)
+    local items = (data and data.items) or {}
+    local pokeBall = (items.POKE_BALL and items.POKE_BALL.index) or POKE_BALL_ID
+    local entry = items[ballId]
+    local id = entry and (entry.index or entry.id)
+    if type(id) ~= "number" then id = pokeBall end
+    if id > pokeBall then return pokeBall end
+    return id
+  end
+
+  -- PlayStereoSFX (audio/engine.asm:2571), the ONE sfx path with no CheckSFX
+  -- gating -- the throw's own SFX_THROW_BALL then SFX_BALL_POOF would otherwise
+  -- be dropped as outranked by its first (see BattleState:startAnim's own sound
+  -- hook).  Guarded through pcall so a trimmed engine or a headless harness
+  -- simply plays nothing rather than aborting the throw.
+  N.playAnimSfx = function(data, name)
+    if not name then return end
+    local ok, Sound = pcall(require, "src.core.Sound")
+    if not ok or type(Sound) ~= "table" then return end
+    local fn = Sound.playStereo or Sound.play
+    if type(fn) ~= "function" then return end
+    pcall(fn, data, name)
+  end
+
+  ------------------------------------------------------------------
+  -- GENERATION 2 -- the real modules and data fields, unchanged.
+  ------------------------------------------------------------------
+  if N.isGen2 then
+    N.Battle = require("src.battle.gen2.Battle")
+    N.Catching = require("src.battle.gen2.Catching")
+    N.HpBar = require("src.battle.gen2.HpBar")
+    N.BattleHud = require("src.ui.gen2.BattleHud")
+    N.Mon = require("src.battle.gen2.Mon")
+    N.Palettes = require("src.world.gen2.Palettes")
+    N.AnimRunner = require("src.battle.gen2.AnimRunner")
+    N.BattleAnimView = require("src.ui.gen2.BattleAnimView")
+    N.Sprites = require("src.pokemon.Sprites")
+
+    N.paletteData = function(data) return data and data.gen2Palettes end
+    N.menuGfxData = function(data) return data and data.gen2MenuGfx end
+    N.statusesData = function(data) return data and data.gen2Statuses end
+    N.trainersData = function(data) return data and data.gen2Trainers end
+    N.constantsData = function(data) return data and data.gen2Constants end
+    N.animData = function(data) return data and data.gen2BattleAnims end
+
+    N.monExp = function(mon)
+      return mon and (mon.experience or mon.exp) or 0
+    end
+
+    N.partyMenuId = function() return "Gen2PartyMenu" end
+    N.packMenuId = function() return "Gen2PackMenu" end
+
+    N.isBall = function(id, def) return def ~= nil and def.pocket == "BALL" end
+
+    N.buildBattle = function(opts) return N.Battle.new(opts) end
+    N.newStages = function() return N.Battle.newStages() end
+    N.takeEvents = function(battle) return battle:takeEvents() end
+
+    N.setParticipants = function(battle, battlers, save, combat)
+      battle.participants = {}
+      for _, battler in ipairs(battlers) do
+        if combat.isAlive(battler) then
+          for index, mon in ipairs(save.party) do
+            if mon == battler.mon then
+              battle.participants[index] = true
+              break
+            end
+          end
+        end
+      end
+    end
+
+    N.awardExperience = function(battle, loser) battle:awardExperience(loser) end
+
+    N.catchAttempt = function(opts) return N.Catching.attempt(opts) end
+
+    -- The pre-existing Gen 2 full-party destination: insertion at the head of
+    -- the current box, refilling PP.  Returns ok, message-suffix.
+    N.depositCatch = function(save, mon)
+      local Boxes = require("src.core.gen2.Boxes")
+      local index = math.max(1, math.min(Boxes.NUM_BOXES,
+        math.floor(tonumber(save.currentBox) or 1)))
+      local box = Boxes.box(save, index)
+      table.insert(box, 1, mon)
+      if type(Boxes.enterBox) == "function" then Boxes.enterBox(mon) end
+      local where = (Boxes.name and Boxes.name(save, index)) or "the PC"
+      return true, " It was sent to " .. where .. "."
+    end
+
+    N.resolveTurn = function(g9dex, battle, actingBattlers)
+      g9dex.exports.resolveTurnActions(battle, actingBattlers)
+      return battle:takeEvents()
+    end
+
+    N.statusLabel = nil
+
+    -- -- trainer intro art ---------------------------------------------
+    -- Player back-pic: native reads gen2MenuGfx.battleHud and raises
+    -- player.sprite over it.  Returns path, trueColor, colours.
+    N.playerBackArt = function(data, save, battle)
+      local hud = data and data.gen2MenuGfx and data.gen2MenuGfx.battleHud
+      local palettes = data and data.gen2Palettes
+      local female = save and save.player
+        and save.player.gender == "female"
+      local path = hud and hud.playerBack
+      if hud and hud.playerBackFemale and female then
+        path = hud.playerBackFemale
+      end
+      local trueColor = false
+      if path then
+        path, trueColor = N.Sprites.playerPic(path, {
+          side = "back", kind = "battle", battle = battle, data = data,
+        })
+      end
+      local colors = N.Palettes.trainerColors(palettes,
+        female and "FALKNER" or "PLAYER")
+        or N.Palettes.trainerColors(palettes, "PLAYER")
+      return path, trueColor, colors
+    end
+
+    -- Enemy class front-pic, same sources native's BattleState:drawPic reads.
+    -- Returns path, trueColor, colours.
+    N.enemyTrainerArt = function(data, trainerData)
+      local hud = data and data.gen2MenuGfx and data.gen2MenuGfx.battleHud
+      local palettes = data and data.gen2Palettes
+      local classId = trainerData.classId or trainerData.class
+      local classes = data and data.gen2Trainers
+        and data.gen2Trainers.classes
+      local classDef = classes and classes[classId]
+      local path = (classDef and classDef.pic)
+        or (hud and hud.trainerPics and hud.trainerPics[classId])
+      local trueColor = (classDef and classDef.trueColor) and true or false
+      return path, trueColor, N.Palettes.trainerColors(palettes, classId)
+    end
+
+  ------------------------------------------------------------------
+  -- GENERATION 1 -- adapters over the Gen 1 engine's own primitives.
+  ------------------------------------------------------------------
+  else
+    local BattleState = require("src.battle.BattleState")
+    local Catching = require("src.battle.Catching")
+    local Experience = require("src.battle.Experience")
+    local Growth = require("src.pokemon.Growth")
+    local Status = require("src.battle.Status")
+    local TurnOrder = require("src.battle.TurnOrder")
+    local HudTiles = require("src.render.HudTiles")
+    -- Pure (no love, no requires) HP-bar maths, vendored for the exact
+    -- ComputeHPBarPixels / GetHPPal math.  VENDORED as the mod's own
+    -- hp_bar.lua rather than required by its engine name: the engine's
+    -- cross-generation require gate (src/mods/Loader.lua's
+    -- crossGenerationDenial) refuses every require("src.*.gen2.*") on a Gen 1
+    -- boot, so the engine module is unreachable from here even though its
+    -- code is pure.  The Gen 2 arm above still requires the real engine
+    -- module and is unchanged.
+    local HpBarPure = loadSiblingFile("hp_bar.lua")
+
+    ------------------------------------------------------------------
+    -- GEN 2 ASSETS ON A GEN 1 BOOT.
+    -- See the header's "Calling the Gen 2 assets into Gen 1" note.  A stock
+    -- Gen 1 boot has none of these tables, so every accessor below keeps
+    -- answering nil (its previous behaviour); a build that carries them gets
+    -- the Gen 2 asset set through the same code the Gen 2 arm runs.
+    ------------------------------------------------------------------
+    local GEN2_ASSET_KEYS = {
+      "gen2Palettes", "gen2MenuGfx", "gen2Statuses", "gen2Trainers",
+      "gen2Constants", "gen2BattleAnims",
+    }
+    -- `data` iff it carries at least one Gen 2 asset table, else nil.
+    local function gen2Assets(data)
+      if type(data) ~= "table" then return nil end
+      for _, key in ipairs(GEN2_ASSET_KEYS) do
+        if data[key] then return data end
+      end
+      return nil
+    end
+    N.gen2Assets = gen2Assets
+    -- Is a Gen 2 asset pack present in this boot?  Probed off the live
+    -- game-data singleton at LOAD time: the engine loads generated data and
+    -- folds every mod merge over it BEFORE the mod loader runs, so this sees
+    -- everything a "Gen 1 boot carrying Gen 2 assets" would carry.  A stock
+    -- Gen 1 boot answers false, and the Gen 2 modules below are then never
+    -- loaded at all.  (The accessors further down still read the per-call
+    -- `data`, so an asset table that appears later is not lost.)
+    local bootData = tryRequire("src.core.Data")
+    local gen2 = gen2Assets(bootData) ~= nil
+    -- The shared Gen 2 modules the Gen 2 arm loads unconditionally, pcall'd
+    -- so a trimmed build yields nil rather than failing the boot.
+    local Gen2Palettes = gen2 and tryRequire("src.world.gen2.Palettes") or nil
+    local Gen2BattleHud = gen2 and tryRequire("src.ui.gen2.BattleHud") or nil
+
+    N.HpBar = HpBarPure
+    N.Catching = Catching
+    N.Sprites = require("src.pokemon.Sprites")
+
+    -- -- HUD ---------------------------------------------------------
+    -- A HudTiles-backed stand-in for the Gen 2 BattleHud interface the scene
+    -- calls: :available() / :drawHpBar(hp,maxHp,tx,ty) / :drawExpBar(...),
+    -- plus the static EXP_LENGTH_PX.  Gen 1's own DrawHPBar already draws the
+    -- same "HP:" + six 8px cells + cap at the same 48px width, so the readout
+    -- geometry carries over.  Gen 1 has no in-battle exp bar, so drawExpBar
+    -- is a deliberate no-op (the player readout simply has no exp row).
+    local HudMt = {}
+    HudMt.__index = HudMt
+    HudMt.EXP_LENGTH_PX = HpBarPure.LENGTH_PX
+    function HudMt.new() return setmetatable({}, HudMt) end
+    function HudMt:available() return true end
+    function HudMt:drawHpBar(hp, maxHp, tx, ty)
+      local data = require("src.core.Data")
+      local shim = { hp = math.max(0, hp or 0),
+                     stats = { hp = math.max(1, maxHp or 1) } }
+      -- barType 1 is the player's own in-battle bar (double-bar cap).
+      return pcall(HudTiles.drawHPBar, data, tx, ty, shim, 1)
+    end
+    function HudMt:drawExpBar() return false end
+    N.BattleHud = HudMt
+
+    -- "All the Gen 2 assets" includes the HUD itself.  Gen 2's battle HUD
+    -- draws the cart's own $60-$78 tiles AND a real exp bar, which is exactly
+    -- what the scene was written against; HudMt exists only because a stock
+    -- Gen 1 boot cannot supply the Gen 2 menu graphics.  So hand the scene the
+    -- real Gen 2 HUD the moment those graphics are present, and HudMt
+    -- otherwise.  Same entry points either way (:available(), :drawHpBar,
+    -- :drawExpBar, .EXP_LENGTH_PX) -- which is all the scene talks to.
+    local HudDispatch = {}
+    function HudDispatch.new(menuGfx, palettes)
+      if Gen2BattleHud and menuGfx and menuGfx.battleHud then
+        return Gen2BattleHud.new(menuGfx, palettes)
+      end
+      return HudMt.new()
+    end
+    HudDispatch.EXP_LENGTH_PX = (Gen2BattleHud and Gen2BattleHud.EXP_LENGTH_PX)
+      or HudMt.EXP_LENGTH_PX
+    N.BattleHud = HudDispatch
+
+    -- -- exp curve ----------------------------------------------------
+    -- Mon.partySpecies/growthFor/experienceForLevel, the three helpers the
+    -- expFraction readout uses.  Gen 1's mon stores its total as `.exp` (the
+    -- scene reads that through N.monExp) and its curve is evaluated by the
+    -- real src.pokemon.Growth, exactly as Experience.apply does it.
+    N.Mon = {
+      MAX_LEVEL = 100,
+      partySpecies = function(mon) return mon and mon.species end,
+      growthFor = function(data, rate)
+        return { rate = rate, rates = data and data.growth_rates }
+      end,
+      experienceForLevel = function(growth, level)
+        if not growth then return 0 end
+        return Growth.expForLevel(growth.rate, level, growth.rates)
+      end,
+    }
+
+    -- -- trainer colours ----------------------------------------------
+    -- The Gen 2 class-colour rows, from the same module the Gen 2 arm uses,
+    -- whenever the Gen 2 palette table is present.  With none, nil -- which
+    -- makes drawRawImage draw the sheet raw, the honest DMG look rather than a
+    -- wrong tint (Gen 1's own SGB colouring is a native-screen pipeline this
+    -- scene does not reproduce).
+    N.Palettes = {
+      trainerColors = function(palettes, classId)
+        if not (Gen2Palettes and palettes) then return nil end
+        return Gen2Palettes.trainerColors(palettes, classId)
+      end,
+    }
+
+    -- Gen 2's move-animation engine, the same modules the Gen 2 arm wires.
+    -- Loaded only when the Gen 2 assets are actually present (pcall-guarded on
+    -- top).  When they are, the scene's move-anim entry points take the Gen 2
+    -- path exactly as they always did (the Gen 2 arm's own engine, on a Gen 1
+    -- boot); when they are not, the Gen 1 arm below takes over instead.
+    N.AnimRunner = gen2 and tryRequire("src.battle.gen2.AnimRunner") or nil
+    N.BattleAnimView = gen2
+      and tryRequire("src.ui.gen2.BattleAnimView") or nil
+
+    ------------------------------------------------------------------
+    -- GEN 1'S OWN MOVE-ANIMATION ENGINE -- src/battle/AnimPlayer.lua.
+    --
+    -- The cart's Red/Blue/Yellow battle animations are played by a
+    -- DIFFERENT module with a DIFFERENT data contract from Gen 2's
+    -- AnimRunner: AnimPlayer compiles `data.battle_anims`' moveAnims rows
+    -- into a flat list of timed OAM steps at :start() (the subanimation
+    -- player of engine/battle/animations.asm, reimplemented), then just
+    -- ticks them with :update()/:isDone().  That is why the scene needs an
+    -- arm, not a translation -- but it IS the native engine, and the
+    -- scene's Gen 1 arms drive exactly the contract the game's own
+    -- BattleState drives (src/battle/BattleState.lua:1399-1405).
+    --
+    -- Loaded whenever the module resolves.  The engine's own cross-
+    -- generation gate (src/mods/Loader.lua) refuses `src.*.gen2.*` on a Gen
+    -- 1 boot but `src.battle.AnimPlayer` is Gen 1's own module, so it is
+    -- always reachable here; tryRequire keeps a trimmed build from failing
+    -- the boot over it.  A missing module (or missing `data.battle_anims`)
+    -- simply makes the scene's Gen 1 animation call sites no-ops.
+    N.AnimPlayer = tryRequire("src.battle.AnimPlayer")
+
+    -- `data.battle_anims` is a BASE Gen 1 generated module (src/core/
+    -- Data.lua's MODULES list), so it is there on every Red/Blue/Yellow
+    -- boot -- unlike the `gen2*` tables above, which are an optional pack.
+    -- Shape: { moveAnims = { <id> = {seq=...} }, subanims, frameBlocks,
+    -- baseCoords, tilesheets } -- see tools/extract/battle_anims.py.
+    N.gen1AnimData = function(data) return data and data.battle_anims end
+
+    -- BattleState:tossAnimFor (src/battle/BattleState.lua:5499-5506): the
+    -- ball record's own tossAnim, else wCurItem's mapping
+    -- POKE->TOSS, GREAT->GREATTOSS, everything else ULTRATOSS.
+    N.ballTossAnim = function(ballId)
+      local def = Catching.BALLS and Catching.BALLS[ballId]
+      if def and def.tossAnim then return def.tossAnim end
+      return ballId == "POKE_BALL" and "TOSS_ANIM"
+          or ballId == "GREAT_BALL" and "GREATTOSS_ANIM"
+          or "ULTRATOSS_ANIM"
+    end
+
+    -- The Master/Ultra OBJ-palette strobe, off the ball record
+    -- (DoBallTossSpecialEffects; AnimPlayer's own opts.ballFlicker).
+    N.ballFlicker = function(ballId)
+      local def = Catching.BALLS and Catching.BALLS[ballId]
+      return (def and def.flicker) or false
+    end
+
+    -- A battle_anim row's sound byte is a MOVE id: GetMoveSound plays that
+    -- move's MoveSoundTable entry (sfx + its own pitch/tempo bytes), except
+    -- that the GROWL/ROAR animations (IsCryMove) play the ATTACKER's cry
+    -- instead, with the move's own tempo layered on.  Mirrors
+    -- BattleState:playAnimSound, pcall'd so a trimmed engine or a headless
+    -- harness simply plays nothing rather than aborting the animation.
+    -- `opts.animName`/`opts.crySpecies` are the running animation's id and
+    -- its attacker's species (only GROWL/ROAR read them).
+    N.playMoveAnimSound = function(data, soundMove, opts)
+      if not soundMove then return end
+      local ok, Sound = pcall(require, "src.core.Sound")
+      if not ok or type(Sound) ~= "table" then return end
+      local mdef = data and data.moves and data.moves[soundMove]
+      local anim = mdef and mdef.anim
+      local name = opts and opts.animName
+      if (name == "GROWL" or name == "ROAR") and opts and opts.crySpecies then
+        if type(Sound.playMoveCry) == "function" then
+          pcall(Sound.playMoveCry, data, opts.crySpecies, anim and anim.tempo)
+        end
+        return
+      end
+      if not anim then return end
+      if type(Sound.playMove) == "function" then
+        pcall(Sound.playMove, data, anim)
+      elseif anim.sound then
+        pcall(Sound.play, data, anim.sound)
+      end
+    end
+
+    -- The Gen 2 asset tables, straight off `data` exactly as the Gen 2 arm
+    -- reads them.  Absent on a stock Gen 1 boot (nil, the accessors' previous
+    -- answer); present on a build carrying the Gen 2 assets, which then get
+    -- the whole set: menu graphics + palettes for the HUD, battle animations,
+    -- trainer art and colours, authored status labels.
+    N.paletteData = function(data) return data and data.gen2Palettes end
+    N.menuGfxData = function(data) return data and data.gen2MenuGfx end
+    N.statusesData = function(data) return data and data.gen2Statuses end
+    N.trainersData = function(data) return data and data.gen2Trainers end
+    N.constantsData = function(data) return data and data.gen2Constants end
+    N.animData = function(data) return data and data.gen2BattleAnims end
+
+    N.monExp = function(mon) return mon and (mon.exp or 0) or 0 end
+
+    N.partyMenuId = function() return "PartyMenu" end
+    N.packMenuId = function() return "ListMenu" end
+
+    N.isBall = function(id) return Catching.BALLS[id] ~= nil end
+
+    N.newStages = function() return {} end
+
+    -- -- the battle model ---------------------------------------------
+    -- A real BattleState instance (so the game's own methods are all on the
+    -- metatable) used as a MODEL: `makeBattler` builds the native battlers
+    -- from the caller's own mon tables, `performMove` is the native move
+    -- executor, and the screen-side message queue is drained into the event
+    -- stream this scene already paces on.
+    N.buildBattle = function(opts, game, data)
+      local state = setmetatable({}, BattleState)
+      state.game = game
+      state.data = game.data
+      state.kind = (data.trainer ~= nil and data.trainer ~= false)
+        and "trainer" or "wild"
+      state.rng = function(a, b) return love.math.random(a, b) end
+      state.random = state.rng
+      state.queue = {}
+      state.events = {}
+      state.participants = {}
+      state.moveAnimRow = nil
+      state.nextInsert = 0
+      state.stages = { player = {}, enemy = {} }
+      -- The substrate EffectRegistry/Status expect on a battle object.
+      state.sides = {
+        { index = 1, battlers = {}, screens = {}, hazards = {}, tokens = {} },
+        { index = 2, battlers = {}, screens = {}, hazards = {}, tokens = {} },
+      }
+      state.field = { weather = nil, tokens = {}, sides = state.sides }
+
+      local rulesets = game.data.rulesets or {}
+      local selected = game.save and game.save.options
+        and game.save.options.ruleset
+      state.ruleset = (selected and rulesets[selected])
+        or rulesets.gen1_faithful
+        or tryRequire("src.battle.rulesets.gen1_faithful")
+
+      -- Native battlers for every mon the scene will field, keyed by the mon
+      -- table itself so the g9dex-shaped useMove(monMon, monTarget, moveId)
+      -- call can find them.
+      local byMon, sideByMon, orderMons = {}, {}, {}
+      state.battlersByMon = byMon
+      state.sideByMon = sideByMon
+      state.rosterMons = orderMons
+      local function addBattler(mon, isPlayer)
+        if not mon or byMon[mon] then return end
+        byMon[mon] = BattleState.makeBattler(game.data, mon, isPlayer,
+          isPlayer and game.save or nil)
+        sideByMon[mon] = isPlayer and "player" or "enemy"
+        orderMons[#orderMons + 1] = mon
+      end
+      for _, mon in ipairs(data.enemies or {}) do addBattler(mon, false) end
+      for _, mon in ipairs(data.players or {}) do addBattler(mon, true) end
+
+      state.enemyParty = data.enemies or {}
+      state.enemyIndex = 1
+      state.enemy = (data.enemies and data.enemies[1]) and byMon[data.enemies[1]]
+      state.player = (data.players and data.players[1]) and byMon[data.players[1]]
+
+      function state:emit(event) table.insert(self.events, event) end
+      function state:takeEvents()
+        local out = self.events
+        self.events = {}
+        return out
+      end
+      function state:clearVolatile(mon)
+        local battler = byMon[mon]
+        if battler then pcall(BattleState.clearVolatiles, self, battler) end
+      end
+      function state:setEnemyIndex(mon)
+        for i, m in ipairs(self.enemyParty) do
+          if m == mon then self.enemyIndex = i return end
+        end
+      end
+
+      -- BattleState.lua keeps displayName local; mirrored here for the
+      -- recharge line ("Enemy X must recharge!") exactly as that file builds
+      -- it (raw name on the player side, the "Enemy " qualifier on the foe's).
+      local function displayName(battler)
+        if battler.isPlayer then return battler.name end
+        return require("src.core.Strings")("Enemy %s", battler.name)
+      end
+
+      -- BattleState.lua's own local, read off the live ruleset; decides
+      -- whether a side's poison/burn/leech-seed residual runs right after
+      -- its move (Gen 1 / gen1_faithful) or in the end-of-round sweep
+      -- (modern_clean). Mirrored here so the scene's per-move call matches
+      -- what BattleState:endOfTurn will do with `sweep`.
+      local function residualAfterMove(battle)
+        local ruleset = battle.ruleset
+        return not ruleset or ruleset.residualAfterMove ~= false
+      end
+
+      -- BattleState:statusInterrupt (the pre-move status gauntlet:
+      -- sleep/freeze/held-in-place/flinch/disable/confusion/full-paralysis),
+      -- guarded so an older vanilla BattleState without the method cannot
+      -- take the battle down. Returns true when the action was eaten.
+      function state:statusGate(user, target, moveId)
+        if type(BattleState.statusInterrupt) ~= "function" then return false end
+        local ok, interrupted = pcall(BattleState.statusInterrupt, self, user,
+          target, moveId)
+        return ok and interrupted or false
+      end
+
+      -- The native move executor, in the g9dex shape (mons, not battlers).
+      -- Drains the native screen queue this move filled into real events, each
+      -- routed through self:emit so the scene's event probe stamps its HP
+      -- snapshot exactly as it does on Gen 2.
+      --
+      -- IMPORTANT: performMove is only the move EXECUTOR. The rest of a Gen 1
+      -- turn -- the pre-move status gauntlet, the recharge arm, the trapping
+      -- continuation and the per-move residual -- lives in
+      -- BattleState:executeAction, and the scene calls performMove directly.
+      -- Every one of those effects is therefore reproduced here, in the
+      -- asm's own order (core.asm CheckPlayerStatusConditions), or a flinched/
+      -- sleeping/frozen/fully-paralysed/confused/must-recharge mon would
+      -- silently get a free move.
+      function state:useMove(attackerMon, defenderMon, moveId)
+        local user = byMon[attackerMon]
+        local target = defenderMon and byMon[defenderMon] or nil
+        if not (user and target) then return end
+        local inst
+        for _, slot in ipairs(user.mon.moves or {}) do
+          if slot.id == moveId then inst = slot break end
+        end
+        inst = inst or { id = moveId, pp = 1 }
+        self.queue = {}
+        self.nextInsert = 0
+        self.moveAnimRow = nil
+        -- The held-in-place mirror executeAction refreshes before the status
+        -- checks (core.asm:414-416): the victim is held exactly while the
+        -- opponent's trapping counter is live (including a counter sitting at
+        -- 0 until the end-of-turn release).
+        user.boundTurns = target.trappingTurns
+                          and math.max(1, target.trappingTurns) or nil
+        -- Recharge turn (Hyper Beam et al): executeAction's `recharge` arm
+        -- never reaches performMove. The pre-recharge slice can still eat the
+        -- turn WITHOUT consuming the flag -- the native Hyper Beam glitch --
+        -- which is exactly what preRechargeChecks reproduces.
+        if user.mustRecharge then
+          local blocked = false
+          if type(BattleState.preRechargeChecks) == "function" then
+            local oka, ate = pcall(BattleState.preRechargeChecks, self,
+              user, target)
+            blocked = oka and ate or false
+          end
+          if not blocked then
+            user.mustRecharge = nil
+            self:sayNext(self:romText("_MustRechargeText",
+              "%s\nmust recharge!", displayName(user)))
+          end
+          self:drainNativeMove(nil)
+          return
+        end
+        -- Trapping continuation: while this battler's trapping counter is
+        -- live the native turn ignores its choice and runs the locked
+        -- continuation (executeAction's `trapping` arm). The counter is
+        -- released by BattleState:endOfTurn once it has reached 0.
+        if user.trappingTurns then
+          if self:statusGate(user, target, user.trapMove) then
+            self:drainNativeMove(nil)
+            return
+          end
+          self:continueTrapping(user, target)
+          self:drainNativeMove(user.trapMove)
+          return
+        end
+        -- The pre-move status gauntlet, before every ordinary move. When it
+        -- eats the turn, the status text it queued is all this action emits.
+        if self:statusGate(user, target, moveId) then
+          self:drainNativeMove(nil)
+          return
+        end
+        local ok, err = pcall(BattleState.performMove, self, user, target,
+          inst, false)
+        -- Gen 1 timing: each side's poison/burn/leech-seed residual runs
+        -- right after its OWN move (residualAfterMove rulesets) -- the
+        -- trailing HandlePoisonBurnLeechSeed executeAction queues. The
+        -- modern ruleset skips this and the end-of-round sweep in
+        -- BattleState:endOfTurn runs instead.
+        if ok and residualAfterMove(self) then
+          local rok, rerr = pcall(BattleState.residualFor, self, user, target)
+          if not rok then ok, err = false, rerr end
+        end
+        self:drainNativeMove(moveId)
+        if not ok then error(err, 0) end
+      end
+
+      function state:drainNativeMove(moveId)
+        for _, row in ipairs(self.queue) do
+          if type(row) == "table" and type(row.text) == "string" then
+            self:emit({ kind = "say", text = row.text })
+          end
+        end
+        -- A move happened: give the scene a per-action move beat so anything
+        -- keyed to it (a future Gen 1 animation arm) has a hook.  No anim
+        -- module is wired on Gen 1, so the scene's handler is a no-op today.
+        if moveId then self:emit({ kind = "move", move = moveId }) end
+        self.queue = {}
+        self.nextInsert = 0
+      end
+
+      -- Experience, via the pure module the native screen's awardExp is built
+      -- on.  Participants are mon-keyed (set by N.setParticipants below).
+      function state:awardExperience(loser)
+        local def = loser and self.data.pokemon[loser.species]
+        if not def then return end
+        local count = 0
+        if self.participants then
+          for _ in pairs(self.participants) do count = count + 1 end
+        end
+        if count == 0 then count = 1 end
+        local party = (self.game.save and self.game.save.party) or {}
+        local playerId = self.game.save and self.game.save.player
+          and self.game.save.player.id
+        for _, mon in ipairs(party) do
+          if self.participants[mon] and (mon.hp or 0) > 0 then
+            local traded = playerId ~= nil
+              and ((mon.otId ~= nil and mon.otId ~= playerId)
+                or (mon.otId == nil and mon.traded == true))
+            Experience.apply(self.data, mon, def, loser.level or 1,
+              self.kind == "trainer", count, traded, nil)
+          end
+        end
+      end
+
+      return state
+    end
+
+    N.setParticipants = function(battle, battlers, save, combat)
+      battle.participants = {}
+      for _, battler in ipairs(battlers) do
+        if combat.isAlive(battler) then battle.participants[battler.mon] = true end
+      end
+    end
+
+    N.takeEvents = function(battle) return battle:takeEvents() end
+
+    N.awardExperience = function(battle, loser) battle:awardExperience(loser) end
+
+    N.statusLabel = function(mon, data)
+      if not (mon and mon.status) then return nil end
+      -- A build carrying the Gen 2 status table uses its authored HUD label
+      -- -- the same record the Gen 2 arm's statusTag reads -- so Gen 1 shows
+      -- the Gen 2 text; otherwise the native Gen 1 registry's own label.
+      local authored = data and data.gen2Statuses
+        and data.gen2Statuses[mon.status]
+      if authored then
+        if authored.substatus then return nil end
+        return authored.hudLabel or authored.label
+      end
+      return Status.hudLabelFor(data and data.statuses, mon.status)
+    end
+
+    -- -- trainer intro art ---------------------------------------------
+    -- With the Gen 2 assets present: the Gen 2 back-pic, off
+    -- gen2MenuGfx.battleHud and GBC-coloured through the Gen 2 palette rows,
+    -- resolved exactly as the Gen 2 arm resolves it.  Otherwise Gen 1's own
+    -- back-pic, off the shared Sprites.playerPath seam (the real native
+    -- source: field.playerPics, with the catch-tutorial/oak fallbacks), which
+    -- already raises player.sprite exactly once -- drawn raw.
+    N.playerBackArt = function(data, save, battle)
+      local hud = data and data.gen2MenuGfx and data.gen2MenuGfx.battleHud
+      local palettes = data and data.gen2Palettes
+      local female = save and save.player
+        and save.player.gender == "female"
+      local path = hud and hud.playerBack
+      if hud and hud.playerBackFemale and female then
+        path = hud.playerBackFemale
+      end
+      if path then
+        local trueColor
+        path, trueColor = N.Sprites.playerPic(path, {
+          side = "back", kind = "battle", battle = battle, data = data,
+        })
+        local colors = N.Palettes.trainerColors(palettes,
+          female and "FALKNER" or "PLAYER")
+          or N.Palettes.trainerColors(palettes, "PLAYER")
+        return path, trueColor, colors
+      end
+      local fallback, rawTrue = N.Sprites.playerPath(data, "back", {
+        kind = "battle", battle = battle, data = data,
+      })
+      return fallback, rawTrue, nil
+    end
+
+    -- Trainer class front-pic.  With the Gen 2 assets present: the Gen 2
+    -- lookup the Gen 2 arm runs -- a trainers-registry `pic`/`trueColor` wins
+    -- over the extracted menu_gfx sheet, GBC-coloured through the Gen 2
+    -- palette rows.  Otherwise the native Gen 1 lookup, drawn raw (Gen 1's SGB
+    -- colouring is a native-screen pipeline this scene does not reproduce).
+    N.enemyTrainerArt = function(data, trainerData)
+      local classId = trainerData.classId or trainerData.class
+      local classes = data and data.gen2Trainers
+        and data.gen2Trainers.classes
+      local classDef = classes and classes[classId]
+      local hud = data and data.gen2MenuGfx and data.gen2MenuGfx.battleHud
+      local path = (classDef and classDef.pic)
+        or (hud and hud.trainerPics and hud.trainerPics[classId])
+      if path then
+        local trueColor = (classDef and classDef.trueColor) and true or false
+        return path, trueColor, N.Palettes.trainerColors(
+          data and data.gen2Palettes, classId)
+      end
+      local trainerRec = data and data.trainers and data.trainers[classId]
+      local gen1Path = BattleState.trainerPicPath(data, trainerRec, classId,
+        trainerData.partyIndex or 1)
+      return gen1Path, BattleState.trainerTrueColor(data, trainerRec), nil
+    end
+
+    N.catchAttempt = function(opts)
+      local data = require("src.core.Data")
+      return Catching.attempt(opts.ball, opts.mon, opts.def, opts.random,
+        opts.catchRate, { statuses = data.statuses, battle = opts.battle })
+    end
+
+    N.depositCatch = function(save, mon)
+      local Boxes = require("src.pokemon.Boxes")
+      local index = Boxes.deposit(save, mon)
+      if index then return true, " It was sent to the PC." end
+      return false
+    end
+
+    -- -- Gen 1 end of turn --------------------------------------------
+    -- The scene drives BattleState:performMove per action and never runs the
+    -- native per-action turn engine (BattleState:executeAction), so the
+    -- end-of-round half of a Gen 1 turn had no caller at all: the modern-
+    -- ruleset residual sweep, the trapping-counter release (CheckNumAttacks-
+    -- Left), the residualDone/skipMove reset, and the battle.turn_ended event
+    -- every turn-tick listener waits on.  This runs the non-presentation half
+    -- of BattleState:endOfTurn once per turn, whichever path resolved the
+    -- moves; it queues its status text with sayNext, so the drain right after
+    -- turns those rows into events.  (The Gen-1-timing per-move residual runs
+    -- inside state:useMove instead, exactly as residualAfterMove rulesets
+    -- expect, and endOfTurn then skips its own sweep.)
+    N.applyGen1EndOfTurn = function(battle)
+      if type(BattleState.endOfTurn) ~= "function" then return end
+      local ok = pcall(BattleState.endOfTurn, battle)
+      if not ok then return end
+      if type(battle.drainNativeMove) == "function" then
+        battle:drainNativeMove(nil)
+      end
+    end
+
+    -- -- turn resolution ----------------------------------------------
+    -- Natively ordered (real TurnOrder priority/speed) and natively executed
+    -- (BattleState:performMove).  An engine mod that grows a Gen 1 arm takes
+    -- over by exporting resolveTurnActionsForGen1.
+    N.resolveTurn = function(g9dex, battle, actingBattlers)
+      -- Head of every Gen 1 turn (core.asm MainInBattleLoop ->
+      -- BattleState:clearTurnFlinches, BattleState.lua:2096): a flinch set by
+      -- a SLOWER attacker after its victim already moved must not survive into
+      -- the next turn, or it eats a move it never earned. Runs before either
+      -- resolution path so both share it; battlers kept recharging (or mid
+      -- Rage) keep theirs, exactly as the native helper does.
+      if type(BattleState.clearTurnFlinches) == "function" then
+        pcall(BattleState.clearTurnFlinches, battle)
+      end
+      local eng = g9dex and g9dex.exports
+      local handled = false
+      if eng and type(eng.resolveTurnActionsForGen1) == "function" then
+        handled = pcall(eng.resolveTurnActionsForGen1, battle, actingBattlers)
+      end
+      if handled then
+        N.applyGen1EndOfTurn(battle)
+        return battle:takeEvents()
+      end
+
+      local byMon = battle.battlersByMon
+      local order = {}
+      for _, action in ipairs(actingBattlers) do order[#order + 1] = action end
+
+      local function moveDef(action)
+        local user = byMon[action.mon]
+        if not user then return nil end
+        return battle:moveDef({ id = action.move })
+      end
+      -- Insertion sort -- a turn is a handful of actions, and this keeps the
+      -- native firstMover comparison in exactly one place.
+      for i = 2, #order do
+        local j = i
+        while j > 1 do
+          local a, b = order[j], order[j - 1]
+          local aUser, bUser = byMon[a.mon], byMon[b.mon]
+          local aFirst = true
+          if aUser and bUser then
+            aFirst = TurnOrder.firstMover(aUser, moveDef(a), bUser, moveDef(b),
+              battle.rng, false)
+          end
+          if aFirst then break end
+          order[j], order[j - 1] = order[j - 1], order[j]
+          j = j - 1
+        end
+      end
+
+      local function aliveOpponent(mon)
+        local side = battle.sideByMon[mon]
+        for _, other in ipairs(battle.rosterMons) do
+          if battle.sideByMon[other] ~= side and other ~= mon
+             and (other.hp or 0) > 0 then
+            return other
+          end
+        end
+        return nil
+      end
+
+      for _, action in ipairs(order) do
+        local actor = byMon[action.mon]
+        if actor and (action.mon.hp or 0) > 0 then
+          local target = action.target
+          if not target or (target.hp or 0) <= 0 then
+            target = aliveOpponent(action.mon)
+          end
+          if target and (target.hp or 0) > 0 then
+            battle:useMove(action.mon, target, action.move)
+          end
+        end
+      end
+      N.applyGen1EndOfTurn(battle)
+      return battle:takeEvents()
+    end
+
+    -- -- the BALL list ------------------------------------------------
+    -- Gen 1's native BagMenu throws balls through the native BattleState
+    -- (`battle:throwBall`), which owns a different battle object than this
+    -- scene's.  A ball-only native ListMenu wired straight to the scene's own
+    -- throwBall is the equivalent, and keeps ball choice.
+    N.openBag = function(screen)
+      local Screens = require("src.ui.Screens")
+      local Strings = require("src.core.Strings")
+      local save = screen.game.save
+      local inventory = save.inventory or {}
+      local order = { "MASTER_BALL", "ULTRA_BALL", "GREAT_BALL",
+                      "POKE_BALL", "SAFARI_BALL" }
+      local items = {}
+      for _, id in ipairs(order) do
+        if Catching.BALLS[id] and (inventory[id] or 0) > 0 then
+          local def = screen.data.items and screen.data.items[id]
+          items[#items + 1] = { value = id, label = (def and def.name) or id,
+                                count = inventory[id] }
+        end
+      end
+      if #items == 0 then
+        screen.message = "You have no BALLS to throw!"
+        screen.phase = "actionMenu"
+        return
+      end
+      items[#items + 1] = { cancel = true, label = Strings("CANCEL") }
+      Screens.push(screen.game, "ListMenu", "BALLS", items, {
+        -- The CANCEL row is a real row of the list (ListMenu only pops itself
+        -- on B), so A on it has to close and hand back to the action menu here
+        -- -- exactly as B does through onCancel below.  Without this the row
+        -- was inert: pressed and nothing happened, with the bag still up.
+        onChoose = function(item, list)
+          if not item then return end
+          list:close()
+          screen.suppressInputFrame = true
+          if item.cancel or not item.value then
+            screen.phase = "actionMenu"
+            return
+          end
+          screen:throwBall(item.value)
+        end,
+        onCancel = function()
+          screen.suppressInputFrame = true
+          screen.phase = "actionMenu"
+        end,
+      })
+    end
+  end
+
+  mod.exports.native = N
+  mod.log:info("g9_Battle_Scene: native backend ready (gen %d)", N.gen)
+end

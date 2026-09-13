@@ -28,8 +28,21 @@
 -- FIGHT/BAG/PKMN/RUN menu (E) -- vanilla's own text-box-plus-menu split,
 -- not the single full-width box the earlier passes used.
 --
--- Virtual canvas is still 320x144 (40x18 tiles), fit via drawWidescreen
--- against the real window.
+-- Design field is 320x180 (40x22.5 tiles, 16:9); the scene draws it onto a
+-- 960x540 CANVAS (the design field at x3 -- see DS).
+--
+-- How that canvas reaches the window is the ONE thing the two generations do
+-- differently, and both paths are owned here:
+--
+--   * Gen 2 -- Game2's renderer resolves the scene through
+--     drawsWidescreen/drawWidescreen and blits it window-filling (unchanged;
+--     the Gen 2 path never touches any of the Gen 1 members below).
+--   * Gen 1 -- src/core/Game.lua has no drawWidescreen path at all.  It asks
+--     each state for the UI SURFACE it wants (BattleState:uiSize ->
+--     Renderer:setUISize) and then calls state:draw() into it, so the scene
+--     answers that same wide-battle contract and Screen:draw renders the
+--     960x540 canvas 1:1 into the surface the engine allocated.  See the
+--     WIDESCREEN CONTRACT block by Screen:drawWidescreen.
 return function(mod)
   local Font = require("src.render.Font")
   local Screens = require("src.ui.Screens")
@@ -45,15 +58,25 @@ return function(mod)
   -- activation, this session; potentially others) keep working correctly
   -- against a battle this mod drives, not just a native-turn-loop one.
   local Runtime = require("src.mods.Runtime")
+  -- The generation backend (native.lua, loaded before this file).  Every
+  -- engine surface this scene touches that differs between Red/Blue/Yellow
+  -- and Gold/Silver is reached through it, so the code below is one scene for
+  -- both games.  On Gen 2 each of these locals is the exact module it used to
+  -- be; on Gen 1 it is a Gen 1 adapter over the game's own primitives -- see
+  -- native.lua's header for the full split and for the combat-authority rule.
+  local N = assert(mod.exports.native,
+    "g9-Battle-Scene: native.lua must load before battle_screen.lua")
   -- Real native Battle, constructed here so battle:useMove (driven
-  -- through g9-battle-engine-beta's mod.exports.resolveTurnActions) has
+  -- through g9-battle-engine's mod.exports.resolveTurnActions) has
   -- the type chart/stats/RNG/event-queue machinery it needs -- see
   -- pushDoubleBattleScreen's own comment for why battler roster/identity
   -- still stays this mod's own arrays, never battle.player/battle.enemy.
-  local Battle = require("src.battle.gen2.Battle")
+  -- (Gen 1: a BattleState instance used purely as a model.)
+  local Battle = N.Battle
   -- Real catch formula/rate, replacing g2-Battle-Scene's own catch.lua
   -- (dropped entirely in this fork -- see manifest.json's description).
-  local Catching = require("src.battle.gen2.Catching")
+  -- (Gen 1: the native src/battle/Catching.lua algorithm.)
+  local Catching = N.Catching
   -- Genuinely pure (data in, data out, no Battle-instance dependency) --
   -- confirmed by direct source read, the same standard this mod already
   -- held Damage.calc/Catching.attempt to. HpBar.pixels/.palette/.draw
@@ -61,7 +84,8 @@ return function(mod)
   -- 48px-wide bar, its green/yellow/red thresholds, a live mon never
   -- showing a fully-empty bar), so this mod's bar reads identically to
   -- every native HP bar in the game rather than a reinvented one.
-  local HpBar = require("src.battle.gen2.HpBar")
+  -- (Pure -- the same module serves both generations.)
+  local HpBar = N.HpBar
   -- The real move-animation engine, Gen 2's own -- separate from Gen 1's
   -- (src/battle/AnimPlayer.lua) and, confirmed by direct source read,
   -- NOT coupled to the native single-battle BattleState class at all:
@@ -69,15 +93,58 @@ return function(mod)
   -- header says "Love-free"), and BattleAnimView:drawObjects(runner,
   -- battle) is the only half that touches love.graphics. The reference
   -- wiring this mirrors is src/ui/gen2/BattleState.lua:1064-1151
-  -- (startAnim/animForMove).
-  local AnimRunner = require("src.battle.gen2.AnimRunner")
-  local BattleAnimView = require("src.ui.gen2.BattleAnimView")
+  -- (startAnim/animForMove).  Gen 2 drives AnimRunner/BattleAnimView.
+  --
+  -- GEN 1 DOES HAVE AN EQUIVALENT -- its own src/battle/AnimPlayer.lua,
+  -- which the cart's own BattleState drives (src/battle/BattleState.lua:
+  -- 1399-1405).  It is a DIFFERENT module with a different data contract
+  -- (battle_anims moveAnims rows instead of Gen 2's animation scripts),
+  -- so it is not a drop-in substitute for AnimRunner -- but it IS the
+  -- native Gen 1 engine, and the scene arms it whenever the Gen 2 pair is
+  -- absent (see the GEN 1'S OWN ANIMATION ARM block below).  Both are nil
+  -- only on a build missing that module AND the Gen 2 ones, where every
+  -- animation call site still degrades to "no animation".
+  local AnimRunner = N.AnimRunner
+  local BattleAnimView = N.BattleAnimView
+  -- Gen 1's own battle-animation player (src/battle/AnimPlayer.lua), the
+  -- native engine its BattleState drives.  Nil unless the module resolves;
+  -- the Gen 1 arm below treats that as "no animation", never a crash.
+  local AnimPlayer = N.AnimPlayer
   -- Both needed to draw a move animation's OBJ layer with the real
   -- attacker/target position remap (Screen:drawMoveAnimObjects) instead
   -- of BattleAnimView:drawObjects' own vanilla-fixed coordinates -- same
   -- require paths BattleAnimView.lua itself uses.
   local bit = require("bit")
   local GbcPalette = require("src.render.GbcPalette")
+  -- The cart's own HUD tiles -- the "HP:" badge, the bar's six fill cells and
+  -- its end cap, the <LV> level glyph and the exp bar -- drawn from the same
+  -- sheets/palettes the native battle screen loads, so this mod's readout is
+  -- the game's own art instead of a hand-drawn approximation. See BattleHud's
+  -- own header for which VRAM slot holds what.  (Gen 1: a HudTiles-backed
+  -- adapter with the same interface -- see native.lua.)
+  local BattleHud = N.BattleHud
+  -- Mon's exp-curve helpers, for the exp bar's fill fraction -- the native
+  -- number is computed off the same growth records Mon.gainExperience used
+  -- (see expFraction below, mirroring BattleState:expPixels).
+  local Mon = N.Mon
+  -- Strings resolves a status record's label marker into the text the native
+  -- HUD prints (Battle.STATUSES stores plain strings, but a mod may register
+  -- its own), so a statused mon's tag reads exactly as the cart's does.
+  local Strings = require("src.core.Strings")
+  -- The GBC palette tables the trainer pics are COLOURED from. A trainer pic
+  -- is a 4-shade (grayscale) sheet like every other imported 2bpp image, so
+  -- the class's own TrainerPalettes row has to be substituted in at draw time
+  -- -- native does exactly this in BattleState:drawPic (Palettes.trainerColors
+  -- + GbcPalette.with), and drawing the sheet raw is what left the trainer
+  -- pics grey. See drawRawImage.  (Gen 1: no palette row -- its SGB colouring
+  -- is a native-screen pipeline; the sheets draw raw.)
+  local Palettes = N.Palettes
+  -- The player.sprite seam (Sprites.playerPic), the same hook Gen 1 raises
+  -- for its own back-pic. Native raises it for the player's Gen 2 back-pic
+  -- too, so a mod's swapped picture -- and its trueColor answer, which says
+  -- the art is already full-colour and must NOT be remapped -- reaches the
+  -- draw exactly as it does on the native screen.  The module is shared.
+  local Sprites = require("src.pokemon.Sprites")
 
   ------------------------------------------------------------------
   -- Real N-way adjacency, the one contribution combat/
@@ -89,9 +156,9 @@ return function(mod)
   -- The grid this answers from already exists as real, working state --
   -- self.enemyBattlers[i]/self.playerBattlers[i], explicitly built
   -- N-agnostic ("Looped, not hardcoded to exactly 2", Screen.new's own
-  -- comment) and already index-aligned with each layout preset's own
-  -- enemySprite<i>/playerSprite<i> position slots -- this wrap is the
-  -- missing piece connecting that real grid to g9-battle-engine-beta's
+  -- comment) and already index-aligned with each side's own grid slot
+  -- column (sideColumns) -- this wrap is the
+  -- missing piece connecting that real grid to g9-battle-engine's
   -- own targeting seam, not a new grid built from scratch.
   --
   -- lastScreen: a single reference, not a registry -- this engine only
@@ -125,7 +192,7 @@ return function(mod)
     -- registered at install time, well before mod.exports.combat exists
     -- (combat.lua's own install runs separately) -- by the time a real
     -- battle ever reaches this closure, every sibling file has finished
-    -- loading, the same lazy-lookup convention g9-battle-engine-beta's
+    -- loading, the same lazy-lookup convention g9-battle-engine's
     -- own code uses throughout for exactly this reason.
     local combat = mod.exports.combat
     local isAlive = combat and combat.isAlive
@@ -200,7 +267,30 @@ return function(mod)
   Screen.__index = Screen
   Screen.isOpaque = true
 
-  local VW, VH = 320, 160
+  -- The DESIGN space this whole file's geometry is authored in: 320x180
+  -- (40x22.5 tiles). It is NOT the render surface any more -- see DS
+  -- below. Every tile/px constant, every slot rect and every font/border
+  -- draw stays in these units, so the layout is unchanged.
+  local VW, VH = 320, 180
+  -- Design -> CANVAS scale. The coordinate space this scene actually draws
+  -- into is CANVAS_W x CANVAS_H = 960x540 (16:9) -- the design field at x3.
+  -- Everything authored in VWxVH is drawn under one scale(DS) transform,
+  -- so the layout keeps its exact shape and proportions, but the SURFACE
+  -- it lands on is 960x540, i.e. half of 1080p.
+  -- Why 960x540: it is a whole-number multiple of the design field (x3)
+  -- AND a clean sub-multiple of every standard display -- x1 = 960x540,
+  -- x2 = 1920x1080, x4 = 3840x2160 (4K), x8 = 7680x4320 (8K) -- so on
+  -- those sizes the window-fill scale (see fitScale) lands on a perfect
+  -- whole number and stays crisp. On any OTHER size it now fills at
+  -- whatever fractional ratio the display allows (user's rule, round
+  -- sixty-nine: filling the window beats integer-letterboxing, because
+  -- the letters floated the whole scene -- bottom GUI included -- away
+  -- from the real screen edge). It also lets the sprite pack's own art
+  -- reach the screen at its real resolution: a sprite is baked at the
+  -- CANVAS scale (drawSprite's ctx.scale) and blitted 1:1, instead of
+  -- being baked small and then magnified by the fit transform.
+  local DS = 3
+  local CANVAS_W, CANVAS_H = VW * DS, VH * DS -- 960x540
   -- Intro send-out pacing. Player mons and every trainer-battle mon
   -- (enemy and player) are THROWN from a pokeball: the ball arcs from
   -- the trainer's side to the mon's platform, lands with a white poof,
@@ -225,7 +315,13 @@ return function(mod)
   local BALL_PLAYER_AX, BALL_PLAYER_AY = 96, 18
   local BALL_ENEMY_OX, BALL_ENEMY_OY = 330, 10
   local BALL_ENEMY_AX, BALL_ENEMY_AY = 292, 2
-  local WILD_DROP_DURATION = 0.5
+  -- A wild-encounter mon has no trainer to throw its ball, so it appears
+  -- IN PLACE: drawn at its final sprite position from the very first frame,
+  -- fading from completely invisible (alpha 0) to completely visible
+  -- (alpha 1) over this many seconds -- the user's rule (round sixty-three).
+  -- This replaced a 0.5s drop-in that slid the mon down from the top of the
+  -- screen; its position, size and reveal gating are otherwise unchanged.
+  local WILD_FADE_DURATION = 1.0
   -- Trainer/intro pic slides, ported from the native screen's own frame
   -- counts (src/ui/gen2/BattleState.lua:124-129): the enemy trainer's
   -- class front-pic slides OFF to the right in TRAINER_SLIDE_FRAMES=16
@@ -273,6 +369,11 @@ return function(mod)
   -- a picked-up row (src/ui/ListMenu.lua, src/ui/PartyMenu.lua), reused
   -- here for the same purpose on a picked-up move.
   local SWAP_MARKER_CODE = 0xEC
+  -- The native refusal when a listed move has no PP left (Gen 1's
+  -- _MoveNoPPText / Gen 2's BattleText_TheresNoPPLeftForThisMove). A
+  -- 0-PP move is never dropped off the list; picking it prints this and
+  -- returns to the list, exactly as both native move menus do.
+  local MOVE_NO_PP_TEXT = "No PP left for this move!"
   -- mon.gender is "male"/"female"/"unknown" (Mon.lua's own GENDERS
   -- table). These two escapes are the exact UTF-8 bytes for MALE SIGN /
   -- FEMALE SIGN already used elsewhere in this codebase's own UI
@@ -293,7 +394,8 @@ return function(mod)
   -- label comes from settings.lua (self.customButtonLabel, read once per
   -- battle in Screen.new); selecting it fires a hook instead of a
   -- built-in action (see Screen:chooseMenuItem).
-  local MENU_LABELS = { FIGHT = "FIGHT", BAG = "BAG", PKMN = "PKMN", RUN = "RUN" }
+  local MENU_LABELS = { FIGHT = "FIGHT", BAG = "BAG", PKMN = "PKMN", RUN = "RUN",
+    SWITCH = "SWITCH" }
 
   -- Plain 2x2 grid coordinates (confirmed directly by the user: FIGHT/
   -- PKMN on top, BAG/RUN on bottom). Real row/col toggling works fine
@@ -306,6 +408,18 @@ return function(mod)
   local CROSS_SLOTS = {
     { "FIGHT", nil, "PKMN" },
     { nil, "CUSTOM", nil },
+    { "BAG", nil, "RUN" },
+  }
+
+  -- SWITCH-ENABLED shapes, used when the battle has two or more living
+  -- allies and is not a bossFight (see the layout note by the geometry
+  -- constants far below). SWITCH sits directly UNDER FIGHT in both: the
+  -- wide grid gains a middle row, the cross gains its empty middle-left
+  -- cell -- everything else keeps its old place, CUSTOM included.
+  local GRID2_ROWS_SW = { { "FIGHT", "PKMN" }, { "SWITCH", "BAG" }, { "RUN", nil } }
+  local CROSS_SLOTS_SW = {
+    { "FIGHT", nil, "PKMN" },
+    { "SWITCH", "CUSTOM", nil },
     { "BAG", nil, "RUN" },
   }
 
@@ -330,6 +444,20 @@ return function(mod)
   -- prefix gate outright, so the emit below would have silently done
   -- nothing since the moment this mod was created.
   local CUSTOM_BUTTON_EVENT = "mod.g9-Battle-Scene.customButton"
+
+  -- Emitted (mod.events:emit) by the FORMS bridge for each phase of a
+  -- manually activated transformation, so a peer mod can follow one without
+  -- reading this scene's internals: `phase` is "armed" (a FORM was confirmed
+  -- and is waiting on battle.turn_started), "used" (battle_forms' own
+  -- activation consumed it) or "cancelled" (the picker was backed out of, the
+  -- arm was refused, or the activation was refused). Every payload carries
+  -- `mon` -- the live Pokemon the FORM belongs to -- because battle_forms
+  -- resolves the owner from `battle.player`, which this scene only focuses on
+  -- that mon for the duration of each battle_forms call (see the GIMMICK
+  -- SELECT section's own FORMS OWNER block). Also `slot`, `id`, `label`,
+  -- `reason` (cancellations), `battle`, `game`, `world`. Prefixed with this
+  -- mod's own id for the same reason CUSTOM_BUTTON_EVENT is.
+  local FORMS_EVENT = "mod.g9-Battle-Scene.forms"
 
   -- Two-choice prompt: the phase this screen sits in while a question is
   -- on screen. Declared HERE, at module scope, rather than beside the
@@ -374,54 +502,187 @@ return function(mod)
     return data
   end
 
-  -- Row geometry, tiles. ROW_H=5 (40px) stays fixed -- widening it to fit
-  -- a taller GUI box would eat into the bottom area's own already-tight
-  -- budget (see BOTTOM_H below), so the GUI box's real HP bar + gender
-  -- symbol land within the SAME 2-line, 24px-interior box the plain-text
-  -- version used, not a taller one.
-  local ROW_H = 5
-  -- GUI_TW=15 (interior (15-2)*8=104px) is sized for line 2: the 48px HP
-  -- bar plus, for the player's own box only, "NNN/NNN" beside it --
-  -- 48+6(gap)+40(text)=94px, needing real margin past GUI_TW=13's 88px.
+  -- ------------------------------------------------------------------
+  -- STANDARDIZED FIELD GEOMETRY
+  -- One 16:9 field that EVERY layout preset shares -- no preset carries
+  -- its own hand-tuned field positions any more. The design field is
+  -- 320x180 (16:9; the old 320x160 was 2:1 and got letterboxed on a 16:9
+  -- window), drawn onto a 960x540 canvas at x3 (see DS) and fit to the
+  -- window by FILLING it (see fitScale). The message/menu box owns the bottom
+  -- BOTTOM_H (6.5 tiles = 52 design px, y 128..180 -- flush with the
+  -- field's own bottom edge), and the whole field above it (y 0..128)
+  -- belongs to the sprites and HUDs.
+  --
+  -- The sprite GRID is eight columns (cols 1..8, left->right, i.e.
+  -- a1..a4/e1..e5 by the user's own naming). Each column's centre is exactly
+  -- COL_W -- the readout's own pitch -- from its neighbour, so a side's
+  -- columns and its row of stat readouts share one spacing and every readout
+  -- stands dead over its own mon. The two sides anchor at opposite ends:
+  -- allies fill RIGHTWARD from a1 and enemies fill LEFTWARD
+  -- from e6: singles -> a1 / e6, doubles -> a1,a2 / e5,e6, triples ->
+  -- a1,a2,a3 / e4,e5,e6, hordes -> a2 / e2..e6, bossFight -> a1..a4 / e5.
+  -- A boss enemy always takes column 5 (e5); a horde's lone ally takes
+  -- column 2 (a2). See sideColumns/slotRect below. A preset no longer
+  -- nudges a sprite at all.
+  --
+  -- ROUND EIGHTY-TWO (user-reported): the pitch used to be only 40.5px,
+  -- narrower than the 56.4px readout, so the readout row had to be SPREAD
+  -- wider than the sprites to keep the boxes off one another -- and its
+  -- outer boxes then stopped standing over their own mons, worst in a
+  -- five-mon horde. The pitch is now the readout's own (see the COL_W
+  -- block below), so no spreading is needed and the GUI tracks the sprite
+  -- positions exactly. The old ALLY_X_SHIFT (+50 canvas px) that used to
+  -- be applied on top of the ally columns is folded into the ally anchor
+  -- (ALLY_LEFT_X), so the lead ally stays exactly where it was.
+  --
+  -- VERTICALLY each side gets its own band: the enemy's the upper half
+  -- (feet at 8 tiles = 64px), the ally's the lower half (feet on BOTTOM_Y
+  -- = the text box's own top edge). The bands are disjoint, so no two
+  -- sprites ever share their own ground line. Each slot is an ANCHOR the
+  -- sprite stands on (its centre x, its ground line), never a box the art is
+  -- folded into.
+  --
+  -- SIZING: every sprite is drawn at its side's own scale (SPRITE_SCALE_FRONT
+  -- for enemies, SPRITE_SCALE_BACK for allies -- two INDEPENDENT multipliers,
+  -- both default 1) x its OWN trimmed pixels, and the bossFight boss at
+  -- SPRITE_SCALE_FRONT * BOSS_MUL (the "+0.6" applies to bosses ONLY). This
+  -- is a straight multiplier, NOT a per-slot box: the slot a sprite is handed
+  -- is an ANCHOR only (its centre x, its ground line), never a size to be
+  -- folded into. So a Diglett stays small and a Koraidon stays huge -- the
+  -- pack's own relative sizes -- and no two species are forced to the same
+  -- height or width. A sheet is drawn at its FULL size x that side's scale:
+  -- NO fold of any kind (round sixty-nine). A sheet taller than the field
+  -- simply rises off the top of the scene and is cut by the screen edge --
+  -- preserving the full size is the rule, and the edge does the cropping.
+  -- (There is deliberately NO native-picture-box
+  -- cap any more -- that 56px/48px fold flattened every bigger species down
+  -- to the size the game's own screen would show; see the note by
+  -- SPRITE_SCALE_FRONT/BACK.)
+  --
+  -- This replaced an earlier model that handed each sprite its slot rect as
+  -- the exact pixel box to bake into, which made every species come out the
+  -- SAME slot-sized square (user-reported: "sprites are being reduced to an
+  -- exact same height-width").
+  local ROW_H = 8
+  -- GUI_TW=15 (interior (15-2)*8=104px) is sized for line 2: the native HP
+  -- bar -- the cart's own "HP:" badge + six cells + end cap, 9 tiles = 72px
+  -- -- the widest single element the box carries. 104px leaves that real
+  -- margin and comfortably fits the 8-tile (64px) exp bar on the player's
+  -- row below it.
   local GUI_TW = 15
-  local GUI_GAP = 1
-  -- How many tiles lower the SECOND box of a pair sits, stacked
-  -- DIRECTLY under the first at the SAME tx -- not side by side, per
-  -- the user's own reference image (both boxes flush against the row's
-  -- left/right edge, one under the other, no horizontal offset at all).
-  -- Set to GUI_BOX_H*BOX_SCALE (defined below) so the two boxes sit
-  -- flush against each other with no gap and no overlap; kept as its
-  -- own named constant since it's computed from values declared later
-  -- in the file. GUI_BOX_H=5, BOX_SCALE=0.47 -> rendered height 18.8px,
-  -- so 2 stacked = 37.6px, safely under the row's own 40px (ROW_H*8) --
-  -- BOX_SCALE was 0.6 briefly, which rendered a stacked pair at 48px,
-  -- 8px TALLER than the row, and visibly overlapped the FIGHT/BAG/PKMN/
-  -- RUN box below it live.
-  local GUI_STACK_TY = 2.35
-  -- Sprite-zone geometry is UNCHANGED from the original two-column
-  -- layout -- explicitly reverted after a prior pass "fixed" this gap
-  -- without being asked to, which moved every sprite's position as a
-  -- side effect. The dead strip between the (now single, stacked) GUI
-  -- column and the sprite zone is left as-is on purpose: only the GUI
-  -- boxes were asked to move, nothing about the sprites.
-  local SPRITE_ZONE_TW = VW / 8 - (GUI_TW * 2 + GUI_GAP) -- 9
-  -- px square a mon's sprite is scaled to fit inside, bottom-anchored in
-  -- its row.
-  local SPRITE_BOX = 34
+  -- A readout is 15 tiles (120 design px) wide before BOX_SCALE -- the same
+  -- width on both sides. Readouts are one box per slot in a single row now,
+  -- so there is no per-side stack spacing any more (see spreadBoxCentres).
+  --
+  -- ROUND EIGHTY-TWO: THE SPRITE PITCH IS THE READOUT'S OWN PITCH. A readout
+  -- is 56.4px wide, so two of them need 56.4 + GUI_BOX_GAP (2) = 58.4px of
+  -- centre-to-centre room. The sprite grid's column pitch is EXACTLY that
+  -- (COL_W below), so one readout stands dead over every mon with no
+  -- spreading and no drift. Before this the pitch was only 40.5px -- far
+  -- narrower than a readout -- so spreadBoxCentres had to widen the row to
+  -- keep the boxes off one another, and the row's outer boxes no longer sat
+  -- over their own mons (user-reported, worst in a five-mon horde where the
+  -- GUI spread too wide and stopped matching the sprite positions). The
+  -- eight-column a1..a8/e1..e5 scheme is unchanged; only its pitch and its
+  -- two anchors moved. HUD_W is the readout's own drawn width
+  -- (GUI_TW * 8 * BOX_SCALE = 56.4), kept here so the sprite grid and the
+  -- readout row can never drift apart.
+  local HUD_W = 56.4
+  -- The pitch: a readout plus the sliver its row leaves to its neighbour.
+  -- Written as HUD_W + 2 rather than GUI_BOX_W + GUI_BOX_GAP (the same
+  -- number, declared further down) because every sprite/slot helper below
+  -- reads it, and those are defined before the readout constants.
+  local COL_W = HUD_W + 2
+  -- The enemy team's anchor column: e6 (col 6), the rightmost column an
+  -- enemy ever occupies. The five-mon horde fills columns 2..6, so its
+  -- readout row is 4*COL_W + HUD_W = 290px wide; giving the 320px canvas the
+  -- SAME margin at each end puts e6 at 276.8px -- the rightmost the enemy
+  -- team can stand while every readout still lands inside the canvas. Every
+  -- smaller enemy count keeps e6 and steps leftward (see sideColumns), so
+  -- the team stays right-aligned.
+  local ENEMY_RIGHT_X = VW - (VW - 4 * COL_W - HUD_W) / 2 - HUD_W / 2
+  -- The ally team's anchor column: a1 (col 1). Held at the exact spot the old
+  -- grid put the lead ally (its old a1 centre plus the ALLY_X_SHIFT that used
+  -- to be applied on top of it), so a lone ally does not move -- a fuller
+  -- team now just spreads rightward on the same pitch its readouts use.
+  local ALLY_LEFT_X = 35
+  -- The sprite field: the canvas itself. Only ever used as the OUTER clamp
+  -- for a slot's own hit-box width (a lone mon's slot takes the free
+  -- half-field on its empty side); the outer columns of the eight-column
+  -- scheme sit past it and are simply never occupied by a shipped preset.
+  local SPRITE_FIELD_L = 0
+  local SPRITE_FIELD_R = VW
 
-  local BOTTOM_Y = ROW_H * 2
-  -- 2/3 of the original full-row height (VH/8-BOTTOM_Y = 10 tiles at the
-  -- current VH=160), floored to stay an integer tile count, plus a
-  -- standalone +0.5 tile (4px) bump. Font.drawBox's own border math
-  -- (Font.lua:544-558) places the bottom border tile at (th-1)*8, which
-  -- lines up exactly with the fill's own bottom edge (th*8) for ANY real
-  -- th, not just integers -- fractional th is fine for a box that isn't
-  -- edge-aligning against a SEPARATE element (unlike the stacked-GUI-box
-  -- case elsewhere in this file, where that alignment does matter). Only
-  -- the border's own bottom edge moves: self.fTextY/eTextY are computed
-  -- from fy/ey (the box's TOP), never from this constant, so growing it
-  -- pushes the box's bottom out without moving the text at all.
-  local BOTTOM_H = math.floor((VH / 8 - BOTTOM_Y) * 2 / 3) + 0.5
+  -- The field's DEFAULT sprite scale, PER SIDE: enemies use FRONT, allies
+  -- use BACK, so the two teams' sizes are controlled INDEPENDENTLY. Every
+  -- sheet is drawn at its side's scale x its own trimmed pixel size. A
+  -- straight MULTIPLIER (x1 = the pack's own pixels, 1:1 and crispest)
+  -- rather than a field-wide divisor, so relative sizes within a side stay
+  -- exactly the pack's own. Tweak SPRITE_SCALE_FRONT to resize the enemy
+  -- team (and the boss, which is a front) and SPRITE_SCALE_BACK to resize
+  -- the ally team; both directions work. A preset may override either with
+  -- `spriteScaleFront` / `spriteScaleBack` (or the legacy single
+  -- `spriteScale`, which sets both). With every fold gone (round sixty-nine)
+  -- a sheet is drawn at exactly its side's scale x its own trimmed pixels:
+  -- never against its slot's width or height, never against any picture-box
+  -- cap, and no longer against the field's own headroom either -- those
+  -- folds are what used to make every species the same size.
+  local SPRITE_SCALE_FRONT = 0.5
+  local SPRITE_SCALE_BACK = 0.5
+
+  -- NO SIZE CAP AT ALL (deliberately removed). Natural sizing used to fold
+  -- every sheet back to its side's native Gen-2 box -- 56px front / 48px
+  -- back, x1.6 for the boss -- so an oversized pack frame could never draw a
+  -- mon bigger than the game's own screen would. That cap is what FLATTENED
+  -- a big species the moment it passed that size (user-reported), and it is
+  -- gone. So was the LAST remaining fold -- the field-headroom cap that
+  -- shrank any sheet taller than the band above its ground line (round
+  -- sixty-nine). A sheet is now drawn at its FULL size x its side's scale,
+  -- period: if its art stands taller than the field it simply draws past the
+  -- top of the scene and is cut by the screen edge, which is exactly what
+  -- "preserve full sprite size" means. Width always follows the art's own
+  -- aspect ratio.
+
+  -- The trainer class/back pics that stand in a side's sprite slots during
+  -- the intro are the cart's own 6-7 tile squares (48-56px); drawn at
+  -- their native 7 tiles rather than stretched to the sprite band's own
+  -- 64px, which would blow a trainer up past a mon's size.
+  local TRAINER_PIC_T = 5
+
+  -- The enemy team's own ground line: the enemy band is the UPPER half of
+  -- the field, so its sprites' bottoms land at 8 tiles (64px) and the ally
+  -- band (feet on BOTTOM_Y, the text box's own top edge) takes the lower
+  -- half. The two bands are disjoint, so the two teams can never collide on
+  -- the y axis no matter how tall a sheet is. The slot's own headroom is NOT
+  -- handed to the sprite mod any more (round sixty-nine: that fold is gone),
+  -- so an oversized legendary (a 130px Koraidon) is clipped at the top of
+  -- the field rather than shrunken -- the user's explicit rule: preserve the
+  -- full sprite size and let the screen edge do the cropping.
+  local ENEMY_FEET_T = ROW_H
+  -- The bossfight enemy's own size ratio: +0.6 (x1.6) on TOP of the field's
+  -- FRONT scale, so ONLY the boss is drawn at SPRITE_SCALE_FRONT * BOSS_MUL
+  -- its own pixels. See bossSlot: the boss is CENTRED on column 5 (e5) and
+  -- stands in the enemy half of the field, BOSS_MUL bands tall, rather than
+  -- down on the allies' own ground line.
+  local BOSS_MUL = 1.5
+  -- The bossfight boss's own POSITION nudge: +40 CANVAS px straight DOWN (a
+  -- y-only shift; x is untouched), expressed as a design-px value because the
+  -- 960x540 canvas is the fixed surface this file draws
+  -- into, so a canvas-px offset is the same fraction of the field regardless
+  -- of the window it is fitted to. Applied inside drawSprite (boss only), so
+  -- it moves the sprite, the HUD head line and the pokeball's landing spot
+  -- together, and never touches the bake (size) itself.
+  local BOSS_Y_SHIFT = -60 / DS
+  -- The player team's ground line is the TEXT BOX's own top edge -- see
+  -- this file's standardized-geometry header. BOTTOM_H is a fixed 6.5
+  -- tiles (52px) rather than 2/3 of whatever is left, so the F/E box's
+  -- interior keeps the 36px the action menu has always needed (3 real
+  -- rows) and the box reaches the canvas's bottom edge.
+  local BOTTOM_H = 6.5
+  local BOTTOM_Y = VH / 8 - BOTTOM_H -- 16 tiles (128px)
+  -- The ally team's ground line IS the text box's own top edge, so no ally
+  -- sprite can ever be drawn inside the text box, however tall it is.
+  local ALLY_FEET_T = BOTTOM_Y
   local F_TW = 28
   local E_TW = VW / 8 - F_TW
   -- The player's GUI column's own tx, derived from E's own right edge
@@ -434,6 +695,87 @@ return function(mod)
   -- dependency is on E's geometry by name, staying correct even if F_TW/
   -- E_TW's own split ever changes independently of VW.
   local GUI_RIGHT_TX = F_TW + E_TW - GUI_TW -- 25
+
+  -- -- HUD readout placement: one box per slot + the 70% height rule ------
+  -- Explicit user directive: each readout belongs OVER its own pokemon,
+  -- with no box frame or white background left (see drawGuiBox) so the
+  -- sprite reads straight through it. Two rules, both
+  -- decided here:
+  --
+  -- 1. ONE BOX PER SLOT. The readouts used to be one STACKED column per
+  --    team, all sharing a tx; they are now split so each box is PAIRED
+  --    with the one mon -- and therefore the one slot -- it reports on. A
+  --    box is centred on its own slot's centre-x, the exact point
+  --    drawSprite centres that mon's sprite on, so moving the sprite moves
+  --    its readout with it. (Native keeps each readout in the corner
+  --    OPPOSITE its own team; "over the mon" is why the box background had
+  --    to go transparent, and why it could not just stay in that corner.)
+  --    A box is GUI_BOX_W (56.4px) wide, and the sprite grid's own pitch is
+  --    exactly that width plus GUI_BOX_GAP (see COL_W), so the columns are
+  --    already one non-overlapping readout apart and centring a box on its
+  --    own slot's centre-x keeps every box clear of its neighbour. (Round
+  --    eighty-two: the pitch used to be only 40.5px -- narrower than a
+  --    readout -- so this row had to be re-spread, and its outer boxes then
+  --    stopped sitting over their own mons; spreadBoxCentres, below, still
+  --    runs as the safety net for a row that really does overlap, but a
+  --    shipped row now comes back untouched.) Order is preserved, so box i
+  --    is always battler i's.
+  --
+  -- 2. SAME HEIGHT. Every box on a side keeps the SAME height as its
+  --    neighbours -- one head line per side, not one per mon -- so a full
+  --    team reads as one even row ("keeping always the same height for the
+  --    stat info gui"). Each box sits ON its side's head line, a hat rather
+  --    than a sign held up beside it: its BOTTOM edge lies on that line
+  --    (one box per slot now, so both sides place a single row the same
+  --    way), and the mon's head reads through the transparent box.
+  --    The head line is GUI_HEAD_PCT of the way up a sprite's OWN drawn
+  --    height, measured from its feet (NOT a screen reference): the top
+  --    ~30% of a pokemon sprite is its head, so 70% up lands at the base of
+  --    the head. It is measured per sprite, then AVERAGED over the side
+  --    (sideHeadY, below) into the single line the whole row shares.
+  local GUI_HEAD_PCT = 0.70
+  -- The head line for a side, in design px: the mean, over that side's
+  -- battlers, of the head point of the sprite ACTUALLY DRAWN for it this
+  -- frame -- drawn top + (1 - GUI_HEAD_PCT) * drawn height, recorded per
+  -- battler by drawContent's sprite pass (drawSprite's own dy/dh returns).
+  -- This measures the SPRITE'S OWN drawn box on purpose, NOT a slot/band
+  -- (whose height is the whole 8-tile row no matter what art stands in it),
+  -- so the line really does track the heads; it is averaged into the ONE
+  -- line every box on the side shares, which is what keeps the row level.
+  -- `fallback` (that side's ground line) covers a side with nothing drawn
+  -- yet -- its trainer pic still stands in the slot, or its mons have not
+  -- landed -- and the HUD is hidden until those mons are revealed anyway.
+  local function sideHeadY(battlers, headLines, fallback)
+    local n, sum = 0, 0
+    for _, b in ipairs(battlers) do
+      local hy = headLines[b]
+      if hy then
+        sum = sum + hy
+        n = n + 1
+      end
+    end
+    if n == 0 then return fallback end
+    return sum / n
+  end
+  -- Shrinks the ENTIRE readout -- border, name, bar, numeric HP, exp bar, all
+  -- of it -- to 47% size, anchored at the box's own top-left tile corner
+  -- (that point stays fixed; everything else scales toward it) via a plain
+  -- graphics transform around the whole draw, rather than recomputing every
+  -- dimension by hand. Declared HERE rather than with the GUI_BOX_H_* group
+  -- further down because the placement maths below needs it; that group now
+  -- just reads this local.
+  local BOX_SCALE = 0.47
+  -- A readout's REAL drawn width -- GUI_TW tiles at BOX_SCALE -- and half
+  -- of it. The readout is drawn from its LEFT edge (drawGuiBox's
+  -- anchorRight=false), so centring it on a point is just (centre - half
+  -- width), in px; guiTxOn applies that and clamps the result so the box
+  -- always stays inside the canvas. GUI_BOX_GAP is the sliver left between
+  -- two boxes in a spread row (spreadBoxCentres) so their borders never
+  -- touch.
+  local GUI_BOX_W = GUI_TW * 8 * BOX_SCALE -- 56.4px
+  local GUI_BOX_HALF_W = GUI_BOX_W / 2     -- 28.2px
+  local GUI_BOX_GAP = 2                    -- design px between adjacent boxes
+
   -- True interior origin for a box at (tx,ty): Font.drawBox's border
   -- glyphs occupy a full 8px tile at each edge (Font.lua:544-558),
   -- confirmed live after an earlier pass's text visibly struck through
@@ -446,16 +788,206 @@ return function(mod)
   -- exact (F_TW-2) fit, so a wrapped line never sits flush against the
   -- border.
 
-  local function fitScale(winW, winH)
-    return math.max(1, math.floor(math.min((winW or 0) / VW, (winH or 0) / VH)))
+  -- -- sprite grid helpers --------------------------------------------
+  -- The centre-x (design px) of column `col` (1..8) for one side. Each side
+  -- steps away from its own anchor (e6 for the enemy, a1 for the ally) by one
+  -- COL_W per column, so an under-strength side keeps its anchor column and
+  -- leaves the columns behind it empty -- see sideColumns.
+  local function colCentre(side, col)
+    if side == "enemy" then return ENEMY_RIGHT_X - (6 - col) * COL_W end
+    return ALLY_LEFT_X + (col - 1) * COL_W
   end
 
+  -- The column each of a side's battlers stands in, 1..8. Allies fill
+  -- RIGHTWARD from a1 (cols 1,2,3,4) and enemies fill LEFTWARD from e6
+  -- (cols 6,5,4,3,2), so a side under its maximum keeps its innermost
+  -- column and leaves its outer ones empty. Two exceptions: a boss enemy
+  -- always takes column 5 (e5), and a horde's lone ally takes column 2 (a2).
+  local function sideColumns(count, side, boss, horde)
+    count = math.max(1, count)
+    if side == "enemy" then
+      -- A boss enemy always stands at e5 (column 5).
+      if boss then return { 5 } end
+      -- Enemies fill LEFTWARD from column 6 (e6): 1 -> {6}, 2 -> {5,6},
+      -- 3 -> {4,5,6}, 5 -> {2,3,4,5,6}. Clamp any battler past seven to
+      -- column 1 so an oversized roster stays inside the field.
+      local cols = {}
+      for i = 1, count do cols[i] = math.max(7 - count + (i - 1), 1) end
+      return cols
+    end
+    -- A horde's lone ally stands at a2 (column 2).
+    if horde and count == 1 then return { 2 } end
+    -- Allies fill RIGHTWARD from column 1 (a1): 1 -> {1}, 2 -> {1,2},
+    -- 3 -> {1,2,3}, 4 -> {1,2,3,4}. Clamp any battler past eight to 8.
+    local cols = {}
+    for i = 1, count do cols[i] = math.min(i, 8) end
+    return cols
+  end
+
+  -- The x centres (design px) for one side's row of readouts, one per entry
+  -- in `centres` (that side's slot centres, in battler order).
+  --
+  -- ROUND EIGHTY-TWO: this is now normally the IDENTITY. The sprite grid's
+  -- pitch (COL_W) IS the readout's own pitch (GUI_BOX_W + GUI_BOX_GAP), so a
+  -- side's slot centres already stand exactly one non-overlapping readout
+  -- apart and each box simply comes back on its own mon. It is kept -- and
+  -- still does real work -- only as the safety net for a row whose centres
+  -- are NOT already on that pitch (an over-full roster clamped onto the same
+  -- column, say): it re-lays the row on the non-overlapping pitch around the
+  -- MEAN of the slot centres so the boxes still read as one row over the
+  -- team, then slides it to stay inside the canvas. A lone entry always comes
+  -- back exactly on its own slot; order is preserved, so entry i is always
+  -- battler i's box. (At most eight entries; the widest shipped row -- a
+  -- five-mon horde -- is 4*58.4 + 56.4 = 290px, inside a 320px canvas.)
+  local function spreadBoxCentres(centres)
+    local n = #centres
+    local out = {}
+    if n == 0 then return out end
+    if n == 1 then out[1] = centres[1]; return out end
+    -- Already clear of one another? Leave the row EXACTLY on the mons. The
+    -- sprite grid's pitch is this very pitch now (see COL_W), so a shipped
+    -- row lands here and comes back untouched -- bit for bit on the slot
+    -- centres -- and the re-layout below is reserved for a row that really
+    -- does overlap (which is also the only case where it would be pulled off
+    -- its mons, the thing the user asked to stop).
+    local clear = true
+    for i = 2, n do
+      if centres[i] - centres[i - 1] < GUI_BOX_W then clear = false break end
+    end
+    if clear then
+      for i = 1, n do out[i] = centres[i] end
+      return out
+    end
+    local pitch = GUI_BOX_W + GUI_BOX_GAP
+    local mean = 0
+    for i = 1, n do mean = mean + centres[i] end
+    mean = mean / n
+    local first = mean - (n - 1) * pitch / 2
+    local left = first - GUI_BOX_HALF_W
+    local right = first + (n - 1) * pitch + GUI_BOX_HALF_W
+    local shift = 0
+    if left < 0 then
+      shift = -left
+    elseif right > VW then
+      shift = VW - right
+    end
+    for i = 1, n do out[i] = first + (i - 1) * pitch + shift end
+    return out
+  end
+
+  -- The tile-space tx that puts a BOX_SCALE-sized readout (GUI_BOX_W wide,
+  -- drawn from its LEFT edge) centred on canvas x `cx`, clamped so the box
+  -- can never hang off either side of the canvas.
+  local function guiTxOn(cx)
+    local tx = (cx - GUI_BOX_HALF_W) / 8
+    return math.max(0, math.min((VW - GUI_BOX_W) / 8, tx))
+  end
+
+  -- The pixel slot {x,y,w,h} for column `col` within the occupied set
+  -- `cols`: centred on the column, half-width = the nearer of (gap to the
+  -- neighbouring column's own centre / 2) and (gap to the field edge), so a
+  -- lone sprite gets up to the whole half-field while neighbours get one
+  -- column each. The 1px shave keeps integer boxes from ever touching.
+  --
+  -- A slot is an ANCHOR, not a size: drawSprite centres the sprite on the
+  -- slot's own centre-x and stands it on the slot's ground line (its bottom
+  -- edge, feetT*8). The width/height here are still the sprite's own hit-box
+  -- (the pokeball's fallback landing spot, the move-animation anchors), never
+  -- a box the art is folded into.
+  --
+  -- `side` ("enemy"/"ally") picks which side's column grid the slot is read
+  -- from -- each side anchors its own columns (see colCentre). The other
+  -- bounds are shared: the clamp to the physical field edges (SPRITE_FIELD_L/
+  -- R) bounds the free half-field a lone mon's slot may take.
+  local function slotRect(cols, col, feetT, rowH, side)
+    local center = colCentre(side, col)
+    local left, right = SPRITE_FIELD_L, SPRITE_FIELD_R
+    for i, cc in ipairs(cols) do
+      if cc == col then
+        if cols[i - 1] then left = (center + colCentre(side, cols[i - 1])) / 2 end
+        if cols[i + 1] then right = (center + colCentre(side, cols[i + 1])) / 2 end
+        break
+      end
+    end
+    local half = math.min(center - left, right - center)
+    local w = math.max(8, math.floor(half * 2) - 1)
+    local h = rowH * 8
+    return {
+      x = math.floor(center - w / 2 + 0.5),
+      y = feetT * 8 - h,
+      w = w,
+      h = h,
+    }
+  end
+
+  -- The boss's own slot: CENTRED on column 5 -- e5 -- and standing in the
+  -- ENEMY half of the field, so it no longer shares the allies' own ground
+  -- line (user-reported: the boss used to sit down among the four allies,
+  -- "at a7 or a8", when it belongs in e5). The old slot clamped its LEFT
+  -- edge to e5's left edge and ran it to the player HUD, which parked the
+  -- sprite ~1.5 columns right of e5. Now the slot's CENTRE is e5's centre,
+  -- so the boss stands in e5. It is BOSS_MUL enemy bands tall with its TOP
+  -- on the field's own top edge (y=0), so it towers over the upper half
+  -- instead of standing on the allies' line, and it is never clipped.
+  local function bossSlot()
+    local center = colCentre("enemy", 5)
+    local h = math.max(8, math.floor(BOSS_MUL * ROW_H * 8) - 1)
+    local w = math.max(8, 2 * math.floor(math.min(center - SPRITE_FIELD_L,
+      SPRITE_FIELD_R - center)) - 1)
+    return {
+      x = math.floor(center - w / 2 + 0.5),
+      y = 0,
+      w = w,
+      h = h,
+    }
+  end
+
+  -- Window pixels per CANVAS pixel. ALWAYS the exact fit ratio -- the
+  -- largest fractional scale that keeps the whole canvas inside the
+  -- window -- so the canvas FILLS the room it has instead of being
+  -- letterboxed down to the next whole number. This is what puts the
+  -- bottom message/menu band's own bottom frame ON the screen's bottom
+  -- edge at any window size (the user's rule, round sixty-nine): a
+  -- whole-number fit used to shrink the canvas to x1 on any window that
+  -- could not hold a full x2 (720p, 900p, 1440p, any windowed size),
+  -- leaving the text/menu boxes floating well above the real screen edge
+  -- with bars around them, and keeping the field itself small. Filling
+  -- enlarges every element -- most importantly giving the player's sprites
+  -- the extra vertical room above their ground line that the old
+  -- integer-letterboxed canvas withheld. The trade is that a sprite's own
+  -- pixels no longer always land on whole screen pixels off the exact
+  -- multiples (960x540 / 1920x1080 / 4K / 8K); on those it is still a
+  -- clean whole number.
+  local function fitScale(winW, winH)
+    local raw = math.min((winW or 0) / CANVAS_W, (winH or 0) / CANVAS_H)
+    return raw > 0 and raw or 1
+  end
+
+  -- Top-left of the centred canvas, in window px.
   local function fitOrigin(winW, winH, scale)
-    return math.floor((winW - VW * scale) / 2), math.floor((winH - VH * scale) / 2)
+    return math.floor((winW - CANVAS_W * scale) / 2),
+      math.floor((winH - CANVAS_H * scale) / 2)
   end
 
   local function displayName(mon)
     return mon.nickname or mon.name or mon.species or "???"
+  end
+
+  -- The mon's maximum hit points, whichever field this generation keeps it in.
+  -- Gen 2's src/battle/gen2/Mon.lua stamps `mon.maxHp = stats.hp`, so every
+  -- Gen 2 mon has .maxHp and this is that field, unchanged.  Gen 1's mon never
+  -- carries .maxHp -- src/pokemon/Stats.lua's Stats.ensure recomputes
+  -- mon.stats.hp and clamps mon.hp to it, but does not (and must not, or a
+  -- levelled mon's stale cap would be preferred by the engine's own
+  -- `mon.maxHp or mon.stats.hp` reads) write .maxHp -- so Gen 1's real cap is
+  -- mon.stats.hp.  Reading mon.maxHp bare gave the bar a nil max on Gen 1:
+  -- the HudTiles shim turns that into a max of 1, so the fill computed from
+  -- hp*48/1 clamped to a permanently FULL bar -- the reported "HP bar isn't
+  -- lowering when a Pokemon takes damage".  Same `or` fallback the engine
+  -- itself uses (e.g. src/battle/gen2/Battle.lua:1397), so Gen 2 is
+  -- byte-for-byte unchanged and Gen 1 draws the bar it always should have.
+  local function maxHpOf(mon)
+    return (mon and mon.maxHp) or (mon and mon.stats and mon.stats.hp) or 0
   end
 
   -- Word-wraps text to fit F's own real interior width (F_TW-2 chars,
@@ -469,9 +1001,21 @@ return function(mod)
   -- tiles tall), far more than any single message here needs.
   local function drawWrapped(text, x, y, maxChars, lineHeight)
     lineHeight = lineHeight or 9
+    -- ROUND 107: the F box must never draw a control token or the word
+    -- "prompt". Battle text coming out of the engine/ROM keeps trailing
+    -- {PROMPT}/{DONE} control tokens (RomText.lua preserves them; TextBox
+    -- strips them, but this scene draws through Font directly), and the
+    -- font renders the token's letters literally -- a flinched mon showed
+    -- "... flinched!{PROMPT}". Strip the tokens (any case) and any stray
+    -- standalone "prompt" word before wrapping.
+    text = tostring(text or "")
+    text = text:gsub("{%s*[Pp][Rr][Oo][Mm][Pp][Tt]%s*}", " ")
+    text = text:gsub("{%s*[Dd][Oo][Nn][Ee]%s*}", " ")
+    text = text:gsub("%f[%a][Pp][Rr][Oo][Mm][Pp][Tt]%f[%A]", " ")
+    text = text:gsub("%s+", " ")
     local line = ""
     local row = 0
-    for word in tostring(text or ""):gmatch("%S+") do
+    for word in text:gmatch("%S+") do
       local candidate = (line == "") and word or (line .. " " .. word)
       if #candidate > maxChars and line ~= "" then
         Font.draw(line, x, y + row * lineHeight)
@@ -523,21 +1067,17 @@ return function(mod)
     return nil
   end
 
-  -- Floats a mon's sprite freely inside a zone (tx,ty,tw,th) -- no
-  -- border of its own. anchorRight=false anchors it to the zone's own
-  -- left edge, true to its right edge -- both enemy sprites and both
-  -- player sprites share the SAME zone per row (see drawContent), so
-  -- this is what lets the two sprites in a row sit close together
-  -- (a few px apart) instead of pinned to opposite ends of the canvas.
-  -- sizeMul: a plain multiplier on SPRITE_BOX (1.0 = default; the tuned
-  -- default may override it via self.layout) -- the sprite still scales
-  -- to fit that box uniformly by its own aspect ratio, never distorted.
-  -- Returns the sprite's own bottom-center screen position (post-draw),
-  -- or nil if nothing was drawn -- callers that need to know WHERE a
-  -- battler's sprite actually landed this frame (move animations, see
-  -- Screen:startMoveAnim) read this instead of re-deriving the same
-  -- tx/ty/scale math a second time.
-  local function drawSprite(tx, ty, tw, th, battler, spriteField, data, anchorRight, sizeMul, offX, offY, appear)
+  -- Resolve one battler's sprite exactly the way drawSprite draws it, WITHOUT
+  -- drawing it: the art seam (pokemon.sprite) picks the file, it is loaded, and
+  -- the frame seam (battle.mon_pic) swaps in the sprite pack's current frame.
+  -- Kept separate from drawSprite so a caller in the UPDATE phase can start a
+  -- sheet baking early without touching love.graphics -- Screen:prewarmSlot
+  -- raises these same seams during a pokeball's flight, which is what stops a
+  -- trainer's send-out from ever flashing the vanilla pic. Returns (img,
+  -- naturalBake); img is nil both when the battler has no art at all and when
+  -- the frame seam has asked us to draw NOTHING this frame yet -- a managed
+  -- species whose sheet is still baking (see the battle.mon_pic block below).
+  local function resolveSprite(r, boss, battler, spriteField, data, scaleMul)
     local mon = battler and battler.mon
     if not mon then return nil end
     local def = data and data.pokemon and data.pokemon[mon.species]
@@ -565,12 +1105,22 @@ return function(mod)
     end
     local img = path and loadSprite(path)
     if not img then return nil end
+    -- Set true only when the sprite pack hands back its own CANVAS-scale
+    -- natural bake (see the battle.mon_pic block below); a vanilla pic stays
+    -- DESIGN-scale. Returned to drawSprite, which uses it for its blit scale.
+    local naturalBake = false
     -- Animated art arrives through a SECOND seam: pokemon.sprite above picks
     -- the file, battle.mon_pic swaps the current frame into the image on its
     -- way to the screen -- which is why a sprite mod's animated sets showed
     -- here as a still first frame. An animator keys its clock off the battler
     -- it is handed and advances on its own, so raising this once per draw is
     -- the whole of it; there is no tick to run here.
+    -- This side's scale multiplier: the caller's per-battle override
+    -- (self.spriteScaleFront/_Back, or a preset's own) if given, else this
+    -- file's own default. FRONT and BACK are INDEPENDENT, so the two teams
+    -- resize separately; the boss rides the FRONT scale.
+    local sideBack = (spriteField == "spriteBack")
+    local fieldScale = scaleMul or (sideBack and SPRITE_SCALE_BACK or SPRITE_SCALE_FRONT)
     if Runtime.wantsHook("battle.mon_pic") then
       local pctx = {
         species = mon.species,
@@ -582,44 +1132,157 @@ return function(mod)
         -- data already -- so this carries the real table rather than
         -- reaching for a screen `self` that is not in scope here.
         battle = data and { data = data } or nil,
+        -- NATURAL SIZE: the slot is an anchor, not a box. The mod bakes the
+        -- sheet at exactly `scale` x its own (trimmed) pixels and returns an
+        -- image that is ALREADY the final size, so the blit below is 1:1 in
+        -- CANVAS pixels and each species keeps the size its art gives it (a
+        -- Diglett stays small, a Koraidon stays huge) instead of every
+        -- sprite being folded into the same slot-sized square. `scale` is
+        -- THIS side's multiplier (SPRITE_SCALE_FRONT for enemies,
+        -- SPRITE_SCALE_BACK for allies; x1.6 on top for the boss -- the
+        -- "+0.6", bosses only) times DS, i.e. the canvas scale, so the bake
+        -- lands at the resolution the 960x540 surface can actually show
+        -- instead of being baked small and magnified by the fit transform.
+        -- NO SIZE CAP OF ANY KIND (user's rule, round sixty-nine): the
+        -- picture-box cap went first (see the note by SPRITE_SCALE_FRONT/
+        -- BACK), and the field-headroom fold goes with it now. `maxH` is
+        -- deliberately NOT passed, so the pack bakes the sheet at exactly
+        -- `scale` x its own trimmed pixels and NOTHING shrinks it -- a
+        -- species whose art stands taller than the field simply draws past
+        -- the top of the scene and is cut by the screen edge, which is what
+        -- "preserve full sprite size" means. With the canvas now filling the
+        -- window (see fitScale) the field is as tall as the display allows,
+        -- so the player's side gets all the room there is.
+        natural = true,
+        scale = fieldScale * (boss and BOSS_MUL or 1) * DS,
       }
       local ok, swapped = pcall(Runtime.call, "battle.mon_pic",
         function(value) return value end, img, pctx)
-      if ok and swapped then img = swapped end
+      -- The pack's natural bake comes back rasterised at CANVAS scale, so
+      -- it is blitted 1:1 there -- one design px is DS canvas px, hence the
+      -- / DS in the draw scale below. A vanilla pic (no pack, or a sheet
+      -- the pack could not manage) is native DESIGN-px art and draws at its
+      -- own size as always.
+      if ok and swapped == false then
+        -- The frame seam manages this species and its sheet is STILL BAKING
+        -- (the sprite mod returns `false` for exactly that one case): draw
+        -- NOTHING this frame. The vanilla pic must never be shown while a
+        -- real sheet is on its way -- that was the native flash a trainer's
+        -- send-out showed for the first frames of the mon's materialize.
+        return nil
+      end
+      if ok and swapped and swapped ~= img then
+        img = swapped
+        naturalBake = true
+      end
     end
+    return img, naturalBake
+  end
+
+  -- Floats a mon's sprite at its own pixel SLOT `r` = {x,y,w,h}. The slot is
+  -- an ANCHOR, not a size: the sprite's own centre-x sits on the slot's
+  -- centre-x and its feet stand on the slot's bottom edge (the ground line).
+  -- `boss` (true only for the bossFight enemy) asks the sprite mod for the
+  -- boss's own extra size on top of the FRONT scale (see
+  -- SPRITE_SCALE_FRONT/BACK / BOSS_MUL). Every sprite is drawn at its OWN
+  -- size -- the pack's relative sizes, which is what "normal size" means --
+  -- never folded into the slot's box, so no two species are forced to the
+  -- same height or width; there is no fold of any kind (round sixty-nine).
+  -- Returns the sprite's own bottom-center screen position (post-draw),
+  -- or nil if nothing was drawn -- callers that need to know WHERE a
+  -- battler's sprite actually landed this frame (move animations, see
+  -- Screen:startMoveAnim) read this instead of re-deriving the same
+  -- slot/scale math a second time. nil is also returned, quite deliberately,
+  -- for the frames a managed species' sheet is still baking: the sprite is
+  -- simply absent (see resolveSprite) rather than showing its vanilla pic.
+  --
+  -- Two more values follow that anchor when something DID draw: the
+  -- sprite's own drawn TOP (`dy`) and drawn HEIGHT (`dh`), both in design
+  -- px. They are the sprite's REAL box -- the size the art came out at,
+  -- which varies per species -- not the slot's band, so the head-placement
+  -- pass (drawContent's HUD section) can put a readout on a mon's own head
+  -- rather than on a shared row line. A fifth value, `dhFull`, is that
+  -- same height at appear = 1: the materialize animation scales the drawn
+  -- box about the feet, so a caller that wants a line that does not ride
+  -- up with the animation (the HUD anchor) uses `dhFull` with the ground
+  -- line the sprite currently stands on. Callers that only want the
+  -- anchor keep reading the first two returns and ignore the rest.
+  --
+  -- A final optional `alpha` (0..1) multiplies only the blit's opacity --
+  -- the wild-encounter fade-in (round sixty-three) passes its 0..1 ramp
+  -- here so the mon materializes without moving; every existing caller
+  -- omits it and draws fully opaque (alpha defaults to 1), so nothing
+  -- else about a sprite's draw changes.
+  local function drawSprite(r, boss, battler, spriteField, data, anchorRight, offX, offY, appear, scaleMul, alpha)
+    local img, naturalBake = resolveSprite(r, boss, battler, spriteField, data, scaleMul)
+    if not img then return nil end
     local iw, ih = img:getDimensions()
-    local scale = (SPRITE_BOX * (sizeMul or 1)) / math.max(iw, ih)
-    -- `appear` (0..1) scales the sprite in from its bottom-center -- the
-    -- "materializing" phase of a pokeball send-out: the mon grows out of
-    -- the ground at the spot the ball landed on.
-    if appear then scale = scale * appear end
+    -- 1:1 blit in CANVAS pixels for a natural bake (see pctx above), plain
+    -- DESIGN-px size for the vanilla pic. Nothing is resampled to fit the
+    -- slot, so every species comes out at its own size -- which is the
+    -- whole point.
+    local scale = (appear or 1) / (naturalBake and DS or 1)
     local dw, dh = iw * scale, ih * scale
-    local slotX, slotY, slotW, slotH = tx * 8, ty * 8, tw * 8, th * 8
-    local dx = (anchorRight and (slotX + slotW - dw) or slotX) + (offX or 0)
-    local dy = slotY + slotH - dh + (offY or 0)
-    love.graphics.setColor(1, 1, 1, 1)
+    local dx = r.x + (r.w - dw) / 2
+    local dy = r.y + r.h - dh
+    dx = dx + (offX or 0)
+    dy = dy + (offY or 0)
+    -- Boss-fight only: stand the boss BOSS_Y_SHIFT lower (see BOSS_MUL's own
+    -- note). A POSITION shift alone -- the bake above is untouched, so the
+    -- boss keeps its size -- and it is applied before the anchor/head values
+    -- are derived below, so the HUD readout and the ball's landing spot move
+    -- with the art.
+    if boss then dy = dy + BOSS_Y_SHIFT end
+    love.graphics.setColor(1, 1, 1, alpha or 1)
     love.graphics.draw(img, dx, dy, 0, scale, scale)
-    return dx + dw / 2, dy + dh
+    -- The bottom-center anchor; this sprite's own drawn box (top y and
+    -- height, design px); and that height at appear = 1 (see the header
+    -- note -- `appear` is only ever a plain multiplier on the scale, so
+    -- the full-size height is just the art's height over its bake
+    -- divisor, which is also the right answer when appear is 0).
+    local fullH = ih / (naturalBake and DS or 1)
+    return dx + dw / 2, dy + dh, dy, dh, fullH
   end
 
   -- Draws a raw image -- a trainer's pic, which has no species record --
-  -- the same way drawSprite floats a mon: bottom-anchored in the zone,
-  -- uniformly scaled to the zone's own height (trainer pics are 6/7-tile
-  -- squares on native, read as a bit larger than a mon's box). offX
-  -- shifts it horizontally -- the trainer slides' 8px tile steps. Returns
-  -- the bottom-center position, or nil if nothing drew.
-  local function drawRawImage(pathOrImg, tx, ty, tw, th, offX)
+  -- the same way drawSprite floats a mon: bottom-anchored in the SAME pixel
+  -- slot `r` its mon will occupy, upright, scaled to TRAINER_PIC_T tiles
+  -- (trainer pics are 6/7-tile squares on native, read as a bit larger than
+  -- a mon's box). offX shifts it horizontally -- the trainer slides' 8px
+  -- tile steps.
+  --
+  -- COLOUR: a trainer pic is a 4-shade grayscale sheet, and native colours
+  -- it by remapping those four shades through the trainer's own row of
+  -- TrainerPalettes -- BattleState:drawPic's
+  -- `colors = Palettes.trainerColors(...)` arm, applied through
+  -- GbcPalette.with. Drawing the sheet raw (what this did before) shows it
+  -- grey, which is the bug this fixes. `colors` is that four-colour row
+  -- (nil when the class has no palette entry -- native falls through and
+  -- draws raw in that case too); `trueColor` marks a mod-supplied FULL-COLOUR
+  -- pic, which native draws as-is in GBC mode and only remaps in DMG/classic
+  -- -- so the guard below is native's own:
+  --   colors and not (trueColor and GbcPalette.mode == "gbc")
+  -- Returns the bottom-center position, or nil if nothing drew.
+  local function drawRawImage(pathOrImg, r, offX, anchorRight, colors, trueColor)
     local img = pathOrImg
     if type(img) == "string" then img = loadSprite(img) end
     if not img then return nil end
     local iw, ih = img:getDimensions()
-    local scale = (th * 8) / math.max(iw, ih)
+    local scale = (TRAINER_PIC_T * 8) / math.max(iw, ih)
     local dw, dh = iw * scale, ih * scale
-    local slotX, slotY, slotW, slotH = tx * 8, ty * 8, tw * 8, th * 8
-    local dx = slotX + (offX or 0)
-    local dy = slotY + slotH - dh
-    love.graphics.setColor(1, 1, 1, 1)
-    love.graphics.draw(img, dx, dy, 0, scale, scale)
+    local dx = (anchorRight and (r.x + r.w - dw)) or (r.x + (r.w - dw) / 2)
+    local dy = r.y + r.h - dh
+    dx = dx + (offX or 0)
+    local function body()
+      love.graphics.setColor(1, 1, 1, 1)
+      love.graphics.draw(img, dx, dy, 0, scale, scale)
+    end
+    if colors and not (trueColor and GbcPalette.mode == "gbc")
+        and GbcPalette.available() then
+      GbcPalette.with(colors, body)
+    else
+      body()
+    end
     return dx + dw / 2, dy + dh
   end
 
@@ -668,7 +1331,17 @@ return function(mod)
   -- flipped frame mirrors each cell by -(offset+8) while toggling that
   -- cell's own flip), fed back through BattleAnimView's real drawObjects
   -- via a minimal stand-in runner.
-  local BALL_DRAW_SCALE = SPRITE_BOX / 56 -- native ball is 16px vs a 56px mon
+  -- The native ball art is 16px across; next to this screen's sprites a
+  -- 16px ball reads about right, so it is drawn at 0.6 (~10px) regardless
+  -- of how tall the sprite bands are. Tying it to a slot's own box would
+  -- blow the ball up to ~30-60px.
+  --
+  -- GEN 1 uses its OWN ball, never this one: a Gen 1 boot has no
+  -- gen2BattleAnims and no BattleAnimView, so drawNativeBall hands off to
+  -- drawGen1NativeBall, which reads the ball's own frame block out of the
+  -- Gen 1 anim tables (`data.battle_anims`, the same ones AnimPlayer drives
+  -- for Gen 1's moves and catch throw). See that function's own header.
+  local BALL_DRAW_SCALE = 0.6
   -- The landing pose is drawn with its centre a little above the platform
   -- bottom the mon is anchored to, so the open ball sits ON the ground.
   local BALL_LAND_LIFT = 5
@@ -715,6 +1388,73 @@ return function(mod)
     return plan.list[#plan.list]
   end
 
+  -- Gen 1's OWN ball, for the same send-out throw.  A Gen 1 boot has no
+  -- AnimRunner/BattleAnimView (that is the Gen 2 animation contract), so
+  -- there is no BATTLE_ANIM_OBJ_POKE_BALL to read -- but Gen 1 is not
+  -- ball-less.  The cart's own TOSS_ANIM row in `data.battle_anims` -- the
+  -- very Gen 1 tables this file already drives through
+  -- src/battle/AnimPlayer.lua for the move and catch animations -- is a
+  -- subanimation whose first frame block IS the ball: FRAMEBLOCK_03, a 2x2
+  -- 16x16 composite of tiles $02 (upper half) and $12 (lower half) out of
+  -- anim tileset 0 (data/battle_anims/frame_blocks.asm FrameBlock03,
+  -- reached via subanimations.asm Subanim_0BallTossHigh, which
+  -- data/moves/animations.asm BallTossAnim points at).  That is the very
+  -- tile the catch arm's own ball flies, drawn through the same
+  -- sheet/quad path Screen:drawGen1AnimSprites uses, so the send-out ball
+  -- and the catch ball are one object rendered one way.
+  --
+  -- The Gen 2 object/frameset/sheet above is deliberately NOT read here
+  -- (user rule: Gen 1 uses Gen 1's native ball, never Gen 2's).
+  --
+  -- Nothing native tumbles this ball -- the GB's toss walks a static ball
+  -- graphic along a base-coordinate list -- so the flight is a plain
+  -- translate of the block following the caller's own arc.  Returns false
+  -- when the data or its sheet is unavailable, so the caller keeps
+  -- drawPokeball's primitive and a send-out still reads as a ball.
+  local function drawGen1NativeBall(screen, cx, cy)
+    if not AnimPlayer then return false end
+    local anims = N.gen1AnimData(screen.data)
+    local toss = anims and anims.moveAnims and anims.moveAnims["TOSS_ANIM"]
+    local row = toss and toss.seq and toss.seq[1]
+    if not row then return false end
+    local sub = anims.subanims and anims.subanims[row.subanim]
+    local entry = sub and sub.blocks and sub.blocks[1]
+    local fb = entry and anims.frameBlocks and anims.frameBlocks[entry.block]
+    local sheet = anims.tilesheets and anims.tilesheets[row.tileset]
+    if not (fb and sheet) then return false end
+    -- A dedicated player, cached on the screen, only for the sheet image
+    -- and its tile quads -- the ball is a still composite, so none of the
+    -- step machinery is used.  (AnimPlayer's image/quad caches are
+    -- per-instance; one player per battle is all this needs.)
+    local player = screen.gen1BallPlayer
+    if not player then
+      player = AnimPlayer.new(anims)
+      screen.gen1BallPlayer = player
+    end
+    local img = player:sheetImage(row.tileset)
+    if not img then return false end
+    local G = love.graphics
+    G.setColor(1, 1, 1, 1)
+    G.push()
+    G.translate(cx, cy)
+    G.scale(BALL_DRAW_SCALE, BALL_DRAW_SCALE)
+    for _, t in ipairs(fb) do
+      local quad = player:tileQuad(row.tileset, t.tile)
+      if quad then
+        local sx = t.xflip and -1 or 1
+        local sy = t.yflip and -1 or 1
+        -- The block's own 16x16 box is centred on the throw position: its
+        -- tile offsets run 0..8, so the box is laid out from -8,-8.
+        G.draw(img, quad,
+               -8 + (t.x or 0) + (sx < 0 and 8 or 0),
+               -8 + (t.y or 0) + (sy < 0 and 8 or 0),
+               0, sx, sy)
+      end
+    end
+    G.pop()
+    return true
+  end
+
   -- One frame of the native ball, centred on screen (cx,cy). `open` uses
   -- the pose the native object switches to when the throw lands
   -- (BATTLE_ANIM_FRAMESET_POKE_BALL_3) instead of the in-flight tumble;
@@ -722,7 +1462,13 @@ return function(mod)
   -- Returns false when the cache/sheet is unavailable, so the caller can
   -- draw the primitive fallback instead.
   local function drawNativeBall(screen, cx, cy, elapsed, open)
-    local anims = screen.data and screen.data.gen2BattleAnims
+    -- Gen 2's object/frameset contract only.  A Gen 1 boot draws its OWN
+    -- native ball instead (drawGen1NativeBall above) -- never Gen 2's
+    -- asset (user rule) -- and only falls through to drawPokeball's
+    -- primitive when even the Gen 1 data is missing.
+    if not N.isGen2 then return drawGen1NativeBall(screen, cx, cy) end
+    if not BattleAnimView then return false end
+    local anims = N.animData(screen.data)
     local object = anims and anims.objects and
       anims.objects["BATTLE_ANIM_OBJ_POKE_BALL"]
     if not object then return false end
@@ -739,7 +1485,7 @@ return function(mod)
     local sheet = anims.gfx and anims.gfx[object.gfx]
     if not sheet then return false end
     screen.animView = screen.animView or
-      BattleAnimView.new(anims, screen.data.gen2Palettes)
+      BattleAnimView.new(anims, N.paletteData(screen.data))
     local view = screen.animView
     local image = view:image(sheet.image)
     if not image then return false end
@@ -814,42 +1560,134 @@ return function(mod)
     love.graphics.pop()
   end
 
-  -- Font.drawBox's own side-border loop (Font.lua:555-558) is
-  -- `for j = 1, th - 2 do`, which Lua's numeric for truncates to the
-  -- last INTEGER <= th-2 -- fine for an integer th, but BOTTOM_H is now
-  -- a fractional tile count (+0.5 for a 4px height bump), so that loop
-  -- stops half a tile short of the bottom corner and leaves a visible
-  -- gap in the left/right border lines right above it (screenshot-
-  -- reported: the frame broke). This is the same box, drawn the same
-  -- way, except the side-tile count is math.ceil'd instead of
-  -- truncated -- the last tile then overlaps the bottom corner by a
-  -- few px instead of leaving a gap, which is invisible for a solid
-  -- straight-line border glyph.
-  local function drawBoxNoGap(tx, ty, tw, th, fill)
+  -- The cart's own textbox frame, drawn as GEOMETRY instead of glyphs.
+  --
+  -- Font.BORDER hands back $79-$7E of whichever font page the RUNNING
+  -- generation loaded, and the two generations do not agree on that art.
+  -- Gold's extra page carries the clean double-line GSC textbox (the
+  -- extractor blits frames.png row 0 -- the default frame -- into it, and
+  -- Font's framePages/useBattleExtra resolve the player's choice from
+  -- there), while a Red/Blue/Yellow boot has no frames sheet at all and
+  -- falls through to Red's own font_extra border: the ornate,
+  -- clover-cornered double line.  Same calls, two different boxes -- so on
+  -- Gen 1 this scene read as a Gen 1 text box rather than the Gen 2 one it
+  -- exists to be.
+  --
+  -- This draws the Gen 2 frame itself, so F and E look like the cart's own
+  -- textbox on BOTH generations: no font asset to ship, no page registered,
+  -- nothing global -- the engine's Font state is untouched, so every other
+  -- text box in the game keeps its own generation's art.
+  --
+  -- It is the extracted default frame read as geometry, edge for edge.  The
+  -- tile art is NOT a tidy 1-2-1 sandwich: the horizontal tile carries a 1px
+  -- outer line, a 1px paper gap, then a 2px inner line, while the vertical
+  -- tile carries 1px and 1px.  The engine draws the horizontal tile at the
+  -- TOP and, unflipped, at the BOTTOM (so the bottom band is the vertical
+  -- mirror of the top: 2px outer, 1px inner), and the vertical tile
+  -- unflipped on BOTH sides (so the right pair sits 1px further in than the
+  -- left).  Reusing the same measure the engine's own Font.drawBox produces
+  -- with these exact tiles is the whole point -- a "cleaned up" symmetric
+  -- box would be a different box.
+  --
+  -- The corners are the tile's own 3-step rounding: the outer line comes in
+  -- one pixel per row across three rows (4 -> 3 -> 2 on the left) and the
+  -- inner line across two, plus the single-pixel nub where the inner corner
+  -- turns.  At 3x DS those steps are what read as "GSC rounded" instead of
+  -- "two rectangles".
+  --
+  -- Rects also free the frame from tile alignment.  Font.drawBox's border
+  -- glyphs are 8px tiles that only interlock on an integer grid, which is
+  -- exactly why the old drawBoxNoGap had to math.ceil BOTTOM_H's fractional
+  -- 6.5 tiles to stop the side border breaking with a gap; at pixel level
+  -- 6.5 tiles is simply 52px and nothing needs rounding.  Takes TILE coords
+  -- (like Font.drawBox, and like Screen:pos's own return), converts once.
+  local function drawNativeFrame(tx, ty, tw, th)
     local r, g, b, a = love.graphics.getColor()
-    if type(fill) == "table" and fill[1] and fill[2] and fill[3] then
-      love.graphics.setColor(fill[1] / 255, fill[2] / 255, fill[3] / 255, 1)
-    else
-      love.graphics.setColor(1, 1, 1, 1)
+    local x0, y0 = tx * 8, ty * 8
+    local w, h = tw * 8, th * 8
+    love.graphics.setColor(1, 1, 1, 1)
+    love.graphics.rectangle("fill", x0, y0, w, h)
+    love.graphics.setColor(0, 0, 0, 1)
+    -- Top band: 1px outer line, then the 2px inner line.
+    love.graphics.rectangle("fill", x0 + 4, y0 + 2, w - 9, 1)
+    love.graphics.rectangle("fill", x0 + 5, y0 + 4, w - 11, 1)
+    love.graphics.rectangle("fill", x0 + 4, y0 + 5, w - 9, 1)
+    -- Bottom band: the same tile drawn unflipped -- 2px outer, 1px inner.
+    love.graphics.rectangle("fill", x0 + 3, y0 + h - 4, w - 7, 1)
+    love.graphics.rectangle("fill", x0 + 4, y0 + h - 3, w - 9, 1)
+    love.graphics.rectangle("fill", x0 + 5, y0 + h - 6, w - 11, 1)
+    -- Left pair (the v tile at its own column).
+    love.graphics.rectangle("fill", x0 + 2, y0 + 4, 1, h - 8)
+    love.graphics.rectangle("fill", x0 + 4, y0 + 5, 1, h - 11)
+    -- Right pair: the same unflipped v tile, so 1px further in.
+    love.graphics.rectangle("fill", x0 + w - 4, y0 + 4, 1, h - 8)
+    love.graphics.rectangle("fill", x0 + w - 6, y0 + 5, 1, h - 11)
+    -- Top corners' stepped rounding + inner nub.  The bottom corners have no
+    -- nub: the bl/br tiles are not vertical mirrors of tl/tr (the cart's own
+    -- asymmetry), so the bottom is a clean 1px step.
+    for _, c in ipairs({
+      { x0 + 3, y0 + 3 }, { x0 + w - 5, y0 + 3 },
+      { x0 + 3, y0 + h - 5 }, { x0 + w - 5, y0 + h - 5 },
+      { x0 + 5, y0 + 6 }, { x0 + w - 7, y0 + 6 },
+    }) do
+      love.graphics.rectangle("fill", c[1], c[2], 1, 1)
     end
-    love.graphics.rectangle("fill", tx * 8, ty * 8, tw * 8, th * 8)
     love.graphics.setColor(r, g, b, a)
-    local B = Font.BORDER
-    Font.drawCode(B.tl, tx * 8, ty * 8)
-    Font.drawCode(B.tr, (tx + tw - 1) * 8, ty * 8)
-    Font.drawCode(B.bl, tx * 8, (ty + th - 1) * 8)
-    Font.drawCode(B.br, (tx + tw - 1) * 8, (ty + th - 1) * 8)
-    for i = 1, tw - 2 do
-      Font.drawCode(B.h, (tx + i) * 8, ty * 8)
-      Font.drawCode(B.h, (tx + i) * 8, (ty + th - 1) * 8)
-    end
-    for j = 1, math.ceil(th - 2) do
-      Font.drawCode(B.v, tx * 8, (ty + j) * 8)
-      Font.drawCode(B.v, (tx + tw - 1) * 8, (ty + j) * 8)
-    end
   end
 
-  -- The HP fill only -- no black frame, no white backing rectangle --
+  -- The menu window's own left edge, drawn OVER the message box the way the
+  -- cart stacks the two: BattleState:drawBottom draws Chrome.box(0, 12,
+  -- 20+ox, 6) for the whole bottom and then the menu window straight over
+  -- its right end, so the pair reads as ONE box with a divider instead of
+  -- two boxes butted together.  That doubled border -- F's right edge and
+  -- E's left edge running a couple of pixels apart -- was the most visible
+  -- way the old pair stopped looking native.
+  --
+  -- Verticals only: the horizontal lines belong to the bottom box; the menu
+  -- window's own tl/bl tiles add just the 1px corner step and the inner nub
+  -- at each end (the four single cells below), which is the little notch the
+  -- cart shows where the window edge meets the border.
+  --
+  -- Takes TILE coords, like drawNativeFrame above.
+  local function drawNativeDivider(tx, ty, th)
+    local r, g, b, a = love.graphics.getColor()
+    local x0, y0 = tx * 8, ty * 8
+    local h = th * 8
+    love.graphics.setColor(0, 0, 0, 1)
+    love.graphics.rectangle("fill", x0 + 2, y0 + 4, 1, h - 8)
+    love.graphics.rectangle("fill", x0 + 4, y0 + 5, 1, h - 11)
+    love.graphics.rectangle("fill", x0 + 3, y0 + 3, 1, 1)
+    love.graphics.rectangle("fill", x0 + 3, y0 + h - 5, 1, 1)
+    love.graphics.rectangle("fill", x0 + 5, y0 + 6, 1, 1)
+    love.graphics.setColor(r, g, b, a)
+  end
+
+  -- Run `fn` with BattleHud's tile draws keyed instead of plain.
+  --
+  -- Every BattleHud draw goes through GbcPalette.with (the plain
+  -- shade-substitution shader), whose output keeps shade 0 -- the white the
+  -- HUD tiles carry as their cell background -- fully opaque. With the
+  -- readouts now sitting over the pokemon sprites, that white has to fall
+  -- out and let the sprite through instead, which is exactly what
+  -- GbcPalette.keyedWith does (its KEYED shader sends shade 0 to alpha 0).
+  -- BattleHud does not expose a knob for choosing the keyed path, so the
+  -- two entry points it calls through -- GbcPalette.with, the only one its
+  -- drawTile uses -- are swapped for the duration of ONE hud draw and
+  -- restored immediately. pcall-guarded and only when keyedWith is actually
+  -- present, so an engine build without the keyed shader keeps the old
+  -- opaque behaviour rather than erroring mid-battle.
+  local function drawHudKeyed(fn)
+    local G = GbcPalette
+    if not (G and G.keyedWith) or G.with == G.keyedWith then return fn() end
+    local plain = G.with
+    G.with = G.keyedWith
+    local ok, err = pcall(fn)
+    G.with = plain
+    if not ok then error(err, 0) end
+  end
+
+  -- FALLBACK ONLY (used when BattleHud cannot load the cart's tiles): the HP
+  -- fill alone -- no black frame, no white backing rectangle --
   -- at a caller-chosen width rather than the cart's fixed 48px. Reuses
   -- HpBar.pixels/.palette/.colors for the real green/yellow/red state
   -- and RGB (ratio-based thresholds, so they're correct at any width),
@@ -872,27 +1710,98 @@ return function(mod)
     love.graphics.setColor(0, 0, 0, 1)
   end
 
-  -- Drawn box height, tiles, BEFORE the whole-box 60% shrink below --
-  -- tall enough for 3 real lines (name, bar, player's own numeric HP on
-  -- its own line under the bar, no overlap) at the line spacing used
-  -- inside. The final on-screen size is BOX_SCALE of this.
-  local GUI_BOX_H = 5
-  -- Shrinks the ENTIRE box -- border, name, bar, numeric HP, all of it
-  -- -- to 60% size, anchored at the box's own top-left tile corner (that
-  -- point stays fixed; everything else scales toward it) via a plain
-  -- graphics transform around the whole draw, rather than recomputing
-  -- every dimension by hand.
-  local BOX_SCALE = 0.47
+  -- The cart's <LV> level glyph: tile $6E of the battle-extra font page
+  -- (Font.useBattleExtra swaps $60-$78 to that sheet -- Font.lua's own
+  -- BATTLE_EXTRA_TILES note). Drawn as a CODE, not typed as text: the <LV>
+  -- markup the native HUD prints is expanded by Chrome, not by Font, so a
+  -- caller drawing the glyph itself has to place the tile.
+  local LV_GLYPH = 0x6E
 
-  -- The compact bordered name/level/gender/HP readout.
-  -- Font.drawBox's border glyphs occupy a full 8px tile at each edge
-  -- (Font.lua:544-558), so the safe interior starts one full tile in
-  -- from (tx,ty), not a few px past the box's outer edge -- confirmed
-  -- live after an earlier pass's text visibly struck through both
-  -- borders by assuming a thin rule instead.
+  -- PlaceNonFaintStatus's five tags, in the cart's own priority order (PSN,
+  -- BRN, FRZ, PAR, SLP). Toxic is the poison bit worn harder and shares the
+  -- PSN tag; confusion is a battle substatus and never reaches the HUD.
+  -- Mirrors src/ui/gen2/BattleState.lua's own STATUS_TAGS table.
+  local STATUS_TAGS = {
+    poison = "PSN", toxic = "PSN", burn = "BRN",
+    freeze = "FRZ", paralyze = "PAR", sleep = "SLP",
+  }
+
+  -- The text that stands where the level goes while a mon carries a major
+  -- status, or nil for a healthy one. Reads this session's merged
+  -- gen2Statuses record first (so a mod-registered status' own hudLabel
+  -- wins), then the built-in Battle.STATUSES table; a record flagged
+  -- `substatus` returns nil, exactly as BattleState:statusTag does.
+  -- On Gen 1 the backend answers from the native Status registry's own
+  -- label (`Status.hudLabelFor(data.statuses, "PSN")`), which is the same
+  -- text the Gen 1 HUD prints.
+  local function statusTag(mon, data)
+    local status = mon and mon.status
+    if not status then return nil end
+    if not N.isGen2 then return N.statusLabel(mon, data) end
+    local authored = N.statusesData(data) and N.statusesData(data)[status]
+    local builtin = Battle.STATUSES and Battle.STATUSES[status]
+    local record = authored or builtin
+    if record and record.substatus then return nil end
+    if authored then
+      -- The merge's plain no-op register shares the built-in table object
+      -- (the same identity BattleState checks): its label is still the raw
+      -- marker and needs the lookup, while a mod's own record is already
+      -- complete authored text and must not be looked up a second time.
+      if authored == builtin then
+        return Strings(authored.hudLabel or authored.label)
+      end
+      return authored.hudLabel or authored.label
+    end
+    local tag = STATUS_TAGS[status]
+    return tag and Strings(tag) or nil
+  end
+
+  -- The exp bar's fill fraction: THIS level's share of the span between its
+  -- own exp threshold and the next level's -- a share of the level's span,
+  -- not of the mon's total experience (CalcExpBar, engine/battle/core.asm:
+  -- 7555). Mirrored from BattleState:expPixels and computed off the same
+  -- growth records Mon.gainExperience used, so the bar can never disagree
+  -- with the level printed beside it.
+  local function expFraction(mon, data)
+    local def = data and data.pokemon and data.pokemon[Mon.partySpecies(mon)]
+    local growth = Mon.growthFor(data, def and def.growthRate)
+    if not growth then return 0 end
+    local level = math.max(1, math.min(Mon.MAX_LEVEL, mon.level or 1))
+    local base = Mon.experienceForLevel(growth, level)
+    local nextExp = Mon.experienceForLevel(growth, level + 1)
+    if not base or not nextExp or nextExp <= base then return 0 end
+    local into = math.max(0, math.min(nextExp - base,
+      N.monExp(mon) - base))
+    return math.floor(into * BattleHud.EXP_LENGTH_PX / (nextExp - base))
+      / BattleHud.EXP_LENGTH_PX
+  end
+
+  -- Drawn box height, tiles, BEFORE BOX_SCALE -- PER SIDE, because the cart's
+  -- two HUDs are not the same height. The enemy readout is name + bar (two
+  -- content rows); the player's carries the numeric HP on its own row under
+  -- the bar AND the exp bar under that (four). The height still counts the
+  -- two border tiles the box used to draw (one top, one bottom) so these
+  -- constants -- and therefore every asset's position -- are unchanged now
+  -- that the frame is gone: enemy 2 + 2 = 4; player 4 + 2 = 6.
+  local GUI_BOX_H_ENEMY = 4
+  local GUI_BOX_H_PLAYER = 6
+  -- BOX_SCALE -- the readout's 47% shrink, anchored at the box's own
+  -- top-left tile corner -- is declared up in the GUI placement block
+  -- (just above GUI_BOX_W), because the centring maths there needs the
+  -- readout's real drawn width; this group just reads that local.
+  -- There is no per-side stack spacing any more: readouts are one box per
+  -- slot now, laid out in a single spread row at one shared height (see
+  -- drawContent's HUD pass).
+
+  -- The compact name/level/gender/HP readout -- the cart's native assets
+  -- only, with NO box frame around them: the black rule square that used
+  -- to enclose them was removed, leaving just the tiles/text.
+  -- The asset layout still starts one full 8px tile in from (tx,ty), the
+  -- inset it had while Font.drawBox's border glyphs (a full tile at each
+  -- edge, Font.lua:544-558) were still drawn, so no asset moved.
   --
-  -- A fainted battler draws NOTHING here at all -- not even the border
-  -- -- rather than a box that still stands there reading FAINTED. That
+  -- A fainted battler draws NOTHING here at all -- not even a readout
+  -- -- rather than assets that still stand there reading FAINTED. That
   -- makes an empty slot genuinely read as empty, which matters most
   -- against an NPC trainer team where a downed mon sits out until the
   -- trainer sends the next one in.
@@ -909,13 +1818,19 @@ return function(mod)
   -- mon.hp made a fainted battler's box wink out before its own "X
   -- fainted!" line had even been announced.
   --
-  -- Line 1: name (shrunk to fit -- see drawScaledText/fitName) + "LvNN"
-  -- + gender. Line 2: the real HP bar, unlabeled, 3px thick, stretched
-  -- to nearly the box's own width -- and for the enemy, that's the
-  -- WHOLE readout: the numeric current/max is deliberately withheld
-  -- (showNumeric=false), matching every real Pokemon game's own enemy
-  -- HUD. Line 3 (player only, showNumeric=true): the numeric HP on its
-  -- OWN line under the bar, not overlaid on it.
+  -- The readout is now the cart's own assets, imported one element at a
+  -- time into this scene's box rather than the whole native screen:
+  --   Line 1: name (shrunk to fit -- see drawScaledText/fitName), then the
+  --     native level readout -- the <LV> tile + the digits, or the status
+  --     tag in its place while a mon is statused -- then the gender glyph.
+  --   Line 2: the native HP bar (the "HP:" badge, six cells, end cap),
+  --     coloured off the DISPLAYED HP.
+  --   Line 3 (player only, showNumeric=true): the numeric current/max,
+  --     right-aligned, as the cart prints it under the bar.
+  --   Line 4 (player only): the native exp bar, grown from the right.
+  -- For the enemy that is name + bar only -- the numeric and exp bar are
+  -- deliberately withheld (showNumeric=false), matching every real Pokemon
+  -- game's own enemy HUD.
   -- anchorRight=true shrinks toward the box's own TOP-RIGHT corner
   -- instead of its top-left -- needed so a right-aligned box's rendered
   -- right edge lands exactly at (tx+tw)*8 regardless of BOX_SCALE,
@@ -927,7 +1842,11 @@ return function(mod)
   -- sizeMul: a plain multiplier on BOX_SCALE (1.0 = default; applied on
   -- top of BOX_SCALE, not instead of it, so the box's own established
   -- 47%-shrink baseline is unchanged when sizeMul is left at 1.0).
-  local function drawGuiBox(tx, ty, tw, th, battler, data, showNumeric, anchorRight, sizeMul, shownHp)
+  -- `th` is the box's own drawn height in tiles (GUI_BOX_H_ENEMY/_PLAYER --
+  -- the caller picks, since the two sides differ); `hud` is the screen's
+  -- BattleHud instance, which supplies the native tiles and falls back to
+  -- the plain coloured fill when a dataset cannot load them.
+  local function drawGuiBox(tx, ty, tw, th, battler, data, showNumeric, anchorRight, sizeMul, shownHp, hud)
     local mon = battler and battler.mon
     if not mon then return end
     -- `battler.caught` is still checked by name (Screen:throwBall sets it
@@ -947,29 +1866,90 @@ return function(mod)
     love.graphics.scale(effectiveScale, effectiveScale)
     love.graphics.translate(-anchorX, -ty * 8)
 
-    love.graphics.setColor(1, 1, 1, 1)
-    Font.drawBox(tx, ty, tw, GUI_BOX_H)
+    -- No frame at all any more: the readout is just its native assets now.
+    -- The black rule square that used to enclose them (drawn border-only,
+    -- with Font.drawBox's white fill already skipped) was removed so the
+    -- mon shows through completely. The asset offsets below keep the
+    -- one-tile inset they had while the frame existed, so nothing moved.
     love.graphics.setColor(0, 0, 0, 1)
-    local textX, textY = (tx + 1) * 8 + 2, (ty + 1) * 8 + 1
-    local interiorW = (tw - 2) * 8 - 2
+
+    -- The cart's stat glyphs -- the <LV> tile and the HP/exp bar cells --
+    -- live in the battle-extra font page, so every native draw below happens
+    -- with that page swapped in, then swapped back. This is exactly how the
+    -- native HUD brackets its own draws (BattleState:drawEnemyHud's
+    -- Font.useBattleExtra(true) ... (wasBattle)). Ordinary letters sit
+    -- outside the swapped $60-$78 range, so the name is unaffected.
+    local wasBattleExtra = Font.useBattleExtra(true)
+    local hudReady = hud and hud:available()
 
     local NAME_SCALE = 0.75
-    local suffix = string.format(" Lv%d%s", mon.level or 0, GENDER_SYMBOL[mon.gender] or "")
-    local name = fitName(displayName(mon), interiorW / NAME_SCALE, Font.width(suffix))
-    drawScaledText(name .. suffix, textX, textY, NAME_SCALE)
+    local interiorL = (tx + 1) * 8
+    local interiorR = (tx + tw - 1) * 8
+    local interiorW = interiorR - interiorL
+    local rowY = (ty + 1) * 8
 
-    local barW = interiorW - 2
-    local barH = 3
-    local barY = textY + 9
-    local palettes = data and data.gen2Palettes
-    if palettes then
-      drawHpFill(palettes, shownHp, mon.maxHp, textX, barY, barW, barH)
+    -- Line 1: the name, then the native level readout -- the cart's own <LV>
+    -- tile followed by the digits -- then the gender glyph. A statused mon
+    -- prints the 3-letter tag where the level goes and drops the level
+    -- entirely, matching PlaceNonFaintStatus / DrawEnemyHUD's skip_level arm.
+    -- The <LV> tile is one 8px glyph, so the suffix's own advance is (tile +
+    -- digits + gender) at NAME_SCALE; fitName shrinks the name against
+    -- exactly that, so a long name can never strike through the level
+    -- readout or the box's right border.
+    local tag = statusTag(mon, data)
+    local lvText = tag or tostring(mon.level or 0)
+    local gender = GENDER_SYMBOL[mon.gender] or ""
+    local lvW = (tag and 0 or 8) + Font.width(lvText) + Font.width(gender)
+    -- fitName measures in the SAME units it is given: maxWidth is the
+    -- interior converted back to native px (divide by NAME_SCALE), so the
+    -- suffix it subtracts must be native px too -- NOT pre-scaled, or a long
+    -- name would look like it fits and then push the level past the border.
+    local name = fitName(displayName(mon), interiorW / NAME_SCALE,
+      lvW + 4)
+    drawScaledText(name, interiorL + 2, rowY + 1, NAME_SCALE)
+    local penX = interiorL + 2 + (Font.width(name) + 4) * NAME_SCALE
+    if not tag then
+      drawScaledCode(LV_GLYPH, penX, rowY + 1, NAME_SCALE)
+      penX = penX + 8 * NAME_SCALE
     end
+    drawScaledText(lvText, penX, rowY + 1, NAME_SCALE)
+    penX = penX + Font.width(lvText) * NAME_SCALE
+    drawScaledText(gender, penX, rowY + 1, NAME_SCALE)
+
+    -- Line 2: the HP bar -- the cart's own assembly, coloured through the
+    -- hpBar palette for the displayed HP's green/yellow/red state, so it
+    -- matches every native bar exactly. Falls back to the plain coloured
+    -- fill only when the menu gfx cannot supply the tiles.
+    local palettes = N.paletteData(data)
+    if hudReady then
+      -- Keyed (shade 0 transparent) so the mon behind the readout shows
+      -- through the bar's own cell backgrounds -- see drawHudKeyed.
+      drawHudKeyed(function()
+        hud:drawHpBar(shownHp, maxHpOf(mon), tx + 1, ty + 2)
+      end)
+    elseif palettes then
+      drawHpFill(palettes, shownHp, maxHpOf(mon), interiorL, rowY + 10,
+        interiorW, 3)
+    end
+
     if showNumeric then
-      local label = string.format("%d/%d", shownHp, mon.maxHp or 0)
-      drawScaledText(label, textX, barY + barH + 3, 0.75)
+      -- Line 3: current/max, right-aligned to the interior's own right edge,
+      -- under the bar -- where the cart prints it.
+      local label = string.format("%d/%d", shownHp, maxHpOf(mon))
+      drawScaledText(label, interiorR - 2 - Font.width(label) * 0.75,
+        rowY + 16, 0.75)
+
+      -- Line 4: the exp bar, grown from the right exactly as FillInExpBar
+      -- does. The fraction is this level's share of the span to the next
+      -- level (see expFraction), so the bar agrees with the level shown.
+      if hudReady then
+        drawHudKeyed(function()
+          hud:drawExpBar(expFraction(mon, data), tx + 1, ty + 4)
+        end)
+      end
     end
 
+    Font.useBattleExtra(wasBattleExtra)
     love.graphics.pop()
   end
 
@@ -979,21 +1959,75 @@ return function(mod)
     self.world = world
     self.combat = combat
     self.data = gameData
-    -- The real native Battle instance and the g9-battle-engine-beta mod
+    -- The cart's own battle HUD, built over this session's menu gfx/palettes
+    -- -- it caches the tile sheets and answers :available() so drawGuiBox can
+    -- fall back to the plain coloured HP fill on a dataset that cannot supply
+    -- them. One instance per battle, matching native (BattleState's own hud).
+    self.hud = BattleHud.new(N.menuGfxData(self.data),
+      N.paletteData(self.data))
+    -- The real native Battle instance and the g9-battle-engine mod
     -- reference -- both required for every turn's resolution now (see
     -- Combat.resolveTurn). Constructed by pushDoubleBattleScreen, not
     -- here, since building one needs game.save/game.data before this
     -- constructor's own arguments are assembled.
     self.battle = battle
     self.g9dex = g9dex
+    -- Read fresh from this mod's own active layout preset (layouts.lua)
+    -- rather than baked in -- see that file's own header for the preset
+    -- file shape/naming and how the active one is chosen. Read up here,
+    -- before the roster loops, because the preset's own enemyCount is
+    -- what decides how many enemies are actually OUT (see below).
+    local activeLayout = mod.exports.getActiveLayoutData and mod.exports.getActiveLayoutData()
+    self.layout = (activeLayout and activeLayout.layout) or {}
+    -- Grid exceptions, read from the preset: `boss` puts the lone enemy at
+    -- column e5 (col 5) and gives it a BOSS_MUL-tall slot; `horde` puts a
+    -- lone ally at a2 (col 2).
+    self.isBoss = (activeLayout and activeLayout.boss) and true or false
+    self.isHorde = (activeLayout and activeLayout.horde) and true or false
+    -- THIS battle's sprite scale, PER SIDE, from the preset's own optional
+    -- `spriteScaleFront` / `spriteScaleBack` override (or the legacy single
+    -- `spriteScale`, which sets both), else this file's own defaults -- read
+    -- once here and threaded into every drawSprite call. Each side is then
+    -- drawn at its own scale x its OWN pixels, so relative sizes within a
+    -- side are preserved while the two teams resize independently.
+    local legacyScale = tonumber(activeLayout and activeLayout.spriteScale)
+    self.spriteScaleFront = tonumber(activeLayout and activeLayout.spriteScaleFront)
+      or legacyScale or SPRITE_SCALE_FRONT
+    self.spriteScaleBack = tonumber(activeLayout and activeLayout.spriteScaleBack)
+      or legacyScale or SPRITE_SCALE_BACK
     -- Looped, not hardcoded to exactly 2 -- combat.lua's own logic
     -- (isAlive/chooseAiAction/orderActions/sideDefeated/etc) already
     -- just iterates these arrays with ipairs, so rendering (drawContent,
     -- below) is written the same N-agnostic way rather than assuming a
     -- fixed pair.
+    --
+    -- A TRAINER's roster can be longer than the preset's own enemyCount
+    -- -- its "how many enemies this formation actually stands on the
+    -- field" field (bossFight = 1 for its 4v1, doubles = 2, triples = 3).
+    -- Anything past that is the enemy BENCH, held back here and pulled in
+    -- one at a time as an active slot faints (Screen:
+    -- advanceEnemyReplacement). Because every draw, target and turn-order
+    -- path on this screen reads self.enemyBattlers and nothing else, a
+    -- benched boss is never drawn, never selectable as a target and never
+    -- takes a turn -- a two-Pokemon bossFight puts exactly ONE boss out at
+    -- a time instead of stacking both. A WILD fight (or a preset that
+    -- declares no enemyCount) keeps every enemy active, exactly as
+    -- before: there is no trainer to send a replacement, so benching one
+    -- would make a multi-enemy wild impossible to finish.
     self.enemyBattlers = {}
-    for i, mon in ipairs(payload.enemies) do
-      self.enemyBattlers[i] = combat.newBattler(mon, "enemy")
+    self.enemyBench = {}
+    local roster = payload.enemies or {}
+    local enemyCap = #roster
+    if type(payload.trainer) == "table" then
+      local declared = tonumber(activeLayout and activeLayout.enemyCount)
+      if declared and declared >= 1 and declared < enemyCap then enemyCap = declared end
+    end
+    for i = 1, #roster do
+      if i <= enemyCap then
+        self.enemyBattlers[#self.enemyBattlers + 1] = combat.newBattler(roster[i], "enemy")
+      else
+        self.enemyBench[#self.enemyBench + 1] = roster[i]
+      end
     end
     self.playerBattlers = {}
     for i, mon in ipairs(payload.players) do
@@ -1018,11 +2052,11 @@ return function(mod)
     -- the side). Screen:shownHpOf reads it; Screen:stepHpAnim walks it.
     self.shownHp = {}
     self.hpAnim = nil
-    -- Read fresh from this mod's own active layout preset (layouts.lua)
-    -- rather than baked in -- see that file's own header for the preset
-    -- file shape/naming and how the active one is chosen.
-    local activeLayout = mod.exports.getActiveLayoutData and mod.exports.getActiveLayoutData()
-    self.layout = (activeLayout and activeLayout.layout) or {}
+    -- Damage Numbers (option-gated by g9-battle-engine's
+    -- "damage_numbers" option -- see Screen:spawnDmgNumber): a short list
+    -- of { mon, text, color, t } floating HP-change labels. Emptied and
+    -- never touched when the option is off.
+    self.dmgNumbers = {}
     -- E menu (FIGHT/BAG/PKMN/RUN[/custom]) layout mode + optional 5th
     -- button, read fresh from this mod's own settings.lua at its root
     -- (loadSettingsFile's own header). menuOrder is the LIST-mode item
@@ -1034,6 +2068,48 @@ return function(mod)
       and settings.customButtonLabel ~= "") and settings.customButtonLabel or nil
     self.menuOrder = { "FIGHT", "BAG", "PKMN", "RUN" }
     if self.customButtonLabel then self.menuOrder[#self.menuOrder + 1] = "CUSTOM" end
+    -- SWITCH -- the positional ally swap -- is a LAYOUT capability, not a
+    -- per-turn one: it exists only where there is another living ally to
+    -- trade places with (two or more allies on the field) and the
+    -- bossFight preset turns it off outright, its four allies
+    -- notwithstanding. Decided once here, from the roster the preset
+    -- actually shipped, and read by every menu/layout path below so the
+    -- button can never appear where the swap has no meaning.
+    local livingAllies = 0
+    for _, b in ipairs(self.playerBattlers) do
+      if self.combat.isAlive(b) then livingAllies = livingAllies + 1 end
+    end
+    self.swapEnabled = (not self.isBoss) and livingAllies >= 2
+    if self.swapEnabled then table.insert(self.menuOrder, 2, "SWITCH") end
+    -- The E-cell layout tables this screen draws/navigates (grid/cross
+    -- modes; list mode reads self.menuOrder directly). Built per screen
+    -- because the SWITCH cell is conditional; the shared module constants
+    -- stay the no-SWITCH shapes so existing behaviour is untouched.
+    if self.menuLayout == "grid" then
+      if self.customButtonLabel then
+        self.crossSlots = self.swapEnabled and CROSS_SLOTS_SW or CROSS_SLOTS
+      else
+        self.gridRows = self.swapEnabled and GRID2_ROWS_SW or GRID2_ROWS
+      end
+    end
+    -- Battlers that own a queued (not yet resolved) positional swap, kept
+    -- so the field can keep showing WHO is behind each swap after the
+    -- target has been picked (a frame arrow, drawSwapMark). Cleared every
+    -- turn and as each swap resolves.
+    self.swapOwnerMarks = {}
+    -- FORMS ownership (see the GIMMICK SELECT section's own FORMS OWNER
+    -- block): the player battler whose action menu the CUSTOM/FORMS cell was
+    -- opened from, and the transform it confirmed. Kept here, not on
+    -- battle_forms' own arm state -- that state records WHICH mechanic is
+    -- armed and nothing about WHO armed it, because its native cell has only
+    -- one battler to be about. Cleared each turn (Screen:beginTurn) and after
+    -- the turn_started activation, so a stale owner can never fire.
+    self.gimmickActorMon = nil
+    self.gimmickActorSlot = nil
+    self.gimmickOwnerMon = nil
+    self.gimmickOwnerSlot = nil
+    self.gimmickOwnerId = nil
+    self.gimmickOwnerLabel = nil
     -- Move-animation state: spriteAnchor is filled in every drawContent
     -- pass (see drawSprite's own return value) with each battler's real
     -- on-screen bottom-center this frame -- Screen:startMoveAnim reads
@@ -1054,8 +2130,9 @@ return function(mod)
     -- the player trainer's back-pic slides off left before each "Go! P!"
     -- (also a pokeball throw), and only then do the mons' own sprites/
     -- HUDs exist. In a WILD battle there is no enemy trainer -- each
-    -- wild mon drops in from the top of the screen onto its platform,
-    -- and the player back-pic leads (native's BattleIntroSlidingPics).
+    -- wild mon fades in place at its final sprite position (invisible ->
+    -- visible), and the player back-pic leads (native's
+    -- BattleIntroSlidingPics).
     -- enemyRevealed/playerRevealed gate each slot's sprite AND HUD box
     -- (both hidden until that mon is actually sent out); reveal flags
     -- are read by drawContent and set by advanceIntro's beats / the
@@ -1064,19 +2141,25 @@ return function(mod)
     self.showEnemyTrainer = false
     self.playerTrainerImage = nil
     self.enemyTrainerImage = nil
+    -- The pics' colour data, filled in by resolveTrainerArt below (a
+    -- TrainerPalettes row + a trueColor flag per pic -- see drawRawImage).
+    self.playerTrainerColors = nil
+    self.enemyTrainerColors = nil
+    self.playerTrainerTrueColor = false
+    self.enemyTrainerTrueColor = false
     self.trainerSlide = nil
     self.backpicSlide = nil
     self.enemyRevealed = {}
     self.playerRevealed = {}
     self:resolveTrainerArt()
-    -- WILD mons are NOT pre-revealed: their "drop" intro beat slides each
-    -- one down from the top of the screen onto its platform (the vanilla
-    -- wild entry -- see buildIntroSequence), which is what gates sprite
-    -- AND HUD until it lands.
+    -- WILD mons are NOT pre-revealed: their "fade" intro beat leaves each
+    -- one in place at its final sprite position and fades its sprite from
+    -- invisible to visible (see buildIntroSequence), which is what gates
+    -- sprite AND HUD until the fade completes.
     self.introSequence = self:buildIntroSequence()
     self.introIdx = 0
     self.ballThrow = nil
-    self.wildDrop = nil
+    self.wildFade = nil
     self.outroT = nil
     if #self.introSequence > 0 then
       self.phase = "intro"
@@ -1091,7 +2174,7 @@ return function(mod)
   -- TURN PACING -- the display lags the resolution
   --
   -- The engine mod owns turn resolution and resolves the WHOLE turn in
-  -- one call (Combat.resolveTurn -> g9-battle-engine-beta's
+  -- one call (Combat.resolveTurn -> g9-battle-engine's
   -- mod.exports.resolveTurnActions, combat/turn_order.lua:298), so every
   -- hit point this turn will ever cost is already gone from the real mon
   -- tables before a single line of text is on screen. Nothing below
@@ -1161,7 +2244,7 @@ return function(mod)
   -- Screen:startMoveAnim already uses on an AnimRunner's object pool.
   -- Safe to do blind: every event this mod ever sees goes through
   -- battle:emit, confirmed by direct read of both the engine
-  -- (Battle.lua) and g9-battle-engine-beta (its combat/ and abilities/
+  -- (Battle.lua) and g9-battle-engine (its combat/ and abilities/
   -- files call battle:emit / self:emit and never push to battle.events
   -- themselves), and nothing on either side reassigns battle.emit.
   --
@@ -1201,7 +2284,7 @@ return function(mod)
         -- battle; the error is re-raised unchanged afterward. Safe to
         -- wrap in a pcall specifically because nothing under useMove
         -- yields -- checked, not assumed: neither src/battle/gen2/
-        -- Battle.lua nor g9-battle-engine-beta's combat/ uses coroutines
+        -- Battle.lua nor g9-battle-engine's combat/ uses coroutines
         -- at all (switch_primitives.lua's own header explains why the
         -- one place that wanted to could not).
         local ok, a, bb, c = pcall(baseUseMove, b, attacker, defender, moveId, ...)
@@ -1259,6 +2342,11 @@ return function(mod)
       if self.shownHp[mon] == nil then
         self.shownHp[mon] = hp
       elseif self.shownHp[mon] ~= hp then
+        -- A bar the chase has already seen is moving: the signed
+        -- difference IS this event's HP change, so spawn a floating
+        -- number for it (a no-op unless the engine's damage-numbers
+        -- option is on -- see Screen:spawnDmgNumber).
+        self:spawnDmgNumber(mon, hp - self.shownHp[mon])
         pending = pending or {}
         pending[mon] = hp
       end
@@ -1327,6 +2415,97 @@ return function(mod)
     if not pending then return end
     for mon, target in pairs(pending) do self.shownHp[mon] = target end
     self.hpAnim = nil
+  end
+
+  ------------------------------------------------------------------
+  -- DAMAGE NUMBERS (round 105). The engine option
+  -- g9-battle-engine's "damage_numbers" is exposed to this screen
+  -- as g9dex.exports.damageNumbersEnabled(); when it is on, every HP
+  -- change the resolution pass reveals gets a floating label over that
+  -- mon's own HP bar -- a red "-N" for damage taken, a green "+N" for
+  -- HP recovered. The value is the signed change between the bar's
+  -- current displayed value and the event's own HP snapshot
+  -- (Screen:armHpAnim computes exactly that delta for the chase), so
+  -- nothing extra has to be sent across: the engine already stamps every
+  -- emitted event with this screen's full HP vector (event.g9SceneHp,
+  -- Screen:installEventProbe), which is the same source the bars chase.
+  -- Each label lives DMG_NUMBER_LIFE seconds and fades linearly to
+  -- invisible over that time (alpha 1 -> 0).
+  ------------------------------------------------------------------
+  local DMG_NUMBER_LIFE = 1.0
+  local DMG_NUMBER_DAMAGE = { 0.85, 0.13, 0.13 }
+  local DMG_NUMBER_HEAL = { 0.10, 0.65, 0.18 }
+
+  function Screen:damageNumbersEnabled()
+    local eng = self.g9dex and self.g9dex.exports
+    local fn = eng and eng.damageNumbersEnabled
+    return type(fn) == "function" and fn() == true
+  end
+
+  -- Spawns one floating label for `delta` hp on `mon` (negative = damage
+  -- taken, positive = recovered); a no-op for a zero delta, a missing
+  -- mon, or when the engine option is off.
+  function Screen:spawnDmgNumber(mon, delta)
+    if not mon or not delta or delta == 0 then return end
+    if not self:damageNumbersEnabled() then return end
+    local list = self.dmgNumbers
+    if not list then list = {}; self.dmgNumbers = list end
+    local damage = delta < 0
+    list[#list + 1] = {
+      mon = mon,
+      text = (damage and "-" or "+") .. tostring(math.abs(delta)),
+      color = damage and DMG_NUMBER_DAMAGE or DMG_NUMBER_HEAL,
+      t = 0,
+    }
+  end
+
+  -- Ages every live label; drops the ones that have finished fading.
+  -- dt is the real frame delta Screen:update is handed.
+  function Screen:stepDmgNumbers(dt)
+    local list = self.dmgNumbers
+    if not list or #list == 0 then return end
+    local step = dt or 0
+    for i = #list, 1, -1 do
+      local e = list[i]
+      e.t = e.t + step
+      if e.t >= DMG_NUMBER_LIFE then table.remove(list, i) end
+    end
+  end
+
+  -- Draws every live label under its own mon's readout box, centred on the
+  -- HP bar's own fill channel (the 6 cells, 48px wide, whose centre sits 48
+  -- box-local px in from the box's left edge), at the HP-bar font's own
+  -- size (the numeric readout in drawGuiBox is drawn at 0.75 inside the
+  -- 0.47-scaled box, so 0.75 * BOX_SCALE * sizeMul here matches it exactly)
+  -- and fading out. The y is the readout box's own EMPTY bottom band (7px
+  -- above its bottom edge): the bar's fill cells end 24px down, so the label
+  -- sits under the bar without ever superimposing the bar, the numeric
+  -- current/max readout or the exp bar. pcall'd end-to-end: a malformed
+  -- entry must never take the battle down, it just clears the list.
+  function Screen:drawDmgNumbers()
+    local list = self.dmgNumbers
+    if not list or #list == 0 or not self.hudMark then return end
+    local ok = pcall(function()
+      for i = 1, #list do
+        local e = list[i]
+        local battler = self:battlerFor(e.mon)
+        local mark = battler and self.hudMark[battler]
+        if mark and mark.visible and mark.left and mark.gs and mark.top then
+          local eff = BOX_SCALE * mark.gs
+          local scale = eff * 0.75
+          local cx = mark.left + 48 * eff
+          -- box height per side (enemy 4 tiles, player 6); sit the label in
+          -- the box's own empty bottom band, 7px above its lower edge.
+          local h = mark.h or 32
+          local y = mark.top + (h - 7) * eff
+          local alpha = math.max(0, 1 - e.t / DMG_NUMBER_LIFE)
+          love.graphics.setColor(e.color[1], e.color[2], e.color[3], alpha)
+          drawScaledText(e.text, cx - Font.width(e.text) * scale / 2, y, scale)
+        end
+      end
+      love.graphics.setColor(1, 1, 1, 1)
+    end)
+    if not ok then self.dmgNumbers = {} end
   end
 
   -- Real vanilla battle-exit sequence, mirrored from World:startBattle's
@@ -1511,8 +2690,11 @@ return function(mod)
   -- override baked into self.layout (Screen.new) if one exists for it,
   -- otherwise the layout's own computed default.
   function Screen:pos(id, defaultTx, defaultTy)
+    -- A preset may override either coordinate alone (e.g. bossFight only
+    -- moves its sprite's ground line), so fall back PER FIELD rather than
+    -- requiring a tx override before a ty override is honoured.
     local saved = self.layout[id]
-    if saved and saved.tx then return saved.tx, saved.ty end
+    if saved then return saved.tx or defaultTx, saved.ty or defaultTy end
     return defaultTx, defaultTy
   end
 
@@ -1571,6 +2753,18 @@ return function(mod)
       if self.combat.isAlive(b) then self.turnSlots[#self.turnSlots + 1] = i end
     end
     self.queuedActions = {}
+    self.swapOwnerMarks = {}
+    -- A FORM is armed for the turn it was picked in, and no longer: a new
+    -- turn starts with no owner, so a mechanic that was somehow left armed
+    -- (battle_forms' own once-per-battle state refuses a spent id, but a
+    -- refused activation deliberately keeps it armed) is announced as this
+    -- turn's, if anything, rather than last turn's.
+    self.gimmickActorMon = nil
+    self.gimmickActorSlot = nil
+    self.gimmickOwnerMon = nil
+    self.gimmickOwnerSlot = nil
+    self.gimmickOwnerId = nil
+    self.gimmickOwnerLabel = nil
     self.slotPtr = 1
     if #self.turnSlots == 0 then
       -- Both player battlers already down with no switch made -- still
@@ -1592,32 +2786,49 @@ return function(mod)
   -- the intro just skips that slide -- the same graceful fallback native
   -- uses when a cache has no trainer pic (the mon stands in for the
   -- whole intro).
+  --
+  -- COLOUR, resolved here alongside the image (the reason this exists as
+  -- one function): each pic's own TrainerPalettes row plus its trueColor
+  -- flag, both taken from the same sources native reads, and handed to
+  -- drawRawImage so the grayscale sheet is remapped to the cart's colours.
+  -- See drawRawImage and the Palettes/Sprites requires near the top.
   function Screen:resolveTrainerArt()
-    local hud = self.data and self.data.gen2MenuGfx and self.data.gen2MenuGfx.battleHud
-    local backPath = hud and hud.playerBack
     local save = self.game and self.game.save
-    if hud and hud.playerBackFemale and save and save.player
-      and save.player.gender == "female" then
-      backPath = hud.playerBackFemale
-    end
+    -- Per-generation source (native.lua): Gen 2 reads gen2MenuGfx.battleHud and
+    -- colours through TrainerPalettes; Gen 1 reads the native field.playerPics
+    -- back-pic seam and the trainers registry's class pic.  Returns
+    -- path, trueColor, colours.
+    local backPath, backTrueColor, backColors =
+      N.playerBackArt(self.data, save, self.battle)
     local backImg = backPath and loadSprite(backPath)
     if backImg then
       self.playerTrainerImage = backImg
       self.showPlayerTrainer = true
+      self.playerTrainerColors = backColors
+      self.playerTrainerTrueColor = backTrueColor and true or false
     end
     if self.isTrainerBattle and type(self.trainerData) == "table" then
-      local classId = self.trainerData.classId or self.trainerData.class
-      local classes = self.data and self.data.gen2Trainers and self.data.gen2Trainers.classes
-      local classDef = classes and classes[classId]
-      local path = (classDef and classDef.pic)
-        or (hud and hud.trainerPics and hud.trainerPics[classId])
+      local path, trueColor, colors =
+        N.enemyTrainerArt(self.data, self.trainerData)
       local img = path and loadSprite(path)
       if img then
         self.enemyTrainerImage = img
         self.showEnemyTrainer = true
+        self.enemyTrainerColors = colors
+        self.enemyTrainerTrueColor = trueColor and true or false
       end
     end
   end
+
+  -- Reference note for the Gen 2 arm -- kept because it documents exactly which
+  -- native lookups each resolved value came from (the backend above performs
+  -- these same reads, and the Gen 2 path is behaviourally identical):
+  --   local hud = self.data.gen2MenuGfx.battleHud
+  --   playerBack -- playerBackFemale for a female hero (save.player.gender)
+  --   trainerArt(data, classId) with classId = trainer.classId or trainer.class
+  --   colours = Palettes.trainerColors(palettes, classId) through GbcPalette.
+  -- Any missing/unloadable art leaves its flag false and the intro skips that
+  -- slide, the same graceful fallback native uses.
 
   -- The vanilla intro beats for THIS battle, in order -- the full
   -- native sequence, not just the narration lines (the order the user
@@ -1628,14 +2839,15 @@ return function(mod)
   --     its platform) -> backpicSlide (player back-pic slides off left,
   --     only when art loaded) -> one "Go! P!" per living player battler
   --     (also thrown from a pokeball).
-  --   WILD:   one "Wild X appeared!" per enemy -- each drops in from the
-  --     top of the screen onto its platform (the vanilla wild entry, the
-  --     ONLY slide-in left) -> backpicSlide -> "Go! P!" per player
-  --     battler (pokeball throw).
+  --   WILD:   one "Wild X appeared!" per enemy -- each appears in place
+  --     at its final sprite position and fades from invisible to visible
+  --     (there is no slide-in at all) -> backpicSlide -> "Go! P!" per
+  --     player battler (pokeball throw).
   -- A battle with no enemies at all skips straight to the menu (empty
   -- sequence). Kinds: "msg" narration only, "trainerSlide"/"backpicSlide"
   -- start a pic's slide-off (the next beat advances when it completes),
-  -- "drop" slides the wild enemy in slot `slot` down from the top,
+  -- "fade" fades the wild enemy in slot `slot` in place (invisible ->
+  -- visible over WILD_FADE_DURATION),
   -- "throw" throws a pokeball from side `side` ("player"/"enemy") to
   -- slot `slot`'s platform and materializes that battler there.
   function Screen:buildIntroSequence()
@@ -1653,7 +2865,7 @@ return function(mod)
     else
       for i, b in ipairs(self.enemyBattlers) do
         seq[#seq + 1] = { text = "Wild " .. displayName(b.mon) .. " appeared!",
-          kind = "drop", slot = i }
+          kind = "fade", slot = i }
       end
     end
     if self.showPlayerTrainer then
@@ -1684,9 +2896,12 @@ return function(mod)
   -- Shows the next intro beat, or hands off to the real turn loop when
   -- the narration runs out. A "throw" beat arms the pokeball clock (ball
   -- arcs to the mon's platform, lands, materializes the mon -- revealed
-  -- only when the ball lands, drawn in drawContent/drawBallThrow); a
-  -- "drop" beat arms the wild drop-in clock (that enemy mon slides down
-  -- from the top). The slide beats just arm their clocks (the dt stepper
+  -- only when the ball lands, drawn in drawContent/drawBallThrow) AND
+  -- pre-warms that battler's sheet for the ball's whole flight (see
+  -- Screen:prewarmSlot), so the mon's own frames are baked before it is
+  -- revealed; a "fade" beat arms the wild fade clock (that enemy mon fades
+  -- in place).
+  -- The slide beats just arm their clocks (the dt stepper
   -- in Screen:update and the A/B snap in updateIntro both finish them and
   -- then call advanceIntro again for the NEXT beat -- so a pic slides
   -- fully off before the next line reads, exactly like native's own held
@@ -1701,8 +2916,11 @@ return function(mod)
     self.currentMessage = step.text or nil
     if step.kind == "throw" then
       self.ballThrow = { side = step.side, slot = step.slot, t = 0 }
-    elseif step.kind == "drop" then
-      self.wildDrop = { slot = step.slot, t = 0 }
+      -- Begin the sheet bake NOW, during the ball's flight, so the mon's own
+      -- frames are ready when the ball lands (see Screen:prewarmSlot).
+      self:prewarmSlot(step.side, step.slot)
+    elseif step.kind == "fade" then
+      self.wildFade = { slot = step.slot, t = 0 }
     elseif step.kind == "trainerSlide" then
       self.trainerSlide = 0
     elseif step.kind == "backpicSlide" then
@@ -1710,15 +2928,15 @@ return function(mod)
     end
   end
 
-  -- A wild drop-in has completed: reveal that battler (sprite + HUD
+  -- A wild fade-in has completed: reveal that battler (sprite + HUD
   -- gate) and clear the entrance state. Called from the dt stepper once
-  -- the drop's clock passes its duration. (The pokeball throw reveals
+  -- the fade's clock passes its duration. (The pokeball throw reveals
   -- and clears itself inline in Screen:update -- the reveal on landing,
   -- the clear at the very end.)
   function Screen:finishEntrance()
-    if self.wildDrop then
-      self.enemyRevealed[self.wildDrop.slot] = true
-      self.wildDrop = nil
+    if self.wildFade then
+      self.enemyRevealed[self.wildFade.slot] = true
+      self.wildFade = nil
     end
   end
 
@@ -1728,7 +2946,7 @@ return function(mod)
   -- turn loop takes over.
   function Screen:finishIntro()
     self.ballThrow = nil
-    self.wildDrop = nil
+    self.wildFade = nil
     self.trainerSlide = nil
     self.backpicSlide = nil
     self.showPlayerTrainer = false
@@ -1741,7 +2959,7 @@ return function(mod)
 
   -- Intro input: A/B advances the narration exactly like resolving's
   -- message pump -- but a press during a hold (the pokeball throw or wild
-  -- drop-in, either trainer pic's slide-off) snaps it to done (the same
+  -- fade-in, either trainer pic's slide-off) snaps it to done (the same
   -- rule as every other hold: a press ends the hold and nothing else,
   -- never skipping the line underneath it).
   function Screen:updateIntro(input)
@@ -1750,8 +2968,8 @@ return function(mod)
         self.ballThrow.t = BALL_THROW_TOTAL
         return
       end
-      if self.wildDrop and self.wildDrop.t < WILD_DROP_DURATION then
-        self.wildDrop.t = WILD_DROP_DURATION
+      if self.wildFade and self.wildFade.t < WILD_FADE_DURATION then
+        self.wildFade.t = WILD_FADE_DURATION
         return
       end
       if self.trainerSlide ~= nil and self.trainerSlide < TRAINER_SLIDE_DURATION then
@@ -1773,7 +2991,7 @@ return function(mod)
     self.phase = "actionMenu"
   end
 
-  -- CUSTOM ("Gimmicks", per this mod's own settings.lua default) opens a
+  -- CUSTOM ("FORMS", per this mod's own settings.lua default) opens a
   -- real picker over battle_forms's own transform registry -- explicit
   -- user request: "battle forms is the mod that will own the call for
   -- 'custom' button from gen9 battle scene," then, after an initial
@@ -1794,6 +3012,8 @@ return function(mod)
       self:openBag()
     elseif id == "PKMN" then
       self:openSwitchMenu()
+    elseif id == "SWITCH" then
+      self:enterSwapSelect()
     elseif id == "FIGHT" then
       self:enterMoveSelect()
     elseif id == "CUSTOM" then
@@ -1836,6 +3056,93 @@ return function(mod)
   -- is already an edge case, and four slots is what was asked for.
   local GIMMICK_GRID_ROWS = { {1, 2}, {3, 4} }
 
+  ------------------------------------------------------------------
+  -- FORMS OWNER -- which Pokemon a FORMS/CUSTOM pick belongs to
+  ------------------------------------------------------------------
+  -- battle_forms reads `battle.player` for every decision it makes:
+  -- formapi.gimmicks resolves each mechanic's `available(battle)` against it,
+  -- src/dynamax.lua's own `arm` substitutes that battler's moves, and
+  -- src/resolve.lua's onTurnStarted activates against it. This scene
+  -- deliberately pins `battle.player` to the FIRST player battler for the
+  -- engine's own reads (native.lua's buildBattle: `state.player =
+  -- byMon[data.players[1]]`), so on a doubles/native-multi layout a FORM
+  -- picked from any other mon's action menu used to land on slot 1 -- read
+  -- and confirmed in formapi.gimmicks / mega.activate / dynamax.arm.
+  -- Explicit user request: "make sure that we are matching its activation to
+  -- the pokemon owner of the turn".
+  --
+  -- We CAN control the pairing, and this is how: every battle_forms call the
+  -- FORMS bridge makes runs with `battle.player` focused on the mon whose
+  -- action menu the pick came from -- eligibility when the list is built,
+  -- arm() when it is confirmed (so a Max Move/Z-Move substitution lands on
+  -- the right moveset) and the real battle.turn_started activation. The pin
+  -- is restored the instant each call returns, so nothing else that reads
+  -- battle.player sees the focus.
+  --
+  -- The mon is ALSO announced to other mods (FORMS_EVENT above), precisely
+  -- because the focus is transient: a peer that reads battle.player later
+  -- cannot assume it names the FORM's owner, so the announcement carries the
+  -- mon explicitly instead.
+  local function nativePlayerFor(self, mon)
+    if not mon then return nil end
+    -- Gen 2's battle.player IS the mon; Gen 1's is the native battler the mon
+    -- was built into (battle_forms' own battlerof.mon reverses that again).
+    if N.isGen2 then return mon end
+    local byMon = self.battle and self.battle.battlersByMon
+    return byMon and byMon[mon] or nil
+  end
+
+  -- Runs `fn` with battle.player pointed at `mon`, restoring the baseline
+  -- afterward whether fn returns or raises -- pcall'd so a raising
+  -- battle_forms call can never leave the field pointed at the wrong mon.
+  local function focusBattlePlayer(self, mon, fn)
+    local battle = self.battle
+    local focused = mon and nativePlayerFor(self, mon)
+    if not (battle and focused) then return fn() end
+    local saved = battle.player
+    battle.player = focused
+    local ok, a, b = pcall(fn)
+    battle.player = saved
+    if not ok then error(a, 0) end
+    return a, b
+  end
+
+  -- formapi's own published `armed()` (the internals are not the peer
+  -- contract). The armed id disappearing between two reads is also the signal
+  -- that battle.turn_started actually consumed it; staying armed means the
+  -- entry's activate() refused and the option is deliberately kept.
+  local function battleFormsArmedId()
+    local battleForms = mod:find("battle_forms")
+    local api = battleForms and battleForms.exports
+    if not (api and type(api.armed) == "function") then return nil end
+    local ok, id = pcall(api.armed)
+    return ok and id or nil
+  end
+
+  -- The phase announcement described on FORMS_EVENT.
+  local function emitFormsEvent(self, phase, fields)
+    fields = fields or {}
+    local mon = fields.mon
+    local ok, err = pcall(mod.events.emit, mod.events, FORMS_EVENT,
+      { phase = phase, mon = mon, species = mon and mon.species or nil,
+        slot = fields.slot, id = fields.id, label = fields.label,
+        reason = fields.reason, battle = self.battle, game = self.game,
+        world = self.world })
+    if not ok then
+      mod.log:warn("g9_Battle_Scene: FORMS %s event could not be emitted (%s)",
+        tostring(phase), tostring(err))
+    end
+  end
+
+  -- Drops the recorded owner without an announcement -- for the paths that
+  -- have already announced something else about it.
+  local function clearGimmickOwner(self)
+    self.gimmickOwnerMon = nil
+    self.gimmickOwnerSlot = nil
+    self.gimmickOwnerId = nil
+    self.gimmickOwnerLabel = nil
+  end
+
   -- Corrected same day: user asked what happened to battle_forms's own
   -- once-per-battle limit -- the first version of this bridge called
   -- entry.activate(battle) directly, which performs a transformation but
@@ -1852,6 +3159,12 @@ return function(mod)
   function Screen:enterGimmickSelect()
     local battleForms = mod:find("battle_forms")
     local api = battleForms and battleForms.exports
+    -- Which mon's action menu this pick came from -- captured up here so the
+    -- arm and cancel paths always have it (see the FORMS OWNER block above).
+    local actor = self.playerBattlers[self.actingSlotIdx]
+    local actorMon = actor and actor.mon
+    self.gimmickActorMon = actorMon
+    self.gimmickActorSlot = self.actingSlotIdx
     -- battle_forms publishes a DOCUMENTED api (src/formapi.lua): gimmicks(),
     -- arm(), armed(). It does NOT publish transforms/armState -- those are
     -- its internal dep names, and asking for them found nil, which is why this
@@ -1860,13 +3173,19 @@ return function(mod)
     -- other way round: formapi.lua's header states plainly that the internals
     -- are not the peer contract.
     if not (api and type(api.gimmicks) == "function" and type(api.arm) == "function") then
-      self.message = "No Gimmicks available."
+      self.message = "No FORMS available."
       self.phase = "actionMenu"
       return
     end
     -- gimmicks(battle) already applies this mod's own eligibility AND the
     -- barred-species rule, and returns { id, label, available } rows.
-    local okList, rows = pcall(api.gimmicks, self.battle)
+    -- Focused on the acting mon so eligibility is resolved against it rather
+    -- than the engine's pinned slot-1 battler (see FORMS OWNER above).
+    local okList, rows = pcall(function()
+      return focusBattlePlayer(self, actorMon, function()
+        return api.gimmicks(self.battle)
+      end)
+    end)
     if not okList or type(rows) ~= "table" then rows = {} end
     local registry = { all = function()
       local out = {}
@@ -1893,7 +3212,7 @@ return function(mod)
     -- available(battle) alone, confirmed by reading it, never checks
     -- either.
     if armState:usedAny() then
-      self.message = "Already used a Gimmick this battle."
+      self.message = "Already used a FORM this battle."
       self.phase = "actionMenu"
       return
     end
@@ -1906,7 +3225,7 @@ return function(mod)
       end
     end
     if #candidates == 0 then
-      self.message = "No Gimmick available right now."
+      self.message = "No FORM available right now."
       self.phase = "actionMenu"
       return
     end
@@ -1919,7 +3238,11 @@ return function(mod)
   function Screen:updateGimmickSelect(input)
     if input:wasPressed("b") then
       -- Nothing armed yet at this point -- back to the action menu with
-      -- no side effect, same as moveSelect's own B.
+      -- no side effect, same as moveSelect's own B. Announced, so a peer
+      -- watching for the FORM this turn picked a mon for knows the pick was
+      -- backed out of rather than expecting an activation (FORMS_EVENT).
+      emitFormsEvent(self, "cancelled", { mon = self.gimmickActorMon,
+        slot = self.gimmickActorSlot, reason = "backed-out" })
       self.gimmickCandidates = nil
       self.gimmickArmState = nil
       self.phase = "actionMenu"
@@ -1927,12 +3250,48 @@ return function(mod)
     end
     if input:wasPressed("a") then
       local chosen = self.gimmickCandidates[self.gimmickCursor]
+      local ownerMon = self.gimmickActorMon
       -- Armed only -- the real transformation happens later, at
       -- battle.turn_started (Screen:advanceResolving), the same timing
-      -- battle_forms's own resolve.onTurnStarted always used.
-      local ok, armed = pcall(function() return self.gimmickArmState:toggle(chosen.id) end)
-      self.message = (ok and armed) and (chosen.label .. " armed!")
-        or "That Gimmick couldn't be armed."
+      -- battle_forms's own resolve.onTurnStarted always used. Focused on the
+      -- owner because State:toggle dispatches the mechanic's own arm() hook
+      -- (src/arm.lua's retarget), and for a move-substituting mechanic
+      -- (Dynamax's Max Moves, a Z-Move) that hook replaces battle.player's
+      -- move array -- so it has to be the right battler.
+      local ok, armed = pcall(function()
+        return focusBattlePlayer(self, ownerMon, function()
+          return self.gimmickArmState:toggle(chosen.id)
+        end)
+      end)
+      if ok and armed then
+        -- A previous pick this turn (a second mon's FORMS, or a second cell)
+        -- is superseded: announced before the new owner so a peer never sees
+        -- two live "armed" announcements for one battle.
+        if self.gimmickOwnerMon then
+          emitFormsEvent(self, "cancelled", { mon = self.gimmickOwnerMon,
+            slot = self.gimmickOwnerSlot, id = self.gimmickOwnerId,
+            label = self.gimmickOwnerLabel, reason = "replaced" })
+        end
+        self.gimmickOwnerMon = ownerMon
+        self.gimmickOwnerSlot = self.gimmickActorSlot
+        self.gimmickOwnerId = chosen.id
+        self.gimmickOwnerLabel = chosen.label
+        -- Names the Pokemon that used it, so the player line says the same
+        -- thing the FORMS_EVENT payload does.
+        self.message = ownerMon
+          and (displayName(ownerMon) .. " armed " .. chosen.label .. "!")
+          or (chosen.label .. " armed!")
+        emitFormsEvent(self, "armed", { mon = ownerMon,
+          slot = self.gimmickActorSlot, id = chosen.id, label = chosen.label })
+      else
+        -- Toggling the already-armed cell off, or battle_forms refusing it.
+        -- Either way nothing is left armed for an earlier owner to claim.
+        clearGimmickOwner(self)
+        self.message = "That FORM couldn't be armed."
+        emitFormsEvent(self, "cancelled", { mon = ownerMon,
+          slot = self.gimmickActorSlot, id = chosen.id, label = chosen.label,
+          reason = "arm-refused" })
+      end
       self.gimmickCandidates = nil
       self.gimmickArmState = nil
       self.phase = "actionMenu"
@@ -2011,13 +3370,43 @@ return function(mod)
     return list[idx]
   end
 
-  -- Moves self.menuCursor for GRID mode -- either the plain 2x2 (real
-  -- row/col toggle, GRID2_ROWS) or, when a custom button is set, the
-  -- 5-cell cross (the two explicit CROSS_*_CYCLE orders, module header
-  -- explains why coordinate math can't be used there). Same true/false
-  -- return contract as moveMenuCursorList.
+  -- Locate an id in a rectangular grid whose rows may contain nil holes.
+  local function findCell(grid, id)
+    for r = 1, #grid do
+      for c = 1, #grid[r] do
+        if grid[r][c] == id then return r, c end
+      end
+    end
+  end
+
+  -- One grid step that SKIPS empty cells and wraps: walk in the (dr, dc)
+  -- direction until a real cell is met, wrapping around the grid at each
+  -- edge, and give up after a full lap (returning the start) so a heading
+  -- that only ever meets empty cells is a no-op, not a hang. This is what
+  -- lets the SWITCH cross reach its centre cell by plain coordinate
+  -- movement -- the original cross could not (a step from any corner lands
+  -- on an empty cell and carries straight through to the opposite corner),
+  -- which is why that shape needed the explicit cycles below.
+  local function stepCell(grid, r, c, dr, dc)
+    local rows = #grid
+    local cols = 1
+    for i = 1, rows do if #grid[i] > cols then cols = #grid[i] end end
+    local sr, sc = r, c
+    for _ = 1, rows * cols do
+      r = ((r - 1 + dr) % rows) + 1
+      c = ((c - 1 + dc) % cols) + 1
+      if r == sr and c == sc then break end
+      if grid[r] and grid[r][c] then return r, c end
+    end
+    return sr, sc
+  end
+
+  -- Moves self.menuCursor for GRID mode -- the SWITCH cross and the plain
+  -- grids by coordinate movement (stepCell), or, when SWITCH is off and a
+  -- custom button is set, the original 5-cell cross and its two explicit
+  -- cycles. Same true/false return contract as moveMenuCursorList.
   function Screen:moveMenuCursorGrid(input)
-    if self.customButtonLabel then
+    if self.customButtonLabel and not self.swapEnabled then
       if input:wasPressed("right") then
         self.menuCursor = cycleStep(CROSS_RIGHT_CYCLE, self.menuCursor, 1)
       elseif input:wasPressed("left") then
@@ -2031,21 +3420,22 @@ return function(mod)
       end
       return true
     end
-    local row, col
-    for r = 1, 2 do
-      for c = 1, 2 do
-        if GRID2_ROWS[r][c] == self.menuCursor then row, col = r, c end
-      end
-    end
-    row, col = row or 1, col or 1
-    if input:wasPressed("left") or input:wasPressed("right") then
-      col = col == 1 and 2 or 1
-    elseif input:wasPressed("up") or input:wasPressed("down") then
-      row = row == 1 and 2 or 1
+    local grid = self.crossSlots or self.gridRows
+    local row, col = findCell(grid, self.menuCursor)
+    if not row then return false end
+    local nr, nc
+    if input:wasPressed("left") then
+      nr, nc = stepCell(grid, row, col, 0, -1)
+    elseif input:wasPressed("right") then
+      nr, nc = stepCell(grid, row, col, 0, 1)
+    elseif input:wasPressed("up") then
+      nr, nc = stepCell(grid, row, col, -1, 0)
+    elseif input:wasPressed("down") then
+      nr, nc = stepCell(grid, row, col, 1, 0)
     else
       return false
     end
-    self.menuCursor = GRID2_ROWS[row][col]
+    self.menuCursor = grid[nr][nc] or self.menuCursor
     return true
   end
 
@@ -2058,7 +3448,12 @@ return function(mod)
       -- menu either).
       if self.slotPtr > 1 then
         self.slotPtr = self.slotPtr - 1
-        table.remove(self.queuedActions)
+        local undone = table.remove(self.queuedActions)
+        -- Undoing a queued SWITCH drops its owner cue too -- the swap is
+        -- no longer happening.
+        if undone and undone.kind == "swap" then
+          self:clearSwapOwnerMark(undone.actor)
+        end
         self:enterActionMenu()
       end
       return
@@ -2085,27 +3480,54 @@ return function(mod)
     end
   end
 
-  -- E's own real interior width in px, computed from E_TW (not
-  -- guessed): border glyphs eat one full tile per edge (Font.lua's own
-  -- convention, see this file's header), so the interior spans
-  -- (E_TW-2)*8=80px; eTextX already sits 2px into that (its own formula,
-  -- Screen:drawContent), leaving ~78px out to the right border. FIGHT/
-  -- BAG/PKMN/RUN are fixed 8px/glyph text (Font.lua), so a label's
-  -- pixel width is just #chars*8 -- confirmed by direct measurement,
-  -- not assumed, after a flat 44px column-gap guess broke "PKMN" out of
-  -- the box border live (screenshot-reported).
+  -- E's own text budget in px, the width every grid/cross slot below is
+  -- solved against.  E_TW*8=96px of box, minus the text inset eTextX
+  -- already applies (2px past the frame's own 4px left edge, its formula
+  -- in Screen:drawContent) and a 2px margin back from the right edge, is
+  -- 84px of true interior for round eighty-one's rect-drawn frame; 78 is
+  -- the tuned budget kept from the tile-border era, i.e. 6px of slack --
+  -- deliberately, since these slots carry the cursor gutter and the
+  -- label's own scaling.  FIGHT/BAG/PKMN/RUN are fixed 8px/glyph text
+  -- (Font.lua), so a label's pixel width is just #chars*8 -- confirmed by
+  -- direct measurement, not assumed, after a flat 44px column-gap guess
+  -- broke "PKMN" out of the box border live (screenshot-reported).
   local E_INTERIOR_W = 78
 
+  -- Rows are native-spaced at native size normally. SWITCH adds a row, and
+  -- with the custom button too that is six rows inside the box's ~42px of
+  -- text interior -- 11px spacing would run out through the bottom border
+  -- -- so a SWITCH-enabled list uses the cross layout's own 0.5 scale on a
+  -- 7px pitch (6 rows: 5*7 + 4 = 39px, inside 42).
+  local LIST_ROW_GAP = 11
+  local LIST_ROW_GAP_SW = 7
+
   function Screen:drawActionMenuEList()
-    for i, id in ipairs(self.menuOrder) do
-      local label = (id == "CUSTOM")
-        and fitName(self.customButtonLabel, E_INTERIOR_W - 10, 0)
-        or MENU_LABELS[id]
-      Font.draw(label, self.eTextX + 10, self.eTextY + (i - 1) * 11)
-    end
+    local scale = self.swapEnabled and CROSS_TEXT_SCALE or nil
+    local gap = self.swapEnabled and LIST_ROW_GAP_SW or LIST_ROW_GAP
     local cursorRow = 1
-    for i, id in ipairs(self.menuOrder) do if id == self.menuCursor then cursorRow = i break end end
-    Font.drawCode(CURSOR_CODE, self.eTextX, self.eTextY + (cursorRow - 1) * 11)
+    for i, id in ipairs(self.menuOrder) do
+      local label
+      if id == "CUSTOM" then
+        label = scale
+          and fitName(self.customButtonLabel, (E_INTERIOR_W - 10) / scale, 0)
+          or fitName(self.customButtonLabel, E_INTERIOR_W - 10, 0)
+      else
+        label = MENU_LABELS[id]
+      end
+      local y = self.eTextY + (i - 1) * gap
+      if scale then
+        drawScaledText(label, self.eTextX + 10, y, scale)
+      else
+        Font.draw(label, self.eTextX + 10, y)
+      end
+      if id == self.menuCursor then cursorRow = i end
+    end
+    local cy = self.eTextY + (cursorRow - 1) * gap
+    if scale then
+      drawScaledCode(CURSOR_CODE, self.eTextX, cy, scale)
+    else
+      Font.drawCode(CURSOR_CODE, self.eTextX, cy)
+    end
   end
 
   -- Row gap is PER MODE, not shared: BOTTOM_H was cut to 2/3 height
@@ -2152,7 +3574,7 @@ return function(mod)
   -- in the box: box true center = E_INTERIOR_W/2 = 39. margin(m) +
   -- FIGHT(20) + gap(g) + CENTER_budget(B) + gap(g) + PKMN(16) +
   -- margin(m) = E_INTERIOR_W=78, i.e. 2m+2g+B=42; picking g=2 (a
-  -- visible gap) and B=34 (comfortably fits "Gimmicks", 8 chars = 64px
+  -- visible gap) and B=34 (comfortably fits "FORMS", 5 chars = 40px
   -- unscaled at this 0.5 scale) leaves m=2: col1 x=2 w=20 (2 to 22),
   -- col2 x=24 w=34 (24 to 58), col3 x=60 w=16 (60 to 76) -- 2px margin
   -- on both sides. (An earlier pass dropped the gap between col2 and
@@ -2169,25 +3591,50 @@ return function(mod)
   -- Font.drawCode has no scale of its own (native ~8px) -- drawn
   -- through drawScaledCode now so the cursor shrinks with the text
   -- instead of swallowing it (screenshot-reported: the arrow covered
-  -- most of "Gimmicks"). 4px, not 2 or 10: needs to clear the smaller
+  -- most of "FORMS"). 4px, not 2 or 10: needs to clear the smaller
   -- scaled glyph without going negative off col1's own left edge (col1
   -- sits only 2px into the interior, eTextX-2 is the true border).
   local CROSS_CURSOR_OFFSET = 4
+
+  -- SWITCH-ENABLED MENUS. When the battle has two or more living allies
+  -- (and is not a bossFight), one extra E cell carries SWITCH, placed
+  -- directly UNDER FIGHT in every layout: second in the list order, the
+  -- middle-left cell of the cross, the second row's left cell of the
+  -- plain grid. Nothing else moves -- the cross keeps FIGHT/PKMN/BAG/RUN
+  -- on their own corners and CUSTOM centred, the plain grid keeps its own
+  -- top row -- so the only new fact is the cell itself.
+  --
+  -- Cross geometry: column 1 widens 20 -> 24 to fit "SWITCH" (6 glyphs at
+  -- CROSS_TEXT_SCALE=0.5 is exactly 24px), paid for by the centre budget
+  -- 34 -> 30, so the 3-column block still measures 78px with a 2px margin
+  -- either side: 2 + 24 + 2 + 30 + 2 + 16 + 2 = 78. (The SWITCH slot grids
+  -- themselves -- CROSS_SLOTS_SW / GRID2_ROWS_SW -- are declared up with
+  -- the other menu shapes, before Screen.new reads them.)
+  local CROSS_SLOT_X_SW = { 2, 28, 60 }
+  local CROSS_SLOT_W_SW = { 24, 30, 16 }
+  local CROSS_CENTER_BUDGET_SW = CROSS_SLOT_W_SW[2]
 
   -- Explicit numeric bounds, NOT ipairs -- CROSS_SLOTS rows have real
   -- nil holes ({"FIGHT", nil, "PKMN"}), and ipairs stops dead at the
   -- first nil, so it would never reach the third column at all.
   function Screen:drawActionMenuEGrid()
     if self.customButtonLabel then
+      -- Column geometry swaps to the wider-col-1 SWITCH variant when this
+      -- battle offers SWITCH; the plain/cross shapes are chosen by
+      -- Screen.new (self.crossSlots) and the two column tables below stay
+      -- in lockstep with them.
+      local slotColX = self.swapEnabled and CROSS_SLOT_X_SW or CROSS_SLOT_X
+      local slotColW = self.swapEnabled and CROSS_SLOT_W_SW or CROSS_SLOT_W
+      local centerBudget = self.swapEnabled and CROSS_CENTER_BUDGET_SW or CROSS_CENTER_BUDGET
       for r = 1, 3 do
         for c = 1, 3 do
-          local id = CROSS_SLOTS[r][c]
+          local id = self.crossSlots[r] and self.crossSlots[r][c]
           if id then
             local label = (id == "CUSTOM")
-              and fitName(self.customButtonLabel, CROSS_CENTER_BUDGET / CROSS_TEXT_SCALE, 0)
+              and fitName(self.customButtonLabel, centerBudget / CROSS_TEXT_SCALE, 0)
               or MENU_LABELS[id]
-            local slotX = self.eTextX + CROSS_SLOT_X[c]
-            local x = slotX + (CROSS_SLOT_W[c] - Font.width(label) * CROSS_TEXT_SCALE) / 2
+            local slotX = self.eTextX + slotColX[c]
+            local x = slotX + (slotColW[c] - Font.width(label) * CROSS_TEXT_SCALE) / 2
             local y = self.eTextY + GRID_Y_OFFSET + (r - 1) * GRID_ROW_GAP_3
             drawScaledText(label, x, y, CROSS_TEXT_SCALE)
             if id == self.menuCursor then
@@ -2198,16 +3645,28 @@ return function(mod)
       end
       return
     end
-    for r = 1, 2 do
+    -- Plain grid: the original 2x2 at GRID_ROW_GAP_2/GRID_TEXT_SCALE_2, or
+    -- the 3-row SWITCH shape at the cross's own tighter gap/scale -- a 3rd
+    -- row at the 2-row spacing would run past the shorter bottom box.
+    local grid = self.gridRows
+    local scale = self.swapEnabled and CROSS_TEXT_SCALE or GRID_TEXT_SCALE_2
+    local gap = self.swapEnabled and GRID_ROW_GAP_3 or GRID_ROW_GAP_2
+    for r = 1, #grid do
       for c = 1, 2 do
-        local id = GRID2_ROWS[r][c]
-        local label = MENU_LABELS[id]
-        local slotX = self.eTextX + GRID_MARGIN_2 + (c - 1) * GRID_SLOT_2
-        local x = slotX + (GRID_SLOT_2 - Font.width(label) * GRID_TEXT_SCALE_2) / 2
-        local y = self.eTextY + GRID_Y_OFFSET + (r - 1) * GRID_ROW_GAP_2
-        drawScaledText(label, x, y, GRID_TEXT_SCALE_2)
-        if id == self.menuCursor then
-          Font.drawCode(CURSOR_CODE, x - GRID_CURSOR_OFFSET_2, y)
+        local id = grid[r] and grid[r][c]
+        if id then
+          local label = MENU_LABELS[id]
+          local slotX = self.eTextX + GRID_MARGIN_2 + (c - 1) * GRID_SLOT_2
+          local x = slotX + (GRID_SLOT_2 - Font.width(label) * scale) / 2
+          local y = self.eTextY + GRID_Y_OFFSET + (r - 1) * gap
+          drawScaledText(label, x, y, scale)
+          if id == self.menuCursor then
+            if self.swapEnabled then
+              drawScaledCode(CURSOR_CODE, x - CROSS_CURSOR_OFFSET, y, scale)
+            else
+              Font.drawCode(CURSOR_CODE, x - GRID_CURSOR_OFFSET_2, y)
+            end
+          end
         end
       end
     end
@@ -2245,7 +3704,14 @@ return function(mod)
   ------------------------------------------------------------------
   function Screen:openBag()
     self.phase = "submenu"
-    Screens.push(self.game, "Gen2PackMenu", {
+    -- Gen 1's native BagMenu throws through the native BattleState, not this
+    -- scene's model, so the backend opens a ball-only ListMenu wired straight
+    -- to this screen's own throwBall instead (see native.lua).
+    if not N.isGen2 then
+      N.openBag(self)
+      return
+    end
+    Screens.push(self.game, N.packMenuId(), {
       save = self.game.save,
       battle = true,
       world = {},
@@ -2264,7 +3730,7 @@ return function(mod)
 
   function Screen:useItem(itemId)
     local def = self.data.items and self.data.items[itemId]
-    if not (def and def.pocket == "BALL") then
+    if not N.isBall(itemId, def) then
       self.message = "Can't use that here yet."
       self.phase = "actionMenu"
       return
@@ -2277,15 +3743,23 @@ return function(mod)
     self:throwBall(itemId)
   end
 
-  -- Thrown at whichever single enemy is still alive -- catchAllowed
-  -- already guarantees at most one is. See catch.lua's own header for
-  -- the full scope (no PC box yet). Not yet decremented from the bag --
-  -- save's real item-count shape wasn't confirmed against this session's
-  -- own research, and writing a guessed shape risks corrupting the save
-  -- outright, so this is an explicit, stated gap rather than a silent
-  -- guess. Resolves immediately (real Gen 2 never queues a ball throw
-  -- into turn order either); a miss still consumes this slot's action
-  -- for the turn, the same as a move would.
+  -- The BALL is thrown at whichever single enemy is still alive --
+  -- catchAllowed already guarantees at most one is.  This is the real native
+  -- throw: the ball itself is the cart's own ANIM_THROW_POKE_BALL object, in
+  -- the ball's native colour (N.ballPalette), flown from the thrower's own
+  -- sprite onto the target's OWN on-screen sprite position, and the script's
+  -- own catch loop then wobbles it with the native GetPokeBallWobble re-rolls
+  -- before the answer comes back -- see Screen:startCatchAnim.  The catch
+  -- RESOLVES on the frame that animation ends (Screen:resolveCatchAnim), so a
+  -- ball thrown here looks like the cart's own rather than an instant dice
+  -- roll.  When the animation cannot run -- a stock Gen 1 boot with no Gen 2
+  -- anim data -- the catch resolves on the spot exactly as it always used to.
+  --
+  -- Not yet decremented from the bag -- save's real item-count shape wasn't
+  -- confirmed against this session's own research, and writing a guessed shape
+  -- risks corrupting the save outright, so this is an explicit, stated gap
+  -- rather than a silent guess.  Either way a miss still consumes this slot's
+  -- action for the turn, the same as a move would.
   function Screen:throwBall(ballId)
     local target = nil
     for _, e in ipairs(self.enemyBattlers) do
@@ -2296,25 +3770,47 @@ return function(mod)
       self.phase = "actionMenu"
       return
     end
-    -- Real native catch formula (src/battle/gen2/Catching.lua), same
+    -- Real native catch formula -- Gen 2's src/battle/gen2/Catching.lua or Gen
+    -- 1's src/battle/Catching.lua, chosen by the backend (native.lua), same
     -- options shape g2-Battle-Scene's own (now-dropped) catch.lua always
-    -- built. Passing a real `battle` here is the one upgrade native
-    -- gives us: Catching.attempt calls battle:caught(mon) itself on a
-    -- successful catch (Transform reload, the battle.catch_exp hook) --
-    -- confirmed real, gen2/Catching.lua:380-382 -- which a battle-free
-    -- caller never got.
+    -- built. Passing a real `battle` here is the one upgrade native gives
+    -- us: on Gen 2 Catching.attempt calls battle:caught(mon) itself on a
+    -- successful catch (Transform reload, the battle.catch_exp hook).
     local def = self.data.pokemon and self.data.pokemon[target.mon.species]
-    local caught, rate = Catching.attempt({
+    local caught, rate = N.catchAttempt({
       ball = ballId or "POKE_BALL",
       mon = target.mon,
       def = def,
       hp = target.mon.hp,
-      maxHp = target.mon.maxHp,
+      maxHp = maxHpOf(target.mon),
       catchRate = def and def.catchRate,
       status = target.mon.status,
       battle = self.battle,
       random = self.battle.random,
     })
+    local pending = {
+      ballId = ballId or "POKE_BALL",
+      target = target,
+      caught = caught and true or false,
+      rate = rate or 0,
+    }
+    -- Play the game's own throw/catch animation first when the native anim
+    -- data is there; the answer is held on self.catchPending and reported
+    -- back by Screen:resolveCatchAnim the frame the animation ends.
+    if self:startCatchAnim(pending) then
+      self.catchPending = pending
+      return
+    end
+    self:finishBallThrow(pending)
+  end
+
+  -- The outcome half of a ball throw, run once the cartoon is over (or
+  -- immediately, when Screen:startCatchAnim could not run).  Split out so the
+  -- same code serves both paths -- the native animation must not change WHAT a
+  -- catch does, only how it is shown.
+  function Screen:finishBallThrow(pending)
+    local target, caught = pending.target, pending.caught
+    local rate = pending.rate
     local name = target.mon.nickname or target.mon.name or target.mon.species
     if not caught then
       self.message = name .. " broke free! (rate " .. tostring(rate) .. "/255)"
@@ -2332,34 +3828,14 @@ return function(mod)
       self.overMessage = "Gotcha! " .. name .. " was caught!"
     else
       -- A full party sends the catch to the CURRENT BOX, the same as
-      -- `.SendToPC` / `predef SendMonIntoBox` (item_effects.asm:548-550, 604)
-      -- and the same as native's own pushCaught
-      -- (src/ui/gen2/BattleState.lua:2882-2900).
-      --
-      -- This used to say "no PC yet" and then drop the mon on the floor: the
-      -- message claimed a catch, the battle recorded `outcome = "caught"`,
-      -- and nothing was ever written anywhere.  A player who caught something
-      -- with six in the party simply lost it.
-      --
-      -- Inserted at the HEAD, not appended, because SendMonIntoBox's species
-      -- loop cascades every existing entry one slot down (move_mon.asm:954-965)
-      -- so the catch lands in slot 1.  Boxes.deposit is deliberately NOT used:
-      -- that is the PC's own party-to-box move and carries the last-healthy-mon
-      -- and mail refusals, which have nothing to do with a capture.
-      local okBox = pcall(function()
-        local Boxes = require("src.core.gen2.Boxes")
-        local save = self.game.save
-        local index = math.max(1, math.min(Boxes.NUM_BOXES,
-          math.floor(tonumber(save.currentBox) or 1)))
-        local box = Boxes.box(save, index)
-        table.insert(box, 1, target.mon)
-        -- SendMonIntoBox refills the boxed slot's PP before it closes SRAM
-        -- (move_mon.asm:1062-1063).
-        if type(Boxes.enterBox) == "function" then Boxes.enterBox(target.mon) end
-        self.overMessage = "Gotcha! " .. name .. " was caught! It was sent to "
-          .. (Boxes.name and Boxes.name(save, index) or "the PC") .. "."
-      end)
-      if not okBox then
+      -- `.SendToPC` / `predef SendMonIntoBox` (item_effects.asm:548-550, 604).
+      -- The exact storage API is generation-specific and lives in the backend
+      -- (native.lua): Gen 2 inserts at the head of gen2 Boxes; Gen 1 uses the
+      -- native src/pokemon/Boxes.lua deposit.
+      local okBox, where = N.depositCatch(self.game.save, target.mon)
+      if okBox then
+        self.overMessage = "Gotcha! " .. name .. " was caught!" .. (where or "")
+      else
         -- Said honestly rather than claiming a catch that did not happen.
         self.overMessage = "Gotcha! " .. name
           .. " was caught! ...but the PC could not be reached."
@@ -2389,7 +3865,29 @@ return function(mod)
   function Screen:openSwitchMenu()
     self.phase = "submenu"
     local save = self.game.save
-    Screens.push(self.game, "Gen2PartyMenu", {
+    if not N.isGen2 then
+      -- Gen 1's native PartyMenu with forceSwitch/pickOnly and NO battle model:
+      -- pressing A on a mon pops the menu and calls onSwitch, which is exactly
+      -- this screen's own pick-a-switch-target flow (validity is checked in
+      -- trySwitchIn below).  Passing the native battle would route the pick
+      -- through the native BattleState instead of this scene.
+      Screens.push(self.game, N.partyMenuId(), {
+        save = save,
+        party = save.party,
+        forceSwitch = true,
+        pickOnly = true,
+        onSwitch = function(mon)
+          self.suppressInputFrame = true
+          self:trySwitchIn(mon)
+        end,
+        onCancel = function()
+          self.suppressInputFrame = true
+          self.phase = "actionMenu"
+        end,
+      })
+      return
+    end
+    Screens.push(self.game, N.partyMenuId(), {
       save = save,
       party = save.party,
       prompt = "choose",
@@ -2436,16 +3934,32 @@ return function(mod)
   ------------------------------------------------------------------
   function Screen:enterMoveSelect()
     local battler = self.playerBattlers[self.actingSlotIdx]
-    local usable = self.combat.usableMoves(battler, self.data)
-    if #usable == 0 then
+    local all = self.combat.allMoves(battler, self.data)
+    -- Only a genuinely PP-less slot is skipped: native never opens the list
+    -- when nothing has PP left. A slot whose only PP-legal moves are
+    -- ENGINE-blocked (Choice lock, item move-type ban, unmet condition) still
+    -- opens the list, so the player can be told why.
+    local anyPp = false
+    for _, entry in ipairs(all) do
+      if (entry.slot.pp or 0) > 0 then anyPp = true break end
+    end
+    if not anyPp then
       -- Out of PP everywhere -- an explicit Phase 2 gap (no real
-      -- Struggle yet): this slot simply can't act this turn.
+      -- Struggle yet): this slot simply can't act this turn. Native
+      -- also never opens the list in this case (it goes straight to
+      -- Struggle), so no 0-PP-only menu is ever shown.
       self:advanceSlotOrResolve()
       return
     end
-    self.usableMovesCache = usable
+    self.moveListCache = all
+    -- Open the cursor on the first move the engine allows, so a Choice-locked
+    -- mon lands on its locked move instead of a refused row.
     self.moveCursor = 1
+    for i, entry in ipairs(all) do
+      if entry.usable then self.moveCursor = i break end
+    end
     self.moveSwapIndex = nil
+    self.message = nil
     self.phase = "moveSelect"
   end
 
@@ -2467,7 +3981,7 @@ return function(mod)
   end
 
   -- Does this picked move hit every enemy at once (needs no target
-  -- picker)? Authoritative answer: g9-battle-engine-beta's isSpreadMove
+  -- picker)? Authoritative answer: g9-battle-engine's isSpreadMove
   -- (national_dex target archetype) -- trusted when the engine has it.
   -- An OLD engine mod predating that export falls back to the move
   -- def's own `target` field when one is present, then to the
@@ -2490,7 +4004,7 @@ return function(mod)
 
   -- ROUND 26 (2026-09-10): can this picked move legally be aimed at one
   -- of the caster's OWN living teammates? Authoritative answer:
-  -- g9-battle-engine-beta's isAllyTargetable (national_dex's own target
+  -- g9-battle-engine's isAllyTargetable (national_dex's own target
   -- archetype plus the selected-pokemon/heal records like Heal Pulse).
   -- Trusted when the engine has it; an OLD engine predating that export
   -- falls back to the move def's own target/healing fields, so the
@@ -2517,7 +4031,18 @@ return function(mod)
   end
 
   function Screen:updateMoveSelect(input)
-    local count = #self.usableMovesCache
+    -- A refusal (a 0-PP move was chosen) is showing in F: any press
+    -- acknowledges it and drops straight back to the list, which is
+    -- still exactly where it was (moveListCache/moveCursor untouched).
+    -- Same "message + a press clears it" shape the action menu uses.
+    if self.message then
+      if input:wasPressed("a") or input:wasPressed("b")
+          or input:wasPressed("up") or input:wasPressed("down") then
+        self.message = nil
+      end
+      return
+    end
+    local count = #self.moveListCache
     if input:wasPressed("up") then
       self.moveCursor = self.moveCursor > 1 and self.moveCursor - 1 or count
     elseif input:wasPressed("down") then
@@ -2532,7 +4057,7 @@ return function(mod)
       -- refuses this while Transformed (borrowed moves, nothing of the
       -- mon's own to reorder) -- not modeled here since this mod's own
       -- Phase 2 scope has no Transform.
-      local cursorEntry = self.usableMovesCache[self.moveCursor]
+      local cursorEntry = self.moveListCache[self.moveCursor]
       if cursorEntry then
         if self.moveSwapIndex then
           if self.moveSwapIndex ~= cursorEntry.index then
@@ -2540,7 +4065,7 @@ return function(mod)
             local moves = battler.mon.moves
             moves[self.moveSwapIndex], moves[cursorEntry.index] =
               moves[cursorEntry.index], moves[self.moveSwapIndex]
-            self.usableMovesCache = self.combat.usableMoves(battler, self.data)
+            self.moveListCache = self.combat.allMoves(battler, self.data)
           end
           self.moveSwapIndex = nil
         else
@@ -2557,7 +4082,18 @@ return function(mod)
       -- Choosing a move cancels a pending swap rather than performing it
       -- (vanilla's own `xor a / ld [wSwappingMove], a` on the A arm).
       self.moveSwapIndex = nil
-      local picked = self.usableMovesCache[self.moveCursor]
+      local picked = self.moveListCache[self.moveCursor]
+      if picked and not picked.usable then
+        -- The move stays on the list exactly as native keeps it, but an
+        -- unusable pick is refused instead of resolving: the ENGINE's own
+        -- reason (Choice lock / item move-type ban / unmet move condition)
+        -- when it gave one, else native's own "No PP left for this move!"
+        -- arm. Show the message and stay in the list. The engine's
+        -- executeAction refuses it too, but refusing at the menu is what
+        -- the native screens do, and it keeps the player told.
+        self.message = picked.invalidReason or MOVE_NO_PP_TEXT
+        return
+      end
       local aliveEnemies = {}
       for _, e in ipairs(self.enemyBattlers) do
         if self.combat.isAlive(e) then aliveEnemies[#aliveEnemies + 1] = e end
@@ -2585,7 +4121,7 @@ return function(mod)
         -- A move that targets every adjacent enemy by itself (LEER, Muddy
         -- Water, Earthquake, ...) has nothing to choose -- the picker is
         -- skipped entirely and the first alive enemy is queued as a
-        -- placeholder target; g9-battle-engine-beta's resolveTurnActions
+        -- placeholder target; g9-battle-engine's resolveTurnActions
         -- re-resolves the full roster (resolveMoveTargets) at resolution
         -- time, so the placeholder never limits who actually gets hit.
         if self:isSpreadMove(picked) then
@@ -2609,12 +4145,20 @@ return function(mod)
   end
 
   function Screen:drawMoveSelect()
+    -- A refusal (0-PP pick) takes over F until acknowledged, the way the
+    -- native screen's message box replaces the move list.
+    if self.message then
+      drawWrapped(self.message, self.fTextX, self.fTextY, self.fChars)
+      return
+    end
     -- No "<name>'s move:" header -- the move list starts right at
     -- fTextY instead of fTextY+9, using the row that line used to sit
-    -- on rather than leaving it blank.
-    for i, entry in ipairs(self.usableMovesCache) do
+    -- on rather than leaving it blank. Every known move is listed,
+    -- including 0-PP ones (the PP column is what says so).
+    for i, entry in ipairs(self.moveListCache) do
       local label = string.format("%-10s PP %d/%d",
-        entry.def.name or entry.def.id, entry.slot.pp, entry.slot.maxPp or entry.slot.pp)
+        entry.def.name or entry.def.id, entry.slot.pp,
+        self.combat.maxPpOf(entry.slot, entry.def))
       Font.draw(label, self.fTextX + 12, self.fTextY + (i - 1) * 9)
       if self.moveSwapIndex == entry.index then
         Font.drawCode(SWAP_MARKER_CODE, self.fTextX + 6, self.fTextY + (i - 1) * 9)
@@ -2628,15 +4172,24 @@ return function(mod)
   -- or more living enemies, or an ally-targetable move (Heal Pulse and
   -- friends) whose own living teammates join the list beside the foes
   -- (round 26). B cancels back to the move list; A queues the pick.
+  --
+  -- ROUND EIGHTY-TWO (user request): the picker is read off the FIELD, not
+  -- off a list. F carries only its "Choose a target:" prompt and the cursor
+  -- is an arrow drawn over whichever mon is selected (Screen:drawTargetMark)
+  -- -- so each candidate is identified by its own sprite's position, exactly
+  -- as the user asked ("the text box should only say 'Choose a target:' and
+  -- we move the enemy selection arrow to cycle through sprite pos"). Both
+  -- axes cycle the cursor, since the candidates are laid out horizontally: a
+  -- side-by-side row of mons reads naturally with left/right.
   ------------------------------------------------------------------
   function Screen:updateTargetSelect(input)
     local count = #self.targetCandidates
-    if input:wasPressed("up") then
+    if input:wasPressed("up") or input:wasPressed("left") then
       self.targetCursor = self.targetCursor > 1 and self.targetCursor - 1 or count
-    elseif input:wasPressed("down") then
+    elseif input:wasPressed("down") or input:wasPressed("right") then
       self.targetCursor = self.targetCursor < count and self.targetCursor + 1 or 1
     elseif input:wasPressed("b") then
-      -- Back to move selection -- usableMovesCache/moveCursor are still
+      -- Back to move selection -- moveListCache/moveCursor are still
       -- exactly as they were, so the player lands right back where they
       -- left off rather than restarting the move list from the top.
       self.pendingPick = nil
@@ -2649,14 +4202,159 @@ return function(mod)
     end
   end
 
+  -- F's whole contribution to the picker: the prompt, and nothing else. The
+  -- per-candidate name/HP list that used to sit under it is gone (round
+  -- eighty-two) -- the stat readouts over the mons already carry that, and
+  -- the selection is shown on the field by drawTargetMark.
   function Screen:drawTargetSelect()
     Font.draw("Choose a target:", self.fTextX, self.fTextY)
-    for i, battler in ipairs(self.targetCandidates) do
-      local mon = battler.mon
-      local label = string.format("%-10s HP %d/%d", displayName(mon), mon.hp or 0, mon.maxHp or 0)
-      Font.draw(label, self.fTextX + 12, self.fTextY + 9 + (i - 1) * 9)
+  end
+
+  -- The picker's cursor, drawn on the FIELD: a small down-pointing triangle
+  -- sitting just above the stat readout of whichever candidate
+  -- `targetCursor` is on, so the arrow cycles across the enemy (or ally)
+  -- sprites' own positions. The x is that battler's own readout centre --
+  -- which, now that the sprite grid's pitch IS the readout's pitch, is also
+  -- the mon's own centre. A one-pixel bob keeps the eye on it.
+  --
+  -- Drawn as GEOMETRY (five one-pixel rectangles), not a font glyph: the
+  -- engine's cursor glyph is a RIGHT-pointing arrow, and rotating it would
+  -- depend on the running generation's font page, whereas a few rectangles
+  -- are the same arrow on both. self.hudMark (filled by drawContent's HUD
+  -- pass this frame) supplies the anchor; the 8px lift clears the readout's
+  -- own top edge, and the clamp keeps it on-canvas for a very tall mon whose
+  -- readout has been pushed up off the top of the field.
+  --
+  -- The same arrow shape serves the SWITCH cue below: `outline` draws only
+  -- each row's two edge pixels (and the tip) so the OWNER of a swap can be
+  -- marked with a hollow frame of exactly the selection arrow's size.
+  local function drawArrowGlyph(cx, top, outline)
+    love.graphics.setColor(0, 0, 0, 1)
+    for row = 0, 4 do
+      local half = 4 - row
+      if outline and half > 0 then
+        love.graphics.rectangle("fill", cx - half, top + row, 1, 1)
+        love.graphics.rectangle("fill", cx + half, top + row, 1, 1)
+      else
+        love.graphics.rectangle("fill", cx - half, top + row, half * 2 + 1, 1)
+      end
     end
-    Font.drawCode(CURSOR_CODE, self.fTextX, self.fTextY + 9 + (self.targetCursor - 1) * 9)
+  end
+
+  function Screen:drawTargetMark()
+    if self.phase ~= "targetSelect" then return end
+    local target = self.targetCandidates and self.targetCandidates[self.targetCursor]
+    local mark = target and self.hudMark and self.hudMark[target]
+    if not mark then return end
+    local bob = math.floor(love.timer.getTime() * 4) % 2
+    local cx = math.floor(mark.x + 0.5)
+    local top = math.max(0, math.floor(mark.top) - 8 - bob)
+    drawArrowGlyph(cx, top, false)
+  end
+
+  ------------------------------------------------------------------
+  -- SWITCH -- a POSITIONAL swap between ADJACENT allies, not the PKMN
+  -- recall-and-replace switch that button owns. It exists only where the
+  -- preset actually put two or more living allies on the field and the
+  -- battle is not a bossFight (self.swapEnabled, decided once in
+  -- Screen.new from the shipped roster), so the button can never appear
+  -- where a swap has no meaning. The OWNER is the battler whose turn this
+  -- is; its adjacent living allies are the candidates. Choosing one
+  -- queues it as this slot's action (kind="swap"); the field is
+  -- re-shuffled at resolution, before the PKMN switch queue, so the new
+  -- positions hold for the rest of the turn. The enemy side gets the same
+  -- swap through the exported mod.exports.swapPositions.
+  ------------------------------------------------------------------
+  function Screen:enterSwapSelect()
+    local owner = self.playerBattlers[self.actingSlotIdx]
+    local candidates = {}
+    for _, slot in ipairs({ self.actingSlotIdx - 1, self.actingSlotIdx + 1 }) do
+      local ally = self.playerBattlers[slot]
+      if ally and self.combat.isAlive(ally) then candidates[#candidates + 1] = slot end
+    end
+    if #candidates == 0 then
+      self.message = (owner and displayName(owner.mon) or "That Pokemon")
+        .. " has no adjacent ally to switch with."
+      self.phase = "actionMenu"
+      return
+    end
+    self.swapCandidates = candidates
+    self.swapCursor = 1
+    self.message = nil
+    self.phase = "swapSelect"
+  end
+
+  function Screen:updateSwapSelect(input)
+    local count = #self.swapCandidates
+    if input:wasPressed("up") or input:wasPressed("left") then
+      self.swapCursor = self.swapCursor > 1 and self.swapCursor - 1 or count
+    elseif input:wasPressed("down") or input:wasPressed("right") then
+      self.swapCursor = self.swapCursor < count and self.swapCursor + 1 or 1
+    elseif input:wasPressed("b") then
+      -- Back to this slot's own action menu -- nothing has been queued,
+      -- so there is nothing to undo.
+      self.swapCandidates = nil
+      self:enterActionMenu()
+    elseif input:wasPressed("a") then
+      self:queueSwapAction(self.actingSlotIdx, self.swapCandidates[self.swapCursor])
+      self.swapCandidates = nil
+      self:advanceSlotOrResolve()
+    end
+  end
+
+  -- F carries only the prompt, exactly as the target picker does -- the
+  -- field arrows (drawSwapMark) say the rest.
+  function Screen:drawSwapSelect()
+    Font.draw("Switch with whom?", self.fTextX, self.fTextY)
+  end
+
+  function Screen:queueSwapAction(slotA, slotB)
+    local owner = self.playerBattlers[slotA]
+    self.queuedActions[#self.queuedActions + 1] = {
+      kind = "swap",
+      actorSlot = slotA,
+      targetSlot = slotB,
+      actor = owner,
+      def = { priority = 99, name = "Switch" },
+    }
+    -- Kept so the field keeps showing WHO owns the swap after the target
+    -- is picked (drawSwapMark) -- dropped again as the swap resolves.
+    if owner then self.swapOwnerMarks[#self.swapOwnerMarks + 1] = owner end
+  end
+
+  function Screen:clearSwapOwnerMark(battler)
+    if not battler then return end
+    for i, b in ipairs(self.swapOwnerMarks) do
+      if b == battler then table.remove(self.swapOwnerMarks, i) break end
+    end
+  end
+
+  -- The field cue: a FILLED arrow over the candidate under the cursor (the
+  -- swap's TARGET) and a HOLLOW frame arrow of the same size over the
+  -- battler that OWNS the swap -- the acting slot while the choice is
+  -- being made, and any owner whose swap is queued but not yet resolved
+  -- (self.swapOwnerMarks) -- so the cue stays on the mon that called it
+  -- ("leave on owner's sprite a black frame arrow ... for visual cue of
+  -- who is owning the swap").
+  function Screen:drawSwapMark()
+    if not self.hudMark then return end
+    local bob = math.floor(love.timer.getTime() * 4) % 2
+    local function markFor(battler, outline)
+      local m = battler and self.hudMark[battler]
+      if not m then return end
+      local cx = math.floor(m.x + 0.5)
+      local top = math.max(0, math.floor(m.top) - 8 - bob)
+      drawArrowGlyph(cx, top, outline)
+    end
+    if self.phase == "swapSelect" then
+      markFor(self.playerBattlers[self.actingSlotIdx], true)
+      local target = self.swapCandidates
+        and self.playerBattlers[self.swapCandidates[self.swapCursor]]
+      markFor(target, false)
+    end
+    for _, battler in ipairs(self.swapOwnerMarks or {}) do
+      markFor(battler, true)
+    end
   end
 
   ------------------------------------------------------------------
@@ -2674,6 +4372,75 @@ return function(mod)
   -- animation script's own baked x/y coordinates assume they're near.
   local VANILLA_PLAYER_ANCHOR = { x = 40, y = 96 }
   local VANILLA_ENEMY_ANCHOR = { x = 124, y = 56 }
+
+  -- ROUND 62 (2026-09-10): where a SPREAD move's animation should land.
+  -- A spread move hits a whole SIDE at once, so anchoring its animation on
+  -- whichever single mon combat.lua's turn_order happened to loop to (it
+  -- emits one useMove/move event per expanded target -- see that file's own
+  -- resolveTurnActions) is wrong: the animation would visibly snap to one
+  -- victim instead of washing over the side. The user's rule: a spread move
+  -- is cast on the MIDDLE of the OPPOSING side's sprite area -- an enemy's
+  -- spread move centres over the PLAYER's side, a player's over the ENEMY's.
+  -- The middle is the mean of each drawn sprite's centre-x and its vertical
+  -- centre (top + drawn height/2) -- a real centre-of-mass of what is on
+  -- screen, not a fixed grid slot, so an under-strength or horde side still
+  -- centres on the mons actually there. Returns nil (caller falls back to
+  -- the single-target anchor) when no sprite on that side is drawn yet.
+  -- `top`/`h` are stamped into self.spriteAnchor by drawContent's sprite pass.
+  local function sideSpriteCentre(screen, side)
+    local list = (side == "player") and screen.playerBattlers or screen.enemyBattlers
+    local sx, sy, n = 0, 0, 0
+    for _, b in ipairs(list or {}) do
+      local a = screen.spriteAnchor[b]
+      if a and a.h then
+        sx = sx + a.x
+        sy = sy + a.top + a.h / 2
+        n = n + 1
+      end
+    end
+    if n == 0 then return nil end
+    return { x = sx / n, y = sy / n }
+  end
+
+  -- Is this move a spread move, asked by BARE STRING ID (not a picked slot)?
+  -- startMoveAnim only has the resolved { id = ... } def, so it can't call
+  -- Screen:isSpreadMove (which reads a picked slot). Same authority order as
+  -- that method: the engine's exported isSpreadMove first, then the
+  -- module-local SPREAD_MOVE_IDS last-resort list.
+  local function isSpreadMoveId(screen, id)
+    if not id then return false end
+    local eng = screen.g9dex and screen.g9dex.exports and screen.g9dex.exports.isSpreadMove
+    if eng then
+      local ok, res = pcall(eng, id)
+      if ok then return res == true end
+    end
+    return SPREAD_MOVE_IDS[id] == true
+  end
+
+  -- Does the running animation's own native BG layer have this side's mon
+  -- hidden right now?  BATTLE_BG_EFFECT_HIDE_MON is how the cart's
+  -- ANIM_THROW_POKE_BALL sucks the target into the ball once it lands (and
+  -- SHOW_MON how it puts the mon back on a breakout), and the cart's battle
+  -- screen reads it straight off the same bg table (BattleState:picBoxCleared
+  -- -> animPicState, src/ui/gen2/BattleState.lua:1720-1722).  THIS screen
+  -- draws its own sprites rather than going through BattleAnimView's battler
+  -- pics, so it has to honour that flag itself.  Scoped to the BALL throw --
+  -- the one animation this file starts expecting it -- so no existing move
+  -- animation's look changes.
+  local function animHidesMon(screen, side)
+    local anim = screen.moveAnim
+    if not anim then return false end
+    -- Gen 1's arm hides the ENEMY mon itself (the ball's target), driven by
+    -- the animation's own HIDEPIC_ANIM/SHOWPIC_ANIM rows -- the native
+    -- equivalent of BattleState.enemyHidden (src/battle/BattleState.lua:
+    -- 1487-1492).  Only an enemy is ever caught, so that is the only side.
+    if anim.gen1 then
+      return anim.hiddenEnemy == true and side == "enemy"
+    end
+    if not anim.isBall then return false end
+    local bg = anim.runner and anim.runner.bg
+    return (bg and bg.hidden and bg.hidden[side]) == true
+  end
 
   -- Starts def's real move-animation -- Gen 2's own AnimRunner/
   -- AnimObjects engine (this file's own header explains why this mod
@@ -2704,8 +4471,18 @@ return function(mod)
   -- No sound/cry hooks wired -- this mod's own audio call shape was not
   -- confirmed, so this stays visual-only rather than a guessed call into
   -- an unverified API; every hook is a safe, silent no-op.
+  --
+  -- Spread moves (ROUND 62): a move that hits a whole side ignores this
+  -- per-target anchor and instead aims at the OPPOSING side's sprite-area
+  -- centre, so one invocation washes over the side instead of snapping to
+  -- a single victim -- see sideSpriteCentre above.
   function Screen:startMoveAnim(def, actor, target)
-    local animsData = self.data.gen2BattleAnims
+    -- Gen 2 drives AnimRunner/BattleAnimView; when those are absent this is
+    -- a Gen 1 boot, whose own AnimPlayer arm plays the move instead.
+    if not (AnimRunner and BattleAnimView) then
+      return self:startMoveAnimGen1(def, actor, target)
+    end
+    local animsData = N.animData(self.data)
     if not (animsData and def and def.id) then return end
     -- KEYED BY THE MOVE'S OWN STRING ID ("WATER_GUN"), NOT its numeric
     -- ROM index -- confirmed directly against the real extracted data
@@ -2724,17 +4501,24 @@ return function(mod)
     -- target's own anchor isn't known yet or vanilla's own axis gap is
     -- zero (would divide by zero) -- a plain, safe default, not a crash.
     local scaleX, scaleY = 1, 1
-    local targetAnchor = self.spriteAnchor[target]
+    -- A SPREAD move lands on the whole OPPOSING side, not one victim: aim
+    -- it at that side's sprite-area centre (ROUND 62 rule above), falling
+    -- back to the single target's own anchor if the side isn't drawn yet.
+    local targetAnchor
+    if isSpreadMoveId(self, def.id) then
+      targetAnchor = sideSpriteCentre(self, (actor.side == "player") and "enemy" or "player")
+    end
+    targetAnchor = targetAnchor or self.spriteAnchor[target]
     if targetAnchor then
       local vdx = vanillaTargetAnchor.x - vanillaActorAnchor.x
       local vdy = vanillaTargetAnchor.y - vanillaActorAnchor.y
       if vdx ~= 0 then scaleX = (targetAnchor.x - anchor.x) / vdx end
       if vdy ~= 0 then scaleY = (targetAnchor.y - anchor.y) / vdy end
     end
-    self.animView = self.animView or BattleAnimView.new(animsData, self.data.gen2Palettes)
+    self.animView = self.animView or BattleAnimView.new(animsData, N.paletteData(self.data))
     local runner = AnimRunner.new({
       data = animsData,
-      constants = self.data.gen2Constants,
+      constants = N.constantsData(self.data),
       battleTurn = (actor.side == "player") and 0 or 1,
       animId = def.id,
       param = 0,
@@ -2783,6 +4567,145 @@ return function(mod)
       scaleY = scaleY,
       battle = battleForPalette,
     }
+  end
+
+  ------------------------------------------------------------------
+  -- THE THROWN BALL'S OWN ANIMATION -- the cart's ANIM_THROW_POKE_BALL.
+  --
+  -- Round eighty-nine, explicit user request: the ball a catch is thrown
+  -- with must be the game's own throw -- native asset, in the ball's own
+  -- native colour, flown to the POKEMON'S OWN sprite position -- with the
+  -- game's own catch animation (the ball landing, sucking the mon in, then
+  -- the wobbles) playing before the catch is resolved.
+  --
+  -- This is not a second animation engine: it is the SAME native
+  -- AnimRunner/BattleAnimView contract Screen:startMoveAnim already drives,
+  -- with the shared ANIM_* id instead of a move's script key.  Everything
+  -- the cart's own screen hands that runner is handed here too:
+  --   * ballPalette -- N.ballPalette(ballId), the PAL_BATTLE_OB_* name the
+  --     ball's object function stamps onto every ball frame (the "native
+  --     colour");
+  --   * param       -- N.ballAnimParam, wBattleAnimParam, which the script's
+  --     anim_if_param_equal rows branch on;
+  --   * hBattleTurn -- 0 regardless of turn order, because the ball is always
+  --     thrown from the player's side (src/ui/gen2/BattleState.lua:3286-3294);
+  --   * pokeballWobble -- the REAL GetPokeBallWobble re-roll (N.ballWobble)
+  --     over the catch answer this screen already computed, so the number of
+  --     wobbles is the cart's own and not a fixed one.
+  --
+  -- POSITION.  The native script's ball flies vanilla's fixed single-battle
+  -- arc, but a doubles landing spot is a per-slot platform, so the object
+  -- positions are remapped exactly as Screen:startMoveAnim remaps a move's:
+  -- the thrower's real on-screen anchor pins the start and the real
+  -- thrower->target gap scales the rest, so the ball leaves the acting mon's
+  -- own sprite and lands ON the target's own sprite (its self.spriteAnchor
+  -- bottom-centre, the same point the sprite pass bottom-anchors the mon to).
+  -- The catch itself then ends through Screen:resolveCatchAnim.
+  --
+  -- Returns false when the animation cannot run at all (a stock Gen 1 boot,
+  -- or a cache without the anim/its sheet), so Screen:throwBall falls back to
+  -- its old instant resolution rather than stalling.
+  function Screen:startCatchAnim(pending)
+    -- Gen 2's AnimRunner/BattleAnimView contract; a Gen 1 boot has no Gen 2
+    -- anim data, so its own native ball chain takes over instead.
+    if not (AnimRunner and BattleAnimView) then
+      return self:startCatchAnimGen1(pending)
+    end
+    local animsData = N.animData(self.data)
+    local key = animsData and animsData.ids
+      and animsData.ids.ANIM_THROW_POKE_BALL
+    if not key then return false end
+    local target = pending.target
+    local targetAnchor = self.spriteAnchor[target]
+    if not targetAnchor then return false end
+    -- The thrower is the mon whose action menu the BAG was opened from -- the
+    -- very slot this ball's turn is spent on.  Fall back to the first living
+    -- battler when the throw came from outside a turn (the askBattleChoice
+    -- primitive), which is the acting mon in every ordinary single-battle
+    -- fight anyway.
+    local thrower = self.playerBattlers[self.actingSlotIdx or 1]
+      or self.playerBattlers[1]
+    local throwerAnchor = thrower and self.spriteAnchor[thrower]
+    local actorAnchor = throwerAnchor or VANILLA_PLAYER_ANCHOR
+    local vanillaActorAnchor = VANILLA_PLAYER_ANCHOR
+    local vanillaTargetAnchor = VANILLA_ENEMY_ANCHOR
+    -- Scale per axis: real gap / vanilla's own assumed gap, so the vanilla
+    -- arc's own shape covers the real distance (a flat translate could never
+    -- change how FAR anything moved).  A zero vanilla axis gap would divide by
+    -- zero, so it keeps vanilla's own 1.
+    local scaleX, scaleY = 1, 1
+    local vdx = vanillaTargetAnchor.x - vanillaActorAnchor.x
+    local vdy = vanillaTargetAnchor.y - vanillaActorAnchor.y
+    if vdx ~= 0 then scaleX = (targetAnchor.x - actorAnchor.x) / vdx end
+    if vdy ~= 0 then scaleY = (targetAnchor.y - actorAnchor.y) / vdy end
+    self.animView = self.animView or
+      BattleAnimView.new(animsData, N.paletteData(self.data))
+    local wobble = N.ballWobble(pending.caught, pending.rate,
+      self.battle and self.battle.random)
+    local runner = AnimRunner.new({
+      data = animsData,
+      constants = N.constantsData(self.data),
+      battleTurn = 0,
+      animId = "ANIM_THROW_POKE_BALL",
+      param = N.ballAnimParam(self.data, pending.ballId),
+      sfxOrder = self.data.audio and self.data.audio.sfxOrder,
+      ballPalette = N.ballPalette(pending.ballId),
+      hooks = {
+        -- The throw's own SFX_THROW_BALL / SFX_BALL_POOF, through the one
+        -- ungated stereo path (native's own startAnim sound hook).
+        sound = function(name)
+          if N.playAnimSfx then N.playAnimSfx(self.data, name) end
+        end,
+        -- No cry in this animation, and no pitch shift in this port anyway.
+        cry = function() end,
+        -- GetPokeBallWobble's answer, which the ball's own script branches on.
+        pokeballWobble = wobble,
+      },
+    })
+    runner:start(key)
+    -- The same instance-only OAM tag Screen:startMoveAnim applies, for the
+    -- same reason: Screen:drawMoveAnimObjects groups entries by the struct
+    -- that emitted them, and the pool keeps no such reference of its own.
+    local pool = runner.objects
+    local poolUpdateOam = pool.updateOam
+    pool.updateOam = function(self, st)
+      local before = #self.oam
+      local result = poolUpdateOam(self, st)
+      for i = before + 1, #self.oam do
+        self.oam[i].moveAnimStruct = st
+      end
+      return result
+    end
+    self.moveAnim = {
+      -- Marks this runner as a BALL throw, which is what lets the sprite pass
+      -- honour the animation's own hide/show-mon BG effects (see
+      -- animHidesMon) without changing how any move animation draws.
+      isBall = true,
+      runner = runner,
+      anchorX = actorAnchor.x,
+      anchorY = actorAnchor.y,
+      vanillaAnchorX = vanillaActorAnchor.x,
+      vanillaAnchorY = vanillaActorAnchor.y,
+      scaleX = scaleX,
+      scaleY = scaleY,
+      -- Only read by BattleAnimView:objPalette for the two battler palettes;
+      -- the ball's own palette is the fixed battleObjects block, so this is
+      -- just the pair of mons in this throw.
+      battle = { player = thrower and thrower.mon, enemy = target and target.mon },
+      -- Run once the animation genuinely ends (see Screen:update), so the
+      -- catch is reported at the same beat the cart reports it.
+      onFinish = function() self:resolveCatchAnim() end,
+    }
+    return true
+  end
+
+  -- The frame the throw/catch animation ends: hand the held answer to the
+  -- normal resolution.  Kept separate from finishBallThrow so the anim's own
+  -- onFinish reads as exactly one step.
+  function Screen:resolveCatchAnim()
+    local pending = self.catchPending
+    self.catchPending = nil
+    if pending then self:finishBallThrow(pending) end
   end
 
   -- Which loaded sheet a tile id falls in -- BattleAnimView.lua's own
@@ -2835,6 +4758,9 @@ return function(mod)
   function Screen:drawMoveAnimObjects()
     local view = self.animView
     local anim = self.moveAnim
+    -- Gen 1's own arm draws its own compiled OAM steps (see
+    -- Screen:drawGen1AnimSprites below).
+    if anim.gen1 then return self:drawGen1AnimSprites(anim) end
     local runner, battle = anim.runner, anim.battle
     local G = love.graphics
     G.setColor(1, 1, 1, 1)
@@ -2892,15 +4818,319 @@ return function(mod)
     end
   end
 
+  ------------------------------------------------------------------
+  -- GEN 1'S OWN ANIMATION ARM -- src/battle/AnimPlayer.lua.
+  --
+  -- A stock Red/Blue/Yellow boot has no Gen 2 anim tables, so the
+  -- AnimRunner/BattleAnimView arm above cannot run there.  But Gen 1 is
+  -- NOT animationless: the cart's own BattleState drives
+  -- src/battle/AnimPlayer.lua (src/battle/BattleState.lua:1399-1405),
+  -- which compiles a move's `data.battle_anims` moveAnims rows into timed
+  -- OAM steps and ticks them with :update()/:isDone().  This block drives
+  -- that same native engine, with the same inputs the cart hands it:
+  --   * :start(moveId, attackerIsPlayer, opts), opts { shakes, ball,
+  --     ballFlicker } on the ball rows (DoBallShake / DoBallToss);
+  --   * :pollEffects() routed into the same sound + enemy-pic-hide hooks
+  --     BattleState:applyAnimEffect implements;
+  --   * a move's own sound bytes through BattleState:playAnimSound's rule
+  --     (N.playMoveAnimSound), and a ball toss's SFX_BALL_POOF/Tink.
+  --
+  -- POSITION.  AnimPlayer's OAM sprites are in vanilla 160x144 space, so
+  -- they get the SAME kind of remap Screen:drawMoveAnimObjects gives the
+  -- Gen 2 objects: the actor's real on-screen anchor and the real
+  -- actor->target gap drive a per-axis scale, so the animation starts at
+  -- the actor and actually reaches the target (a flat translate could
+  -- never change how far the ball flies).  AnimPlayer's steps are flat
+  -- sprite lists with no per-object identity, so sprites are grouped into
+  -- connected components by OAM adjacency before remapping -- that keeps
+  -- a multi-tile composite (a 16x16 ball is four tiles) rigid instead of
+  -- prying its tiles apart under a non-unit scale, the same guarantee the
+  -- Gen 2 arm gets from its own per-struct OAM tagging.
+  --
+  -- The ball chain is native's own (BattleState:ballChain, :5478-5496):
+  -- toss -> POOF -> (HIDEPIC -> SHAKE) when it landed, and on a breakout
+  -- POOF -> SHOWPIC puts the mon back; a capture ends with the closed ball
+  -- held in OAM through the caught text (AnimPlayer:finalSprites, native's
+  -- lockedBall).  Each row is a separate :start, walked as a FIFO queue.
+  local function gen1AnimRemap(anchor, landAnchor, vanillaActor, vanillaLand)
+    local scaleX, scaleY = 1, 1
+    if anchor and landAnchor and vanillaActor and vanillaLand then
+      local vdx = vanillaLand.x - vanillaActor.x
+      local vdy = vanillaLand.y - vanillaActor.y
+      if vdx ~= 0 then scaleX = (landAnchor.x - anchor.x) / vdx end
+      if vdy ~= 0 then scaleY = (landAnchor.y - anchor.y) / vdy end
+    end
+    return scaleX, scaleY
+  end
+
+  -- Connected components of a step's on-screen sprites, joined when their
+  -- OAM positions are 8px-grid adjacent.  Off-screen (hardware-clipped)
+  -- sprites are dropped first, exactly as AnimPlayer:drawSprites hides them.
+  local function gen1AnimGroups(sprites)
+    local live = {}
+    for i = 1, #sprites do
+      local s = sprites[i]
+      if s.x > 0 and s.x < 168 and s.y > 0 and s.y < 160 then
+        live[#live + 1] = s
+      end
+    end
+    local n = #live
+    local parent = {}
+    for i = 1, n do parent[i] = i end
+    local function find(i)
+      while parent[i] ~= i do
+        parent[i] = parent[parent[i]]
+        i = parent[i]
+      end
+      return i
+    end
+    for i = 1, n do
+      for j = i + 1, n do
+        local a, b = live[i], live[j]
+        if math.abs(a.x - b.x) <= 8 and math.abs(a.y - b.y) <= 8 then
+          parent[find(j)] = find(i)
+        end
+      end
+    end
+    local groups, byRoot = {}, {}
+    for i = 1, n do
+      local root = find(i)
+      local group = byRoot[root]
+      if not group then
+        group = {}
+        byRoot[root] = group
+        groups[#groups + 1] = group
+      end
+      group[#group + 1] = live[i]
+    end
+    return groups
+  end
+
+  -- Start one queued native animation row.  Mirrors BattleState's own row
+  -- handling (:1483-1512): POOF_ANIM plays SFX_BALL_POOF, HIDEPIC/SHOWPIC
+  -- flip enemyHidden, and a toss row carries the ball item (which is what
+  -- makes a Master/Ultra toss flicker).
+  function Screen:startGen1AnimStep(anim, step)
+    if not step then return end
+    if step.name == "POOF_ANIM" then
+      if N.playAnimSfx then N.playAnimSfx(self.data, "Ball_Poof") end
+    elseif step.name == "HIDEPIC_ANIM" then
+      anim.hiddenEnemy = true
+    elseif step.name == "SHOWPIC_ANIM" then
+      anim.hiddenEnemy = false
+    end
+    anim.animName = step.name
+    anim.playing = true
+    local opts
+    if step.shakes or step.ball then
+      opts = {
+        shakes = step.shakes,
+        ball = step.ball,
+        ballFlicker = step.ball and N.ballFlicker(step.ball) or nil,
+      }
+    end
+    -- pcall'd for the same reason every other art/data lookup here is: a
+    -- missing or malformed animation is a battle that plays no animation,
+    -- never a battle that crashes.
+    local ok, err = pcall(anim.player.start, anim.player, step.name,
+      step.isPlayer, opts)
+    if not ok then
+      anim.playing = false
+      anim.queue = {}
+      mod.log:warn("g9_Battle_Scene: gen1 animation %s failed: %s",
+        tostring(step.name), tostring(err))
+      return
+    end
+    -- Frame-0 rows (the first sound/effect) fire before the first tick,
+    -- exactly as BattleState drains them right after :start.
+    self:applyGen1AnimEvents(anim, anim.player:pollEffects())
+  end
+
+  function Screen:applyGen1AnimEvent(anim, ev)
+    if ev.sound then
+      if N.playMoveAnimSound then
+        N.playMoveAnimSound(self.data, ev.sound,
+          { animName = anim.animName, crySpecies = anim.crySpecies })
+      end
+      return
+    end
+    local e = ev.effect
+    if e == "SFX_TINK" then
+      -- each ball shake opens with a tink (DoBallShakeSpecialEffects)
+      if N.playAnimSfx then N.playAnimSfx(self.data, "Tink") end
+    elseif anim.isBall and e == "SE_HIDE_ENEMY_MON_PIC" then
+      anim.hiddenEnemy = true
+    elseif anim.isBall and e == "SE_SHOW_ENEMY_MON_PIC" then
+      anim.hiddenEnemy = false
+    end
+  end
+
+  function Screen:applyGen1AnimEvents(anim, events)
+    for _, ev in ipairs(events or {}) do
+      self:applyGen1AnimEvent(anim, ev)
+    end
+  end
+
+  -- Advance the Gen 1 arm one frame; true once the WHOLE chain is spent.
+  function Screen:stepGen1Anim(anim)
+    local player = anim.player
+    if not anim.playing then return true end
+    player:update()
+    self:applyGen1AnimEvents(anim, player:pollEffects())
+    -- Consume finished rows eagerly: the chain is a FIFO, and a row that is
+    -- already over (a missing or empty animation) must not stall it.
+    while player:isDone() and #anim.queue > 0 do
+      table.remove(anim.queue, 1)
+      self:startGen1AnimStep(anim, anim.queue[1])
+      if not anim.playing then break end
+    end
+    return #anim.queue == 0 and player:isDone()
+  end
+
+  function Screen:drawGen1AnimSprites(anim)
+    local player = anim.player
+    local sprites
+    if anim.playing then
+      local step = player.steps[player.stepIndex]
+      sprites = step and step.sprites
+    end
+    -- A captured ball's chain keeps its closed-ball OAM through the caught
+    -- text (native's lockedBall): once the chain is spent, that resting
+    -- frame is what stays on screen.
+    if not sprites and anim.keepSprites then
+      sprites = player:finalSprites()
+    end
+    if not sprites then return end
+    local G = love.graphics
+    G.setColor(1, 1, 1, 1)
+    for _, group in ipairs(gen1AnimGroups(sprites)) do
+      local ref = group[1]
+      local refX = ref.x - MOVE_ANIM_OAM_X_BIAS
+      local refY = ref.y - MOVE_ANIM_OAM_Y_BIAS
+      local deltaX = (anim.anchorX + anim.scaleX * (refX - anim.vanillaAnchorX)) - refX
+      local deltaY = (anim.anchorY + anim.scaleY * (refY - anim.vanillaAnchorY)) - refY
+      for _, s in ipairs(group) do
+        local img = player:sheetImage(s.ts)
+        local quad = img and player:tileQuad(s.ts, s.tile)
+        if quad then
+          local x = (s.x - MOVE_ANIM_OAM_X_BIAS) + deltaX
+          local y = (s.y - MOVE_ANIM_OAM_Y_BIAS) + deltaY
+          local sxScale = s.xf and -1 or 1
+          local syScale = s.yf and -1 or 1
+          G.draw(img, quad,
+                 x + (sxScale < 0 and 8 or 0),
+                 y + (syScale < 0 and 8 or 0),
+                 0, sxScale, syScale)
+        end
+      end
+    end
+  end
+
+  -- Screen:startMoveAnim's Gen 1 arm: play def's own native move animation
+  -- from the actor's real on-screen position (spread moves still aim at the
+  -- opposing side's centre, exactly as the Gen 2 arm does).
+  function Screen:startMoveAnimGen1(def, actor, target)
+    if not (AnimPlayer and def and def.id) then return end
+    local animsData = N.gen1AnimData(self.data)
+    if not (animsData and animsData.moveAnims) then return end
+    local anchor = self.spriteAnchor[actor]
+    if not anchor then return end
+    local vanillaActor = (actor.side == "player") and VANILLA_PLAYER_ANCHOR or VANILLA_ENEMY_ANCHOR
+    local vanillaTarget = (actor.side == "player") and VANILLA_ENEMY_ANCHOR or VANILLA_PLAYER_ANCHOR
+    local targetAnchor
+    if isSpreadMoveId(self, def.id) then
+      targetAnchor = sideSpriteCentre(self, (actor.side == "player") and "enemy" or "player")
+    end
+    targetAnchor = targetAnchor or self.spriteAnchor[target]
+    local scaleX, scaleY = gen1AnimRemap(anchor, targetAnchor, vanillaActor, vanillaTarget)
+    local anim = {
+      gen1 = true,
+      player = AnimPlayer.new(animsData),
+      queue = { { name = def.id, isPlayer = actor.side == "player" } },
+      playing = false,
+      hiddenEnemy = false,
+      anchorX = anchor.x,
+      anchorY = anchor.y,
+      vanillaAnchorX = vanillaActor.x,
+      vanillaAnchorY = vanillaActor.y,
+      scaleX = scaleX,
+      scaleY = scaleY,
+      -- The running animation's id + its attacker's species, read by
+      -- N.playMoveAnimSound for GROWL/ROAR (GetMoveSound's IsCryMove).
+      animName = def.id,
+      crySpecies = actor.mon and actor.mon.species,
+    }
+    self.moveAnim = anim
+    self:startGen1AnimStep(anim, anim.queue[1])
+  end
+
+  -- Screen:startCatchAnim's Gen 1 arm: the native ball chain, remapped so
+  -- the toss leaves the thrower's own sprite and lands on the target's.
+  function Screen:startCatchAnimGen1(pending)
+    if not (AnimPlayer and pending) then return false end
+    local animsData = N.gen1AnimData(self.data)
+    if not (animsData and animsData.moveAnims) then return false end
+    local target = pending.target
+    local targetAnchor = self.spriteAnchor[target]
+    if not targetAnchor then return false end
+    local thrower = self.playerBattlers[self.actingSlotIdx or 1]
+      or self.playerBattlers[1]
+    local throwerAnchor = thrower and self.spriteAnchor[thrower]
+    local actorAnchor = throwerAnchor or VANILLA_PLAYER_ANCHOR
+    local scaleX, scaleY = gen1AnimRemap(actorAnchor, targetAnchor,
+      VANILLA_PLAYER_ANCHOR, VANILLA_ENEMY_ANCHOR)
+    local ball = pending.ballId or "POKE_BALL"
+    local shakes = pending.rate or 0
+    -- BattleState:ballChain's own decision tree (:5478-5496): a clean miss
+    -- (not caught, zero shakes) stops after the poof with the mon never
+    -- hiding; anything else hides the mon and shakes it; a breakout then
+    -- poofs and shows the mon again; a capture just leaves the ball resting.
+    local landed = pending.caught or shakes ~= 0
+    local queue = {
+      { name = N.ballTossAnim(ball), isPlayer = true, ball = ball },
+      { name = "POOF_ANIM", isPlayer = true },
+    }
+    if landed then
+      queue[#queue + 1] = { name = "HIDEPIC_ANIM", isPlayer = true }
+      queue[#queue + 1] = { name = "SHAKE_ANIM", isPlayer = true, shakes = shakes }
+    end
+    if landed and not pending.caught then
+      queue[#queue + 1] = { name = "POOF_ANIM", isPlayer = true }
+      queue[#queue + 1] = { name = "SHOWPIC_ANIM", isPlayer = true }
+    end
+    self.moveAnim = {
+      gen1 = true,
+      isBall = true,
+      player = AnimPlayer.new(animsData),
+      queue = queue,
+      playing = false,
+      hiddenEnemy = false,
+      anchorX = actorAnchor.x,
+      anchorY = actorAnchor.y,
+      vanillaAnchorX = VANILLA_PLAYER_ANCHOR.x,
+      vanillaAnchorY = VANILLA_PLAYER_ANCHOR.y,
+      scaleX = scaleX,
+      scaleY = scaleY,
+      animName = queue[1].name,
+      crySpecies = nil,
+      -- Native keeps the closed ball in OAM through the caught text.
+      keepSprites = pending.caught and true or false,
+      onFinish = function() self:resolveCatchAnim() end,
+    }
+    self:startGen1AnimStep(self.moveAnim, queue[1])
+    return true
+  end
+
   function Screen:beginResolving()
     -- Switches always resolve before any move (real Gen 2 rule -- not a
     -- speed/priority comparison at all), so they're pulled out of the
     -- queue and applied first, one at a time, in Screen:advanceResolving
-    -- below -- not part of g9-battle-engine-beta's resolveTurnActions
+    -- below -- not part of g9-battle-engine's resolveTurnActions
     -- contract, which is moves only.
-    local moveActions, switchActions = {}, {}
+    local moveActions, switchActions, swapActions = {}, {}, {}
     for _, a in ipairs(self.queuedActions) do
       if a.kind == "switch" then switchActions[#switchActions + 1] = a
+      elseif a.kind == "swap" then swapActions[#swapActions + 1] = a
       else moveActions[#moveActions + 1] = a end
     end
     for _, enemy in ipairs(self.enemyBattlers) do
@@ -2910,6 +5140,7 @@ return function(mod)
       end
     end
     self.switchQueue = switchActions
+    self.swapQueue = swapActions
     self.moveQueue = moveActions
     self.movesResolved = false
     self.currentMessage = nil
@@ -2957,11 +5188,53 @@ return function(mod)
         return
       end
     end
+    if #self.swapQueue > 0 then
+      -- Positional ally swaps resolve FIRST, ahead of both the PKMN
+      -- recall queue and any move: the field has to be in its new shape
+      -- before anything that might read positions (a spread move's
+      -- centre, move-animation anchors) or the PKMN switch queue (which
+      -- places an incoming mon at its slot index) runs.
+      local action = table.remove(self.swapQueue, 1)
+      local a, b = action.actorSlot, action.targetSlot
+      local list = self.playerBattlers
+      local owner, target = list[a], list[b]
+      if owner and target
+          and self.combat.isAlive(owner) and self.combat.isAlive(target) then
+        list[a], list[b] = target, owner
+        self.currentMessage = displayName(owner.mon) .. " switched places with "
+          .. displayName(target.mon) .. "!"
+      end
+      -- Resolved either way -- this owner's cue is done.
+      self:clearSwapOwnerMark(action.actor)
+      return
+    end
     if #self.switchQueue > 0 then
       -- The newly-sent-out mon simply has no action queued of its own
       -- this turn, so it never gets to act again until next turn.
       local action = table.remove(self.switchQueue, 1)
+      local outgoing = self.playerBattlers[action.actorSlot]
       self.playerBattlers[action.actorSlot] = self.combat.newBattler(action.mon, "player")
+      -- The real, shared engine event bus: announce the switch so
+      -- engine-side per-battler bookkeeping keyed to a switch-in runs for
+      -- a scene-driven battle exactly as it does for a native one. Without
+      -- this the engine never learns the switch happened at all -- the
+      -- scene owns the switch and `battle.started` is not re-raised
+      -- mid-battle -- so combat/move_usability.lua kept the outgoing mon's
+      -- Choice lock and combat/modern_action_order.lua kept counting its
+      -- past actions. In-game that showed up as a Choice-locked mon staying
+      -- locked after switching out (the user's own "switch in re-enables
+      -- swapping moves") and a freshly switched-in mon still being refused
+      -- Fake Out/First Impression. previous = the mon leaving (its lock and
+      -- action counter are cleared), battler = the mon arriving (its action
+      -- counter resets to 0). Runtime is the same shared bus this screen
+      -- already raises battle.turn_started on.
+      if Runtime and Runtime.emit then
+        Runtime.emit("battle.battler_switched", {
+          battle = self.battle,
+          previous = outgoing and outgoing.mon or nil,
+          battler = action.mon,
+        })
+      end
       -- The incoming mon has never been on this screen, so the chase has
       -- no entry for it -- seed it at its real hp so its bar is right
       -- from the "Go, X!" line onward. Without this it would fall
@@ -2984,9 +5257,33 @@ return function(mod)
       -- own runTurn drove. Nothing here assumes battle_forms specifically
       -- -- any mod keying real per-turn work off this real, standard
       -- event benefits the same way.
-      Runtime.emit("battle.turn_started", { battle = self.battle })
+      --
+      -- Focused on the FORM's owner for the activation itself (see the
+      -- GIMMICK SELECT section's FORMS OWNER block): battle_forms' entry
+      -- activate() reads battle.player, so without this a FORM armed from
+      -- any slot but the first would transform slot 1 instead. Restored the
+      -- moment the listener returns.
+      local formsMon = self.gimmickOwnerMon
+      local armedBefore = battleFormsArmedId()
+      focusBattlePlayer(self, formsMon, function()
+        Runtime.emit("battle.turn_started", { battle = self.battle })
+      end)
+      if formsMon and armedBefore ~= nil then
+        -- Consuming clears the armed id; battle_forms only consumes when the
+        -- entry actually activated, so a still-armed id is a refusal.
+        if battleFormsArmedId() == nil then
+          emitFormsEvent(self, "used", { mon = formsMon,
+            slot = self.gimmickOwnerSlot, id = self.gimmickOwnerId,
+            label = self.gimmickOwnerLabel })
+        else
+          emitFormsEvent(self, "cancelled", { mon = formsMon,
+            slot = self.gimmickOwnerSlot, id = self.gimmickOwnerId,
+            label = self.gimmickOwnerLabel, reason = "activation-refused" })
+        end
+      end
+      clearGimmickOwner(self)
       -- The WHOLE remaining turn's moves resolve in ONE call now --
-      -- g9-battle-engine-beta's own resolveTurnActions derives priority/
+      -- g9-battle-engine's own resolveTurnActions derives priority/
       -- Speed/order/RNG itself and drives battle:useMove per battler
       -- (STAB/Tera/Protect/damage/accuracy/every sub-effect -- all its
       -- pipeline, not this mod's). This only translates its drained
@@ -3008,35 +5305,22 @@ return function(mod)
       -- mon.hp directly too, so this repurposing doesn't affect
       -- aliveness checks elsewhere).
       --
-      -- awardExperience splits across battle.participants -- a table
-      -- keyed by PARTY INDEX, populated by native's own switch-in flow
-      -- (Battle.new's constructor seeds just self.playerIndex; nothing
-      -- else ever adds to it here, since this mod drives its own roster
-      -- rather than native's switchIn). Rebuilt from the real roster
-      -- every time, right before awarding, so EXP actually splits across
-      -- whichever of OUR playerBattlers fought this battle rather than
-      -- always crediting whatever party slot Battle.new happened to pick
-      -- as its own single "primary" mon.
+      -- awardExperience splits across battle.participants, rebuilt from the
+      -- real roster every time, right before awarding, so EXP splits across
+      -- whichever of OUR playerBattlers fought this battle.  The KEY SHAPE is
+      -- generation-specific (Gen 2 indexes the roster by party slot, Gen 1 by
+      -- the mon table itself), so the backend builds it -- see native.lua.
       if next(self.enemyBattlers) then
-        self.battle.participants = {}
-        for _, p in ipairs(self.playerBattlers) do
-          if self.combat.isAlive(p) then
-            for index, mon in ipairs(self.game.save.party) do
-              if mon == p.mon then
-                self.battle.participants[index] = true
-                break
-              end
-            end
-          end
-        end
+        N.setParticipants(self.battle, self.playerBattlers, self.game.save,
+          self.combat)
       end
       for _, enemy in ipairs(self.enemyBattlers) do
         if enemy.mon and (enemy.mon.hp or 0) <= 0 and not enemy.fainted then
           enemy.fainted = true
-          self.battle:awardExperience(enemy.mon)
+          N.awardExperience(self.battle, enemy.mon)
         end
       end
-      for _, e in ipairs(self.battle:takeEvents()) do events[#events + 1] = e end
+      for _, e in ipairs(N.takeEvents(self.battle)) do events[#events + 1] = e end
       -- Queued WHOLE, in emit order -- not flattened to .text any more.
       -- Screen:installEventProbe has already stamped each one with the
       -- HP vector as of its own emit, which is the entire reason the
@@ -3048,11 +5332,118 @@ return function(mod)
       -- cannot loop, and a proper tail call costs no stack.
       return self:advanceResolving()
     end
+    -- A trainer's active wave can be down while its bench still holds a
+    -- healthy mon -- send the next one out and hold on that beat rather
+    -- than falling into finishTurn, which would declare the trainer
+    -- beaten with a full reserve team unused. Returns false (and lets
+    -- finishTurn run) when there is nothing left to send.
+    if self:advanceEnemyReplacement() then return end
     self:finishTurn()
   end
 
+  -- True only when NO enemy is left anywhere -- neither an active battler
+  -- nor a still-healthy mon waiting on the bench. Screen:finishTurn reads
+  -- this instead of a bare sideDefeated(self.enemyBattlers), so a trainer
+  -- with a reserve team is not declared beaten the instant its FIRST wave
+  -- faints -- the battle is over only when the last bench mon is down too.
+  -- A wild fight (empty bench) is unchanged: this reduces to exactly the
+  -- old sideDefeated check.
+  function Screen:enemySideDefeated()
+    if not self.combat.sideDefeated(self.enemyBattlers) then return false end
+    for _, mon in ipairs(self.enemyBench) do
+      if (mon.hp or 0) > 0 then return false end
+    end
+    return true
+  end
+
+  -- Pops the next still-healthy benched enemy, or nil when the bench is
+  -- empty or exhausted. Removed from the bench as it is taken, so the
+  -- same mon is never sent out twice.
+  function Screen:takeNextEnemyBenchMon()
+    for i, mon in ipairs(self.enemyBench) do
+      if (mon.hp or 0) > 0 then
+        table.remove(self.enemyBench, i)
+        return mon
+      end
+    end
+    return nil
+  end
+
+  -- Sends ONE benched enemy into the first fainted active enemy slot -- the
+  -- trainer-battle counterpart of an active enemy fainting (native does the
+  -- same in Battle:offerEnemySwitch, Battle.lua:3560-3578: clear the
+  -- outgoing mon's volatile state, repoint enemyIndex/enemy at the mon
+  -- coming IN, reset the enemy side's stat stages, then narrate the send).
+  -- Returns true if a mon was sent out -- the caller then holds on the
+  -- send-out beat instead of ending the battle -- and false otherwise.
+  --
+  -- At most ONE send per call, deliberately: a multi-slot layout (doubles,
+  -- triples) can lose two active enemies on the SAME turn, and narrating
+  -- both at once would clobber the single ballThrow/currentMessage state
+  -- and leave the second replacement permanently hidden (only one slot can
+  -- own a throw). Returning after the first send makes the next call --
+  -- the player's next press, once that send's own beat is done -- fill the
+  -- next empty slot, each with its own ball and its own "{TRAINER} sent out
+  -- X!" line, exactly as native walks its own send queue.
+  --
+  -- The player side already being down means no replacement: the battle
+  -- is over (draw/loss), and sending a fresh boss out against an already-
+  -- defeated party would be wrong. finishTurn's own enemySideDefeated
+  -- check is only reached once this returns false.
+  --
+  -- The real Battle model is repointed at the mon actually out because
+  -- more than narration reads it: modern_held_items_phase2's Black Sludge
+  -- tick iterates {battle.player, battle.enemy}, and battle.stages.enemy
+  -- is what the engine's stat-stage math reads -- a stale model would
+  -- tick the wrong mon and fight with the previous boss's stat drops.
+  function Screen:advanceEnemyReplacement()
+    if self.combat.sideDefeated(self.playerBattlers) then return false end
+    for slot, battler in ipairs(self.enemyBattlers) do
+      if not self.combat.isAlive(battler) then
+        local mon = self:takeNextEnemyBenchMon()
+        if not mon then return false end
+        self.enemyBattlers[slot] = self.combat.newBattler(mon, "enemy")
+        self.shownHp[mon] = mon.hp or 0
+        -- Hidden until the ball lands (Screen:update's own throw stepper
+        -- reveals it at t >= BALL_FLIGHT), exactly like the intro send.
+        self.enemyRevealed[slot] = false
+        if self.battle then
+          for index, partyMon in ipairs(self.battle.enemyParty or {}) do
+            if partyMon == mon then self.battle.enemyIndex = index break end
+          end
+          -- pcall'd for the same reason every other engine call on this
+          -- screen is: a model without one of these helpers costs the
+          -- battle an edge case, never the whole fight.
+          pcall(function()
+            if self.battle.clearVolatile then self.battle:clearVolatile(mon) end
+            if self.battle.stages then self.battle.stages.enemy = N.newStages() end
+          end)
+          self.battle.enemy = mon
+        end
+        -- Same switch-in announcement the player's own PKMN switch raises
+        -- (see advanceResolving): the engine's per-mon switch-in bookkeeping
+        -- (the arriving mon's Fake Out/First Impression counter, and the
+        -- departing mon's Choice lock) has to run for an enemy replacement
+        -- too, or an enemy boss that fainted a Choice holder would leave the
+        -- lock on a mon that is no longer on the field.
+        if Runtime and Runtime.emit then
+          Runtime.emit("battle.battler_switched", {
+            battle = self.battle,
+            previous = battler and battler.mon or nil,
+            battler = mon,
+          })
+        end
+        self.currentMessage = (self:trainerDisplayName() or "TRAINER")
+          .. " sent out " .. displayName(mon) .. "!"
+        self.ballThrow = { side = "enemy", slot = slot, t = 0 }
+        return true
+      end
+    end
+    return false
+  end
+
   function Screen:finishTurn()
-    local enemiesDown = self.combat.sideDefeated(self.enemyBattlers)
+    local enemiesDown = self:enemySideDefeated()
     local playersDown = self.combat.sideDefeated(self.playerBattlers)
     if enemiesDown or playersDown then
       self.phase = "over"
@@ -3121,6 +5512,15 @@ return function(mod)
       return
     end
     if pressed then
+      -- A trainer's replacement send is a hold like the intro's own
+      -- throw: mid-flight, a press snaps the ball to landed (which the
+      -- phase-independent stepper in Screen:update then turns into the
+      -- reveal and clears) rather than eating the "sent out X!" line
+      -- underneath it. Reached only after any hpAnim/moveAnim above.
+      if self.ballThrow and self.ballThrow.t < BALL_THROW_TOTAL then
+        self.ballThrow.t = BALL_THROW_TOTAL
+        return
+      end
       self:advanceResolving()
     end
   end
@@ -3462,16 +5862,46 @@ return function(mod)
   -- dispatch
   ------------------------------------------------------------------
   function Screen:update(dt)
+    -- Damage-number lifetimes are wall-clock, independent of phase or
+    -- input -- a label fades out over DMG_NUMBER_LIFE seconds whatever
+    -- else is happening (see Screen:stepDmgNumbers).
+    self:stepDmgNumbers(dt)
     -- Independent of input/phase -- a move animation keeps stepping
     -- underneath the message text the same way it does in every real
     -- Pokemon battle. Runner:step() returns false once the animation
     -- has genuinely finished (its own header note).
     if self.moveAnim then
-      if not self.moveAnim.runner:step() then self.moveAnim = nil end
+      local anim = self.moveAnim
+      if not anim.done then
+        -- Gen 1 drives its own native AnimPlayer (a FIFO of row :starts);
+        -- Gen 2 steps its runner.  Both report true here once finished.
+        local finished
+        if anim.gen1 then
+          finished = self:stepGen1Anim(anim)
+        else
+          finished = not anim.runner:step()
+        end
+        if finished then
+          anim.done = true
+          -- A ball throw holds its own answer (self.catchPending) and reports
+          -- it here, so the catch resolves on the beat the animation ends
+          -- rather than a frame early -- see Screen:startCatchAnim.
+          local onFinish = anim.onFinish
+          anim.onFinish = nil
+          if onFinish then onFinish() end
+          -- A caught ball's own animation asks for its resting closed ball to
+          -- stay in OAM through the caught text (Gen 2's anim_keepsprites;
+          -- Gen 1's lockedBall = finalSprites).  Honour it by keeping the
+          -- finished animation on screen; anything else clears normally.
+          local keep = (anim.gen1 and anim.keepSprites)
+                    or (anim.runner and anim.runner.keepSprites)
+          if not keep then self.moveAnim = nil end
+        end
+      end
     end
 
     -- Same phase-independent stepping for the intro entrances (a pokeball
-    -- throw or wild drop-in finishes its animation even if the player
+    -- throw or wild fade-in finishes its animation even if the player
     -- holds A) and the lose outro's blackout clock. A throw reveals its
     -- battler the instant the ball lands (t >= BALL_FLIGHT -- the poof
     -- and the mon's materialize phase then read over the HUD, matching
@@ -3486,9 +5916,9 @@ return function(mod)
       end
       if bt.t >= BALL_THROW_TOTAL then self.ballThrow = nil end
     end
-    if self.wildDrop then
-      self.wildDrop.t = self.wildDrop.t + dt
-      if self.wildDrop.t >= WILD_DROP_DURATION then self:finishEntrance() end
+    if self.wildFade then
+      self.wildFade.t = self.wildFade.t + dt
+      if self.wildFade.t >= WILD_FADE_DURATION then self:finishEntrance() end
     end
     -- Same phase-independent stepping for the trainer-pic slide-offs:
     -- the enemy trainer's class front-pic slides right off (then the
@@ -3549,6 +5979,7 @@ return function(mod)
     elseif self.phase == "actionMenu" then self:updateActionMenu(input)
     elseif self.phase == "moveSelect" then self:updateMoveSelect(input)
     elseif self.phase == "targetSelect" then self:updateTargetSelect(input)
+    elseif self.phase == "swapSelect" then self:updateSwapSelect(input)
     elseif self.phase == "gimmickSelect" then self:updateGimmickSelect(input)
     elseif self.phase == PROMPT_PHASE then self:updatePrompt(input)
     elseif self.phase == "resolving" then self:updateResolving(input)
@@ -3575,19 +6006,31 @@ return function(mod)
     local bt = self.ballThrow
     if not bt then return end
     local t = bt.t
-    local slotW = (bt.side == "player")
-      and (SPRITE_ZONE_TW / #self.playerBattlers)
-      or (SPRITE_ZONE_TW / #self.enemyBattlers)
-    local sxx, syy
+    local r
     if bt.side == "player" then
-      sxx, syy = self:pos("playerSprite" .. bt.slot, (bt.slot - 1) * slotW, ROW_H)
+      local cols = sideColumns(#self.playerBattlers, "player", false, self.isHorde)
+      r = slotRect(cols, cols[bt.slot] or cols[1], ALLY_FEET_T, ROW_H, "ally")
+    elseif self.isBoss and bt.slot == 1 then
+      r = bossSlot()
     else
-      sxx, syy = self:pos("enemySprite" .. bt.slot, GUI_TW * 2 + GUI_GAP + (bt.slot - 1) * slotW, 0)
+      local cols = sideColumns(#self.enemyBattlers, "enemy", self.isBoss, false)
+      r = slotRect(cols, cols[bt.slot] or cols[1], ENEMY_FEET_T, ROW_H, "enemy")
     end
-    -- Landing spot = the slot zone's bottom-center, where drawSprite
-    -- bottom-anchors the mon (so the ball lands where the mon appears).
-    local tx = (sxx + slotW / 2) * 8
-    local ty = (syy + ROW_H) * 8
+    -- Landing spot = where drawSprite actually bottom-anchored the mon
+    -- this frame (self.spriteAnchor, filled by drawContent's sprite pass,
+    -- which runs before this) -- the slot's own bottom-center, which is
+    -- what the mon's own feet land on. Falling back to it only covers
+    -- the very first frame, before any anchor exists.
+    local tb = (bt.side == "player") and self.playerBattlers[bt.slot]
+      or self.enemyBattlers[bt.slot]
+    local anchor = tb and self.spriteAnchor[tb]
+    local tx, ty
+    if anchor then
+      tx, ty = anchor.x, anchor.y
+    else
+      tx = r.x + r.w / 2
+      ty = r.y + r.h
+    end
     if t < BALL_FLIGHT then
       local p = t / BALL_FLIGHT
       local ox, oy, ax, ay
@@ -3599,16 +6042,16 @@ return function(mod)
       local q = 1 - p
       local x = q * q * ox + 2 * q * p * ax + p * p * tx
       local y = q * q * oy + 2 * q * p * ay + p * p * ty
-      -- The game's own ball, tumbling on its native POKE_BALL_1 frameset
-      -- as it flies this screen's arc (drawPokeball only if that data
-      -- isn't in the cache).
+      -- The game's own ball as it flies this screen's arc: Gen 2's native
+      -- object tumbling on its POKE_BALL_1 frameset, or Gen 1's own ball
+      -- frame (drawPokeball only if that data isn't in the cache).
       if not drawNativeBall(self, x, y, t, false) then
         drawPokeball(x, y, BALL_RADIUS, p)
       end
     elseif t < BALL_FLIGHT + BALL_POOF then
-      -- Landed: show the ball's own opening pose on the platform (lifted
-      -- so it sits on the ground, not half-buried), under the white flash
-      -- that fades as the mon materializes.
+      -- Landed: show the ball on the platform (lifted so it sits on the
+      -- ground, not half-buried) under the white flash that fades as the
+      -- mon materializes -- Gen 2's own opening pose, or Gen 1's own ball.
       drawNativeBall(self, tx, ty - BALL_LAND_LIFT, 0, true)
       local tp = (t - BALL_FLIGHT) / BALL_POOF
       love.graphics.setColor(1, 1, 1, 1 - tp)
@@ -3617,49 +6060,124 @@ return function(mod)
     end
   end
 
-  function Screen:drawContent()
-    -- Every position below goes through self:pos(id, defaultTx,
-    -- defaultTy): a tuned override baked into self.layout (Screen.new)
-    -- if one exists for that id, otherwise the same computed default
-    -- this layout has always used. Looped over however many battlers are
-    -- actually on each side (the real wild flow always hands over 2 per
-    -- side; the loop is just written N-agnostic, matching combat.lua's
-    -- own logic): GUI boxes stack (i-1)*GUI_STACK_TY tiles lower per
-    -- index; sprites spread evenly left to right across their zone.
-    local enemyZoneTx = GUI_TW * 2 + GUI_GAP
-    for i, battler in ipairs(self.enemyBattlers) do
-      local gx, gy = self:pos("enemyGui" .. i, 0, (i - 1) * GUI_STACK_TY)
-      local gs = self:sizeMul("enemyGui" .. i)
-      -- HUD box hidden until this mon is actually sent out (a trainer
-      -- battle's intro shows the trainer's pic, not the mon, in this
-      -- slot) -- drawGuiBox still hides it on its own for fainted/caught.
-      if self.enemyRevealed[i] then
-        drawGuiBox(gx, gy, GUI_TW, ROW_H, battler, self.data, false, false, gs,
-          self:shownHpOf(battler.mon))
-      end
+  -- The two teams' slot rects for this frame, exactly the grid the sprite pass
+  -- draws on (sideColumns/slotRect/bossSlot). Factored out of drawContent so
+  -- Screen:prewarmSlot can resolve a sprite's seam inputs during the UPDATE
+  -- phase and request the VERY sheet the draw pass will use -- the bake key
+  -- is built from these rects, so a pre-warm computed from any other rect
+  -- would bake a second, unused sheet.
+  function Screen:slotRects()
+    local enemyCols = sideColumns(#self.enemyBattlers, "enemy", self.isBoss, false)
+    local playerCols = sideColumns(#self.playerBattlers, "player", false, self.isHorde)
+    local enemyRects, playerRects = {}, {}
+    for i = 1, #self.enemyBattlers do
+      enemyRects[i] = (self.isBoss and i == 1)
+        and bossSlot()
+        or slotRect(enemyCols, enemyCols[i], ENEMY_FEET_T, ROW_H, "enemy")
+    end
+    for i = 1, #self.playerBattlers do
+      playerRects[i] = slotRect(playerCols, playerCols[i], ALLY_FEET_T, ROW_H, "ally")
+    end
+    return enemyRects, playerRects
+  end
 
-      local slotW = SPRITE_ZONE_TW / #self.enemyBattlers
-      local sx, sy = self:pos("enemySprite" .. i, enemyZoneTx + (i - 1) * slotW, 0)
-      local ss = self:sizeMul("enemySprite" .. i)
+  -- Start a battler's sheet BAKING during its pokeball's flight, instead of on
+  -- the frame the ball lands (which is when the sprite pass first asks for it).
+  -- The sprite mod spreads a sheet's scan/bake over frames under a per-update
+  -- budget, so a first-look sheet is not ready for a good fraction of a second
+  -- -- the ball's 0.45s airtime is exactly the head start it needs. resolveSprite
+  -- is drawSprite's own resolve step, so this requests the same sheet key the
+  -- draw pass will (same rect, hence the same bake key), and the result is thrown
+  -- away: the side effect, the bake, is the whole point. Without it a managed
+  -- species' first send-out materializes with its sprite still baking -- and
+  -- now that the vanilla pic is suppressed during a build, the mon would pop
+  -- in mid-grow instead of growing with its art.
+  function Screen:prewarmSlot(side, slot)
+    if not Runtime.wantsHook("battle.mon_pic") then return end
+    local enemyRects, playerRects = self:slotRects()
+    if side == "enemy" then
+      local battler, r = self.enemyBattlers[slot], enemyRects[slot]
+      if battler and r then
+        resolveSprite(r, self.isBoss and slot == 1, battler, "spriteFront",
+          self.data, self.spriteScaleFront)
+      end
+    else
+      local battler, r = self.playerBattlers[slot], playerRects[slot]
+      if battler and r then
+        resolveSprite(r, false, battler, "spriteBack",
+          self.data, self.spriteScaleBack)
+      end
+    end
+  end
+
+  function Screen:drawContent()
+    -- Sprite positions come from the shared 8-column grid (sideColumns/
+    -- slotRect) -- standardized, not per-preset; HUD and F/E positions still
+    -- go through self:pos(id, defaultTx, defaultTy) so a preset may nudge
+    -- one box. Looped over however many battlers are actually on each side
+    -- (combat.lua's own logic iterates these same arrays with ipairs).
+    --
+    -- Draw order is deliberate: every SPRITE first (both teams), then the
+    -- HUD boxes, then the ball/move animation, then F/E. HUD boxes on top
+    -- of the field is what keeps a crowded team readable -- a tall sprite
+    -- passes behind an HP box instead of covering it -- and it is why a
+    -- preset can no longer hide a HUD under a sprite.
+    -- -- sprites -------------------------------------------------------
+    -- Each side's slots come straight from the grid (sideColumns/slotRect),
+    -- so the allies fill rightward from a1 and the enemies leftward from e6,
+    -- leaving the OUTER columns of an under-strength side empty. A slot is an
+    -- ANCHOR (its centre-x, its ground
+    -- line), not a size -- each sprite is drawn at its own size on it. The
+    -- boss's lone enemy takes the boss slot, centred on e5. Screen:slotRects
+    -- owns this computation (prewarmSlot asks it for the very same rects).
+    local enemyRects, playerRects = self:slotRects()
+
+    -- Where each mon's head actually lands THIS frame, in design px, keyed by
+    -- battler -- filled as the sprite pass below draws each one, then read by
+    -- the HUD pass to set each side's readout column down on its own mons'
+    -- heads. The line is taken from the sprite's FULL-SIZE height (`fullH`)
+    -- with the ground line it currently stands on (top + height), NOT from
+    -- its drawn box this frame: the send-out materialize scales the sprite
+    -- about its feet, so using the drawn height would let the readout ride
+    -- up over BALL_APPEAR as the mon grows. A key is absent while a battler
+    -- has no sprite on the field at all (its trainer pic still stands in the
+    -- slot, or its ball/wild drop has not landed), which sideHeadY turns into
+    -- the side's ground-line fallback -- its HUD is hidden until then anyway.
+    local headLines = {}
+    local function noteHead(battler, top, height, fullHeight)
+      if top then
+        headLines[battler] = top + height - GUI_HEAD_PCT * fullHeight
+      end
+    end
+
+    for i, battler in ipairs(self.enemyBattlers) do
+      local r = enemyRects[i]
+      local boss = self.isBoss and i == 1
       -- Trainer-battle intro: the enemy trainer's class front-pic stands
       -- in the enemy slot (native's InitEnemyTrainer) while "{TRAINER}
       -- wants to battle!" reads, then slides right off in 8px steps
       -- (native's SlideBattlePicOut) before the first mon is sent out.
       if self.showEnemyTrainer and self.enemyTrainerImage and i == 1 then
-        drawRawImage(self.enemyTrainerImage, sx, sy, slotW, ROW_H,
-          slideStepPx(self.trainerSlide, TRAINER_SLIDE_DURATION, TRAINER_SLIDE_STEPS))
-      elseif self.wildDrop and self.wildDrop.slot == i
+        drawRawImage(self.enemyTrainerImage, r,
+          slideStepPx(self.trainerSlide, TRAINER_SLIDE_DURATION, TRAINER_SLIDE_STEPS),
+          true, self.enemyTrainerColors, self.enemyTrainerTrueColor)
+      elseif self.wildFade and self.wildFade.slot == i
           and (self:shownHpOf(battler.mon) or 0) > 0 and not battler.caught then
-        -- Wild entry: the wild mon drops in from the top of the screen
-        -- onto its platform -- the one slide-in left in the intro (every
-        -- other mon is thrown from a pokeball). Accelerates like a fall
-        -- (ease-in); HUD + sprite are revealed only once it lands.
-        local p = math.min(1, self.wildDrop.t / WILD_DROP_DURATION)
-        local eased = p * p
-        local offY = -(ROW_H * 8) * (1 - eased)
-        local ax, ay = drawSprite(sx, sy, slotW, ROW_H, battler, "spriteFront", self.data, false, ss, 0, offY)
-        if ax then self.spriteAnchor[battler] = { x = ax, y = ay } end
-      elseif self.enemyRevealed[i] and (self:shownHpOf(battler.mon) or 0) > 0 and not battler.caught then
+        -- Wild entry: the wild mon appears IN PLACE at its final sprite
+        -- position from the very first frame (no drop-in, no offY) and
+        -- fades from completely invisible to completely visible over
+        -- WILD_FADE_DURATION -- the user's rule (round sixty-three).
+        -- Every other mon in the intro is thrown from a pokeball; this is
+        -- the one that simply materializes. HUD + sprite are revealed only
+        -- once the fade ends, exactly as the old drop gated them on landing.
+        local p = math.min(1, self.wildFade.t / WILD_FADE_DURATION)
+        local ax, ay, dty, dth, dfull = drawSprite(r, boss, battler, "spriteFront", self.data, true, 0, 0, nil, self.spriteScaleFront, p)
+        if ax then
+          self.spriteAnchor[battler] = { x = ax, y = ay, top = dty, h = dth }
+          noteHead(battler, dty, dth, dfull)
+        end
+      elseif self.enemyRevealed[i] and (self:shownHpOf(battler.mon) or 0) > 0
+          and not battler.caught and not animHidesMon(self, "enemy") then
         -- A fainted/caught battler's sprite is gone -- the box already hides
         -- on its own (drawGuiBox) and the sprite must follow, so a downed
         -- mon reads as an empty slot and the outro's win/defeat line plays
@@ -3667,38 +6185,114 @@ return function(mod)
         -- sprite vanishes exactly when its bar drains to zero under the
         -- fainted narration, not the frame the whole turn's math commits.
         local appear = ballAppearFor(self, "enemy", i)
-        local ax, ay = drawSprite(sx, sy, slotW, ROW_H, battler, "spriteFront", self.data, false, ss, 0, 0, appear)
-        if ax then self.spriteAnchor[battler] = { x = ax, y = ay } end
+        local ax, ay, dty, dth, dfull = drawSprite(r, boss, battler, "spriteFront", self.data, true, 0, 0, appear, self.spriteScaleFront)
+        if ax then
+          self.spriteAnchor[battler] = { x = ax, y = ay, top = dty, h = dth }
+          noteHead(battler, dty, dth, dfull)
+        end
       end
     end
 
     for i, battler in ipairs(self.playerBattlers) do
-      local slotW = SPRITE_ZONE_TW / #self.playerBattlers
-      local sx, sy = self:pos("playerSprite" .. i, (i - 1) * slotW, ROW_H)
-      local ss = self:sizeMul("playerSprite" .. i)
+      local r = playerRects[i]
       -- Intro lead-in: the player trainer's back-pic stands in the player
       -- slot (native's GetTrainerBackpic) until the very end of the
       -- intro, then slides left off in 8px steps (native's backpic-slide)
       -- just before the first "Go! P!". Only then is this mon drawn.
       if self.showPlayerTrainer and self.playerTrainerImage and i == 1 then
-        drawRawImage(self.playerTrainerImage, sx, sy, slotW, ROW_H,
-          -slideStepPx(self.backpicSlide, BACKPIC_SLIDE_DURATION, BACKPIC_SLIDE_STEPS))
-      elseif self.playerRevealed[i] and (self:shownHpOf(battler.mon) or 0) > 0 and not battler.caught then
+        drawRawImage(self.playerTrainerImage, r,
+          -slideStepPx(self.backpicSlide, BACKPIC_SLIDE_DURATION, BACKPIC_SLIDE_STEPS),
+          nil, self.playerTrainerColors, self.playerTrainerTrueColor)
+      elseif self.playerRevealed[i] and (self:shownHpOf(battler.mon) or 0) > 0
+          and not battler.caught and not animHidesMon(self, "player") then
         -- Pokeball send-out: the mon materializes at its platform (the
         -- ball itself is drawn by drawBallThrow) -- scaled in from the
         -- ground via ballAppearFor while its own "Go! P!" line reads.
         local appear = ballAppearFor(self, "player", i)
-        local ax, ay = drawSprite(sx, sy, slotW, ROW_H, battler, "spriteBack", self.data, false, ss, 0, 0, appear)
-        if ax then self.spriteAnchor[battler] = { x = ax, y = ay } end
-      end
-
-      local gx, gy = self:pos("playerGui" .. i, GUI_RIGHT_TX, ROW_H + (i - 1) * GUI_STACK_TY)
-      local gs = self:sizeMul("playerGui" .. i)
-      if self.playerRevealed[i] then
-        drawGuiBox(gx, gy, GUI_TW, ROW_H, battler, self.data, true, true, gs,
-          self:shownHpOf(battler.mon))
+        local ax, ay, dty, dth, dfull = drawSprite(r, false, battler, "spriteBack", self.data, false, 0, 0, appear, self.spriteScaleBack)
+        if ax then
+          self.spriteAnchor[battler] = { x = ax, y = ay, top = dty, h = dth }
+          noteHead(battler, dty, dth, dfull)
+        end
       end
     end
+
+    -- -- HUD boxes (over the field, under the ball/move anim) ----------
+    -- ONE READOUT PER SLOT, in a single row per side, all at the side's one
+    -- head line (see the placement header far above): each box is centred on
+    -- its own slot's centre-x -- the point drawSprite centres that mon's
+    -- sprite on, so the readout travels with it -- and the grid's pitch is
+    -- the readout's own pitch (COL_W), so neighbouring boxes never overlap
+    -- and no re-spread is needed. spreadBoxCentres still runs as the safety
+    -- net for an overlapping row. Both draw from their LEFT edge
+    -- (anchorRight=false), which is what guiTxOn's (centre - half width)
+    -- arithmetic assumes.
+    local enemyCentres, playerCentres = {}, {}
+    for i = 1, #self.enemyBattlers do
+      enemyCentres[i] = enemyRects[i].x + enemyRects[i].w / 2
+    end
+    for i = 1, #self.playerBattlers do
+      playerCentres[i] = playerRects[i].x + playerRects[i].w / 2
+    end
+    local enemyRow = spreadBoxCentres(enemyCentres)
+    local playerRow = spreadBoxCentres(playerCentres)
+    -- One head line per side -- the mean of the heads of the sprites DRAWN
+    -- for it this frame (sideHeadY/headLines) -- so every box on the side
+    -- keeps the same height. Each box puts its BOTTOM edge on that line
+    -- (one box per slot now, so both sides place their single row the same
+    -- way); a side with nothing drawn yet falls back to its own ground line
+    -- (its HUD is hidden until then anyway).
+    local GUI_HEADLINE_ENEMY = sideHeadY(self.enemyBattlers, headLines, ENEMY_FEET_T * 8)
+    local GUI_HEADLINE_ALLY = sideHeadY(self.playerBattlers, headLines, ALLY_FEET_T * 8)
+    local GUI_TOP_ENEMY = GUI_HEADLINE_ENEMY - GUI_BOX_H_ENEMY * BOX_SCALE * 8
+    local GUI_TOP_ALLY = GUI_HEADLINE_ALLY - GUI_BOX_H_PLAYER * BOX_SCALE * 8
+    -- Where each battler's readout actually landed this frame (its centre-x,
+    -- the box's own top-left tile x and top edge, and the box's sizeMul, all
+    -- design px), keyed by battler. Screen:drawTargetMark drops its arrow just
+    -- above the selected candidate's readout, and Screen:drawDmgNumbers
+    -- centres a floating HP-change label under the candidate's HP bar.
+    -- Recorded from the FINAL, preset-nudged tile position (and the box's own
+    -- sizeMul) so a layout that moves or scales a readout takes both with it.
+    -- `visible` mirrors that slot's own reveal flag, so a label is never drawn
+    -- over a readout the HUD is deliberately hiding.
+    self.hudMark = {}
+    for i, battler in ipairs(self.enemyBattlers) do
+      local gx, gy = self:pos("enemyGui" .. i, guiTxOn(enemyRow[i]), GUI_TOP_ENEMY / 8)
+      local gs = self:sizeMul("enemyGui" .. i)
+      self.hudMark[battler] = { x = gx * 8 + GUI_BOX_HALF_W * gs, top = gy * 8,
+        left = gx * 8, gs = gs, h = GUI_BOX_H_ENEMY * 8,
+        visible = self.enemyRevealed[i] and true or false }
+      -- HUD box hidden until this mon is actually sent out (a trainer
+      -- battle's intro shows the trainer's pic, not the mon, in this
+      -- slot) -- drawGuiBox still hides it on its own for fainted/caught.
+      if self.enemyRevealed[i] then
+        drawGuiBox(gx, gy, GUI_TW, GUI_BOX_H_ENEMY, battler, self.data, false,
+          false, gs, self:shownHpOf(battler.mon), self.hud)
+      end
+    end
+    for i, battler in ipairs(self.playerBattlers) do
+      local gx, gy = self:pos("playerGui" .. i, guiTxOn(playerRow[i]), GUI_TOP_ALLY / 8)
+      local gs = self:sizeMul("playerGui" .. i)
+      self.hudMark[battler] = { x = gx * 8 + GUI_BOX_HALF_W * gs, top = gy * 8,
+        left = gx * 8, gs = gs, h = GUI_BOX_H_PLAYER * 8,
+        visible = self.playerRevealed[i] and true or false }
+      if self.playerRevealed[i] then
+        drawGuiBox(gx, gy, GUI_TW, GUI_BOX_H_PLAYER, battler, self.data, true,
+          false, gs, self:shownHpOf(battler.mon), self.hud)
+      end
+    end
+
+    -- The target picker's field cursor (a no-op in every other phase), drawn
+    -- on top of the readouts it sits above.
+    self:drawTargetMark()
+    -- The SWITCH cue (a no-op unless a swap is being chosen or is queued),
+    -- same layer -- filled arrow on the target, hollow frame on the owner.
+    self:drawSwapMark()
+
+    -- Floating HP-change labels (a no-op unless the engine's damage-numbers
+    -- option is on), drawn over the readouts they belong to and under the
+    -- field effects below.
+    self:drawDmgNumbers()
 
     -- Pokeball throw, drawn over every mon/GUI box but under F/E (so the
     -- flying ball and its landing flash read above the field, below the
@@ -3730,32 +6324,48 @@ return function(mod)
     end
 
     -- Bottom: F (message/move/target, wide) beside E (FIGHT/BAG/PKMN/RUN,
-    -- narrow) -- vanilla's own text-box-plus-menu split, not one shared
-    -- full-width box. Both go through Screen:withScale to apply their
-    -- tuned size (see its own header for why: border+text drawn together
-    -- at their normal INTEGER default size, F_TW/E_TW/BOTTOM_H, then the
-    -- whole finished result scaled as one unit -- passing a scaled tw/th
-    -- straight into Font.drawBox instead visibly broke the frame's own
-    -- tiling live). self.fTextX/fTextY/eTextX/eTextY stay the box's own
-    -- UNSCALED default text origin -- correct because they're read only
+    -- narrow), the two panes of the cart's own bottom box. Both go through
+    -- Screen:withScale to apply their tuned size (see its own header for
+    -- why the whole draw is scaled as one unit rather than the geometry
+    -- being pre-scaled). self.fTextX/fTextY/eTextX/eTextY stay the box's
+    -- own UNSCALED default text origin -- correct because they're read only
     -- from INSIDE that same withScale block below, where the transform
     -- itself does the scaling; fChars is the fixed default (F's own tile
     -- capacity doesn't change, only its on-screen size does).
-    -- Intro/outro narration draws a FULL-WIDTH message box -- vanilla
-    -- spans its battle text across the whole bottom row and only splits
-    -- off the E menu (FIGHT/BAG/PKMN/RUN) once the action menu is up.
-    -- F grows by E_TW; E is skipped entirely.
+    --
+    -- ONE box, TWO panes (round eighty-one): the frame is drawn once,
+    -- across both panes, with the menu window's left edge drawn over it as
+    -- a divider -- the cart's own shape (drawNativeDivider's header).  F
+    -- and E used to be two separately framed boxes, so their facing borders
+    -- ran two pixels apart down the middle of the band and every corner of
+    -- both frames sat at the junction; now there is one continuous frame
+    -- and a single divider line, which is what makes the pair read as the
+    -- native bottom box.
+    --
+    -- Intro/outro narration draws a FULL-WIDTH message box -- vanilla spans
+    -- its battle text across the whole bottom row and only splits off the E
+    -- menu (FIGHT/BAG/PKMN/RUN) once the action menu is up.  F grows by
+    -- E_TW; E is skipped entirely.
     local narrationW = (self.phase == "intro" or self.phase == "over")
     local fx, fy = self:pos("fBox", 0, BOTTOM_Y)
     local ex, ey = self:pos("eBox", F_TW, BOTTOM_Y)
     local fw = narrationW and (F_TW + E_TW) or F_TW
+    -- F and E still share an edge, so they are one box.  A layout preset
+    -- that moves one of them away instead gets two separate frames rather
+    -- than a divider drawn in mid-air.
+    local joined = (fy == ey) and (fx + fw == ex)
     self.fTextX, self.fTextY = (fx + 1) * 8 + 2, (fy + 1) * 8 + 2
     self.eTextX, self.eTextY = (ex + 1) * 8 + 2, (ey + 1) * 8 + 2
     self.fChars = fw - 4
 
     self:withScale("fBox", fx, fy, function()
       love.graphics.setColor(1, 1, 1, 1)
-      drawBoxNoGap(fx, fy, fw, BOTTOM_H)
+      if joined then
+        drawNativeFrame(fx, fy, fw + E_TW, BOTTOM_H)
+        drawNativeDivider(ex, fy, BOTTOM_H)
+      else
+        drawNativeFrame(fx, fy, fw, BOTTOM_H)
+      end
       love.graphics.setColor(0, 0, 0, 1)
       if self.phase == "intro" then
         drawWrapped(self.currentMessage or "", self.fTextX, self.fTextY, self.fChars)
@@ -3765,6 +6375,8 @@ return function(mod)
         self:drawMoveSelect()
       elseif self.phase == "targetSelect" then
         self:drawTargetSelect()
+      elseif self.phase == "swapSelect" then
+        self:drawSwapSelect()
       elseif self.phase == "gimmickSelect" then
         self:drawGimmickSelect()
       elseif self.phase == PROMPT_PHASE then
@@ -3778,8 +6390,10 @@ return function(mod)
 
     if not narrationW then
       self:withScale("eBox", ex, ey, function()
-        love.graphics.setColor(1, 1, 1, 1)
-        drawBoxNoGap(ex, ey, E_TW, BOTTOM_H)
+        if not joined then
+          love.graphics.setColor(1, 1, 1, 1)
+          drawNativeFrame(ex, ey, E_TW, BOTTOM_H)
+        end
         love.graphics.setColor(0, 0, 0, 1)
         -- The prompt's two labels go where FIGHT/BAG/PKMN/RUN normally sit
         -- -- the same vanilla text-box-plus-menu split this box exists for
@@ -3793,14 +6407,55 @@ return function(mod)
   end
 
   function Screen:draw()
-    -- Fallback path only, see this file's earlier header note: only
-    -- reached if something is ever stacked on top of this screen.
-    local w, h = love.graphics.getDimensions()
+    -- GEN 1'S PATH.  src/core/Game.lua has no drawWidescreen channel (that
+    -- is Game2's), so on Gen 1 the engine calls this instead, into the UI
+    -- surface it sized from Screen:uiSize -- which is CANVAS_W x CANVAS_H,
+    -- so the fit below resolves to scale 1 and drawContent lands on that
+    -- surface 1:1, filling it edge to edge.  It still degrades sanely if the
+    -- engine ever hands the scene a different surface (it fits whatever it
+    -- is drawing into).  On Gen 2 this method is never called -- Game2
+    -- resolves the surround through drawsWidescreen/drawWidescreen.
+    --
+    -- ASK FOR THE SURFACE, NOT THE WINDOW.  The engine owns the window: it
+    -- sizes a UI surface from Screen:uiSize (Renderer:setUISize) and blits
+    -- that surface into the window itself, exactly as it does for its own
+    -- wide battle -- and src/battle/WideBattle.lua draws that composition in
+    -- NATIVE SURFACE PIXELS and never asks how big the window is.
+    -- love.graphics.getDimensions() reports the WINDOW, so the fit that used
+    -- to be here sized the 320x180 field against the window: on any window
+    -- larger than the surface the field was drawn OVERSIZED into the 960x540
+    -- canvas, and the canvas' own bottom and right edges then sliced it.
+    -- That is what pushed the bottom message/menu band out of the picture --
+    -- user-reported, with a screenshot: "F and E box being pushed out of
+    -- screen".  The F box kept only its top border sliver and lost the rest
+    -- of its frame; the E box additionally lost its right edge, because the
+    -- field was cut past design x246 and E's own right border sits at 312.
+    -- The live canvas is the literal answer (Renderer:beginFrame sets it to
+    -- the UI surface), Renderer:uiSize() is the size the engine allocated it
+    -- from, and getDimensions() stays the last resort for the no-canvas case
+    -- -- drawing straight to the window, e.g. a headless test.
+    local w, h
+    local canvas = love.graphics.getCanvas and love.graphics.getCanvas()
+    if canvas and canvas.getWidth and canvas.getHeight then
+      w, h = canvas:getWidth(), canvas:getHeight()
+    end
+    if not (w and h and w > 0 and h > 0) then
+      local ok, Renderer = pcall(require, "src.render.Renderer")
+      if ok and type(Renderer) == "table" and Renderer.uiSize then
+        w, h = Renderer:uiSize()
+      end
+    end
+    if not (w and h and w > 0 and h > 0) then
+      w, h = love.graphics.getDimensions()
+    end
     local scale = fitScale(w, h)
     local ox, oy = fitOrigin(w, h, scale)
     love.graphics.push()
     love.graphics.translate(ox, oy)
-    love.graphics.scale(scale, scale)
+    -- Window px per CANVAS px (scale) times CANVAS px per DESIGN px (DS):
+    -- drawContent is authored in the 320x180 design field and lands on the
+    -- 960x540 canvas, which is then scaled to the window.
+    love.graphics.scale(scale * DS, scale * DS)
     self:drawContent()
     love.graphics.pop()
   end
@@ -3815,9 +6470,77 @@ return function(mod)
     local ox, oy = fitOrigin(winW, winH, scale)
     love.graphics.push()
     love.graphics.translate(ox, oy)
-    love.graphics.scale(scale, scale)
+    love.graphics.scale(scale * DS, scale * DS)
     self:drawContent()
     love.graphics.pop()
+  end
+
+  ------------------------------------------------------------------
+  -- WIDESCREEN CONTRACT (Gen 1).
+  --
+  -- src/core/Game.lua's renderer is built around a fixed UI SURFACE that a
+  -- state may widen, not around a state painting its own window.  Its
+  -- widescreen battle is exactly this: BattleState:isWideBattleLayout +
+  -- BattleState:uiSize ask Renderer:setUISize for a 304x144 canvas, the
+  -- state draws into it in native pixels, and endFrame blits it (filled to
+  -- the window via wantsFillScale/BATTLE SIZE "fill").  Gen 1 has no
+  -- drawWidescreen hook, so this scene joins that mechanism instead of
+  -- inventing a second one: the surface IS the scene's own 960x540 canvas,
+  -- so Screen:draw needs no rescale and every engine service the wide battle
+  -- already gets -- the fill scale, the palette-zone pass, the letterbox,
+  -- the centring of any classic state pushed over it -- applies unchanged.
+  --
+  -- The Gen 2 path is untouched by every member below: Game2 resolves its
+  -- surround through drawsWidescreen/drawWidescreen and never reads
+  -- isWideBattleLayout/uiSize/sgbPalettes/letterboxWhite/holdsUIAnchors
+  -- (they are Gen-1-only names in the engine -- see src/mods/Gen2Compat.lua's
+  -- own absent lists), so the scene renders on Gold exactly as it did.
+
+  -- Owns the whole screen, so the renderer must keep drawing IT when an
+  -- opaque classic state (a native text box, a menu) is pushed over it --
+  -- the same "a wide battle owns the surface until it leaves the stack"
+  -- rule Game.drawBaseInStack applies to the native wide layout.
+  function Screen:isWideBattleLayout() return true end
+
+  -- The surface Renderer:setUISize allocates for this state: the scene's own
+  -- canvas, so drawContent's design->canvas scale (DS, see Screen:draw) lands
+  -- it there 1:1 rather than being letterboxed into a Game Boy screen.
+  function Screen:uiSize() return CANVAS_W, CANVAS_H end
+
+  -- Mirrors src/battle/WideBattle.zones() for a scene that resolves its own
+  -- colours: one whole-surface trueColor zone, so the engine's shade-remap
+  -- shader never runs over art that is already the colour it should be.  A
+  -- nil answer here would let PaletteFX.ensureZones invent a 160x144 zone in
+  -- the forced-mono modes, which would remap only the top-left corner of a
+  -- 960x540 surface -- the WideBattle module stores the same opt-out for the
+  -- same reason.
+  function Screen:sgbPalettes()
+    return { { colors = false, x = 0, y = 0, w = CANVAS_W, h = CANVAS_H } }
+  end
+
+  -- The scene paints its own opaque field edge to edge; a window that is not
+  -- 16:9 gets the display mode's paper in its bars rather than black, which
+  -- is what drawWidescreen's own window fill does on Gen 2.
+  Screen.letterboxWhite = true
+
+  -- A battle composes its own screen, so engine UI anchors (dialogue boxes,
+  -- the START menu) must not dock to the window edge over it -- the native
+  -- wide battle sets this for the same reason.
+  Screen.holdsUIAnchors = true
+
+  -- The engine bounds a state's requested surface to Renderer.MAX_UI_WIDTH/
+  -- MAX_UI_HEIGHT (640x576, sized for its own 304x144 wide battle), which
+  -- would clamp this scene's 960x540 request back to 160x144.  Widen the
+  -- bound additively and once, to exactly this file's canvas: the guard's
+  -- intent (never allocate an unbounded canvas) is preserved, and it is done
+  -- only on Gen 1 -- Game2 never calls Renderer:setUISize, so Gen 2's render
+  -- path never reads this value at all.
+  if not N.isGen2 then
+    local ok, Renderer = pcall(require, "src.render.Renderer")
+    if ok and type(Renderer) == "table" then
+      Renderer.MAX_UI_WIDTH = math.max(Renderer.MAX_UI_WIDTH or 0, CANVAS_W)
+      Renderer.MAX_UI_HEIGHT = math.max(Renderer.MAX_UI_HEIGHT or 0, CANVAS_H)
+    end
   end
 
   -- Real vanilla entry sequence, owned here so every caller (Sample-
@@ -3853,8 +6576,8 @@ return function(mod)
   -- resolution itself is unaffected either way (resolveTurnActions never
   -- reads battle.player/battle.enemy/battle.wild at all).
   -- data.trainer accepts either a plain `true` (legacy -- every caller
-  -- before this fix, including this mod's own wildEncounter multi-enemy
-  -- case) or the REAL trainer definition table
+  -- before this fix, including this mod's own multi-enemy wild case) or
+  -- the REAL trainer definition table
   -- ({class=,name=,baseMoney=,...}, the same shape World:startBattle's
   -- own opts.trainer always carried) -- explicit fix, since the plain-
   -- boolean path always synthesized a fake {class="TRAINER",name="",
@@ -3881,14 +6604,20 @@ return function(mod)
     else
       opts.trainer = { class = "TRAINER", name = "", party = data.enemies, baseMoney = 0 }
     end
-    return Battle.new(opts)
+    return N.buildBattle(opts, game, data)
   end
 
   mod.exports.pushDoubleBattleScreen = function(game, world, data)
     local combat = mod.exports.combat
-    local g9dex = mod:find("g9-battle-engine-beta")
-    assert(g9dex and g9dex.exports and g9dex.exports.resolveTurnActions,
-      "g9-Battle-Scene: g9-battle-engine-beta not loaded or missing resolveTurnActions")
+    local g9dex = mod:find("g9-battle-engine")
+    -- Gen 2 resolves turns through g9-battle-engine and needs it.  Gen 1
+    -- has no model the engine can drive (see native.lua's combat-authority
+    -- note), so the engine mod is optional there and the native Gen 1 engine
+    -- resolves instead -- the assert is Gen 2 only.
+    if N.isGen2 then
+      assert(g9dex and g9dex.exports and g9dex.exports.resolveTurnActions,
+        "g9-Battle-Scene: g9-battle-engine not loaded or missing resolveTurnActions")
+    end
     -- A SCENE MUST REPLACE A BATTLE, NEVER LAYER OVER ONE.
     --
     -- buildBattle below calls Battle.new, and Battle.new emits
@@ -3924,6 +6653,13 @@ return function(mod)
         .. "holding the battle it was told about is holding the wrong one.")
     end
     local battle = buildBattle(game, data)
+    -- Hand the engine's move-validity query and this live battle to the
+    -- combat module so its move lists can be annotated (Choice move-lock,
+    -- item move-type ban, Taunt/Torment, unmet move conditions). combat.engine
+    -- is nil on a boot that lacks the mod, in which case every annotation is
+    -- skipped and everything else is unchanged.
+    combat.engine = g9dex and g9dex.exports or nil
+    combat.battle = battle
     local inst = Screen.new(game, world, data, combat, game.data, battle, g9dex)
     -- Also what mod.exports.askBattleChoice resolves against -- see
     -- resolvePromptTarget, which reads this same reference rather than
@@ -4104,5 +6840,62 @@ return function(mod)
     return true
   end
 
-  mod.log:info("g9_Battle_Scene: battle_screen installed (prompt API: askBattleChoice, battleChoiceActive, cancelBattleChoice)")
+  ------------------------------------------------------------------
+  -- POSITIONAL SWITCH (public API). The SAME swap the player's own
+  -- SWITCH button performs, exposed so an enemy-side AI -- or any script
+  -- -- can trade the places of two ADJACENT mons. Enemy allies occupy
+  -- roster slots exactly as player allies do (sideColumns fills the
+  -- enemy half leftward from e6 in index order), so "adjacent" is index
+  -- adjacency on either side and one validation serves both. Applied
+  -- immediately: a swap is pure position, so nothing needs to wait for
+  -- the turn to resolve and an AI can reposition mid-turn, the field
+  -- updating on the next frame.
+  -- ------------------------------------------------------------------
+
+  -- swapPositions(target, side, slotA, slotB) -> true | false, reason
+  --   target  this mod's battle Screen, a Battle, or nil for the live one.
+  --   side    "enemy" or "player".
+  --   slots   two ADJACENT roster indices (|slotA - slotB| == 1) holding
+  --           living battlers.
+  mod.exports.swapPositions = function(target, side, slotA, slotB)
+    if side ~= "enemy" and side ~= "player" then
+      return false, "side must be 'enemy' or 'player'"
+    end
+    if type(slotA) ~= "number" or type(slotB) ~= "number" then
+      return false, "slotA and slotB must be numbers"
+    end
+    local screen = resolvePromptTarget(target)
+    if screen == nil then return false, "no live g9-Battle-Scene battle screen" end
+    if screen.exited or screen.phase == "over" then return false, "battle is over" end
+    if math.abs(slotA - slotB) ~= 1 then return false, "slots must be adjacent" end
+    local list = (side == "enemy") and screen.enemyBattlers or screen.playerBattlers
+    local a, b = list[slotA], list[slotB]
+    if not (a and b) then return false, "no battler in that slot" end
+    if not screen.combat.isAlive(a) or not screen.combat.isAlive(b) then
+      return false, "a battler in that slot has fainted"
+    end
+    list[slotA], list[slotB] = b, a
+    return true
+  end
+
+  -- swapCandidates(target, side, slot) -> array of slot indices | nil, reason
+  -- The query an enemy AI pairs with swapPositions: which of `slot`'s
+  -- neighbours it can legally trade places with, empty when none.
+  mod.exports.swapCandidates = function(target, side, slot)
+    if side ~= "enemy" and side ~= "player" then
+      return nil, "side must be 'enemy' or 'player'"
+    end
+    if type(slot) ~= "number" then return nil, "slot must be a number" end
+    local screen = resolvePromptTarget(target)
+    if screen == nil then return nil, "no live g9-Battle-Scene battle screen" end
+    local list = (side == "enemy") and screen.enemyBattlers or screen.playerBattlers
+    local out = {}
+    for _, j in ipairs({ slot - 1, slot + 1 }) do
+      local b = list[j]
+      if b and screen.combat.isAlive(b) then out[#out + 1] = j end
+    end
+    return out
+  end
+
+  mod.log:info("g9_Battle_Scene: battle_screen installed (prompt API: askBattleChoice, battleChoiceActive, cancelBattleChoice; switch API: swapPositions, swapCandidates)")
 end
