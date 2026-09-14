@@ -3748,18 +3748,20 @@ return function(mod)
   -- throw: the ball itself is the cart's own ANIM_THROW_POKE_BALL object, in
   -- the ball's native colour (N.ballPalette), flown from the thrower's own
   -- sprite onto the target's OWN on-screen sprite position, and the script's
-  -- own catch loop then wobbles it with the native GetPokeBallWobble re-rolls
-  -- before the answer comes back -- see Screen:startCatchAnim.  The catch
+  -- own catch loop then wobbles it to match -- the exact number of shakes the
+  -- selected formula rolled (SV, Gen II or Gen I; see the CATCH FORMULA mod
+  -- option and native.lua's CATCH RATE block) -- before the answer comes back;
+  -- see Screen:startCatchAnim.  The catch
   -- RESOLVES on the frame that animation ends (Screen:resolveCatchAnim), so a
   -- ball thrown here looks like the cart's own rather than an instant dice
   -- roll.  When the animation cannot run -- a stock Gen 1 boot with no Gen 2
   -- anim data -- the catch resolves on the spot exactly as it always used to.
   --
-  -- Not yet decremented from the bag -- save's real item-count shape wasn't
-  -- confirmed against this session's own research, and writing a guessed shape
-  -- risks corrupting the save outright, so this is an explicit, stated gap
-  -- rather than a silent guess.  Either way a miss still consumes this slot's
-  -- action for the turn, the same as a move would.
+  -- The ball LEAVES THE BAG on every valid throw (miss or catch), through
+  -- N.consumeItem -- UseDisposableItem on Gen 2, Bag.remove on Gen 1.  The
+  -- screen used to state the opposite as a known gap; the cart only ever
+  -- spends the ball, so that gap is now closed.  Either way a miss still
+  -- consumes this slot's action for the turn, the same as a move would.
   function Screen:throwBall(ballId)
     local target = nil
     for _, e in ipairs(self.enemyBattlers) do
@@ -3770,29 +3772,69 @@ return function(mod)
       self.phase = "actionMenu"
       return
     end
-    -- Real native catch formula -- Gen 2's src/battle/gen2/Catching.lua or Gen
-    -- 1's src/battle/Catching.lua, chosen by the backend (native.lua), same
-    -- options shape g2-Battle-Scene's own (now-dropped) catch.lua always
-    -- built. Passing a real `battle` here is the one upgrade native gives
-    -- us: on Gen 2 Catching.attempt calls battle:caught(mon) itself on a
-    -- successful catch (Transform reload, the battle.catch_exp hook).
+    ballId = ballId or "POKE_BALL"
+    N.consumeItem(self.game.save, ballId)
+    -- The selected catch formula, in the backend -- see the CATCH RATE block
+    -- in native.lua (the CATCH FORMULA mod option picks Gen IX, Gen II or
+    -- Gen I).  The options carry the whole formula's context: the HP and
+    -- species rate, the wild mon's level and status, and what the conditional
+    -- balls read (the player's lead, its gender/species, weight, typing,
+    -- fishing and dex state).  Terms with no Gen 1/Gen 2 counterpart (badges,
+    -- dark grass, capture power) are simply absent and stay neutral.  Passing
+    -- a real `battle` keeps the Gen 2 captured tail: Battle:caught on a
+    -- success (Transform reload, the battle.catch_exp hook).  The raw dex
+    -- `weight` (tenths of a pound) rides alongside `weightKg` because the Gen
+    -- II Heavy Ball reads the cart's own tenths-of-a-pound value.
     local def = self.data.pokemon and self.data.pokemon[target.mon.species]
-    local caught, rate = N.catchAttempt({
-      ball = ballId or "POKE_BALL",
+    local dexEntry = def and def.dexEntry
+    local lead = self.playerBattlers[self.actingSlotIdx or 1]
+      or self.playerBattlers[1]
+    local leadMon = lead and lead.mon
+    local dex = self.game.save and self.game.save.pokedex
+    local caughtDex = dex and (dex.caught or dex.owned)
+    local caught, shakes, a, chance = N.catchAttempt({
+      ball = ballId,
       mon = target.mon,
       def = def,
       hp = target.mon.hp,
       maxHp = maxHpOf(target.mon),
       catchRate = def and def.catchRate,
       status = target.mon.status,
+      level = target.mon.level,
+      playerLevel = leadMon and leadMon.level,
+      speed = target.mon.stats and target.mon.stats.speed,
+      species = target.mon.species,
+      playerSpecies = leadMon and leadMon.species,
+      types = def and (def.types or def.type),
+      weightKg = dexEntry and dexEntry.weight
+        and (dexEntry.weight * 0.045359237) or nil,
+      weight = dexEntry and dexEntry.weight,
+      gender = target.mon.gender,
+      playerGender = self.game.save and self.game.save.player
+        and self.game.save.player.gender,
+      fishing = self.battle and self.battle.fishing,
+      registered = caughtDex and caughtDex[target.mon.species] and true or false,
+      turn = self.battle and self.battle.turn,
       battle = self.battle,
-      random = self.battle.random,
+      random = self.battle and self.battle.random,
     })
+    -- BOSS CATCH: a wild boss is always caught.  Forced onto the pending
+    -- result BEFORE startCatchAnim below, so the native ball plays the
+    -- wobble count it is actually reporting (three shakes and a click)
+    -- rather than a losing roll that was about to be overridden anyway.
+    -- See special_boss.lua's own header for the option and the 1-HP half.
+    local specialBoss = mod.exports.specialBoss
+    if specialBoss and specialBoss.bossCatchApplies
+        and specialBoss.bossCatchApplies(self.battle, target.mon) then
+      caught, shakes = true, 3
+    end
     local pending = {
-      ballId = ballId or "POKE_BALL",
+      ballId = ballId,
       target = target,
       caught = caught and true or false,
-      rate = rate or 0,
+      shakes = shakes or 0,
+      rate = a or 0,
+      chance = chance,
     }
     -- Play the game's own throw/catch animation first when the native anim
     -- data is there; the answer is held on self.catchPending and reported
@@ -3810,10 +3852,14 @@ return function(mod)
   -- catch does, only how it is shown.
   function Screen:finishBallThrow(pending)
     local target, caught = pending.target, pending.caught
-    local rate = pending.rate
     local name = target.mon.nickname or target.mon.name or target.mon.species
     if not caught then
-      self.message = name .. " broke free! (rate " .. tostring(rate) .. "/255)"
+      -- The cart's own line for this wobble count, in the voice of whichever
+      -- generation the CATCH FORMULA option selected (the backend owns the
+      -- wording).  The old debug "(rate N/255)" is gone -- the rate is a
+      -- property of the throw, not of how close the ball came, and the shake
+      -- count IS the roll's own check result.
+      self.message = N.ballMissMessage(pending.shakes)
       self:advanceSlotOrResolve()
       return
     end
@@ -3825,7 +3871,7 @@ return function(mod)
     self.game.save.party = self.game.save.party or {}
     if #self.game.save.party < 6 then
       self.game.save.party[#self.game.save.party + 1] = target.mon
-      self.overMessage = "Gotcha! " .. name .. " was caught!"
+      self.overMessage = N.caughtMessage(name)
     else
       -- A full party sends the catch to the CURRENT BOX, the same as
       -- `.SendToPC` / `predef SendMonIntoBox` (item_effects.asm:548-550, 604).
@@ -3834,11 +3880,11 @@ return function(mod)
       -- native src/pokemon/Boxes.lua deposit.
       local okBox, where = N.depositCatch(self.game.save, target.mon)
       if okBox then
-        self.overMessage = "Gotcha! " .. name .. " was caught!" .. (where or "")
+        self.overMessage = N.caughtMessage(name) .. (where or "")
       else
         -- Said honestly rather than claiming a catch that did not happen.
-        self.overMessage = "Gotcha! " .. name
-          .. " was caught! ...but the PC could not be reached."
+        self.overMessage = N.caughtMessage(name)
+          .. " ...but the PC could not be reached."
       end
     end
     self.outcome = "caught"
@@ -4589,9 +4635,10 @@ return function(mod)
   --     anim_if_param_equal rows branch on;
   --   * hBattleTurn -- 0 regardless of turn order, because the ball is always
   --     thrown from the player's side (src/ui/gen2/BattleState.lua:3286-3294);
-  --   * pokeballWobble -- the REAL GetPokeBallWobble re-roll (N.ballWobble)
-  --     over the catch answer this screen already computed, so the number of
-  --     wobbles is the cart's own and not a fixed one.
+  --   * pokeballWobble -- the catch answer this screen already computed,
+  --     replayed as the modern formula's own shake count
+  --     (N.ballWobbleFromChecks), so the cartoon and the dice agree instead of
+  --     the wobble count being re-rolled independently of the rate.
   --
   -- POSITION.  The native script's ball flies vanilla's fixed single-battle
   -- arc, but a doubles landing spot is a per-slot platform, so the object
@@ -4640,8 +4687,11 @@ return function(mod)
     if vdy ~= 0 then scaleY = (targetAnchor.y - actorAnchor.y) / vdy end
     self.animView = self.animView or
       BattleAnimView.new(animsData, N.paletteData(self.data))
-    local wobble = N.ballWobble(pending.caught, pending.rate,
-      self.battle and self.battle.random)
+    -- The modern formula decided the wobble count (its four shake checks);
+    -- this hands the ball's own script that exact count, so the cartoon and
+    -- the dice agree -- a caught mon wobbles three times and clicks, a
+    -- failure wobbles 0-3 times and breaks free.
+    local wobble = N.ballWobbleFromChecks(pending.caught, pending.shakes)
     local runner = AnimRunner.new({
       data = animsData,
       constants = N.constantsData(self.data),
@@ -5080,7 +5130,9 @@ return function(mod)
     local scaleX, scaleY = gen1AnimRemap(actorAnchor, targetAnchor,
       VANILLA_PLAYER_ANCHOR, VANILLA_ENEMY_ANCHOR)
     local ball = pending.ballId or "POKE_BALL"
-    local shakes = pending.rate or 0
+    -- The modern formula's own wobble count (its four shake checks), which
+    -- the native SHAKE_ANIM plays once per wobble.
+    local shakes = pending.shakes or 0
     -- BattleState:ballChain's own decision tree (:5478-5496): a clean miss
     -- (not caught, zero shakes) stops after the poof with the mon never
     -- hiding; anything else hides the mon and shakes it; a breakout then
@@ -5337,6 +5389,12 @@ return function(mod)
     -- than falling into finishTurn, which would declare the trainer
     -- beaten with a full reserve team unused. Returns false (and lets
     -- finishTurn run) when there is nothing left to send.
+    -- A player battler can faint with a healthy party reserve still in hand.
+    -- Native answers that by opening the party list and refusing to let the
+    -- player back out before the turn is allowed to be declared over -- see
+    -- Screen:advancePlayerReplacement. Sits ahead of the enemy replacement so
+    -- the player is back in the fight before the trainer answers.
+    if self:advancePlayerReplacement() then return end
     if self:advanceEnemyReplacement() then return end
     self:finishTurn()
   end
@@ -5442,9 +5500,220 @@ return function(mod)
     return false
   end
 
+  ------------------------------------------------------------------
+  -- FORCED PLAYER REPLACEMENT -- a fielded battler faints while the party
+  -- still holds a healthy mon. What native does about it: the party list
+  -- opens and the player is NOT allowed to back out (Gen 2's own
+  -- "forced-switch" phase, src/ui/gen2/BattleState.lua:2906-2926 and
+  -- :3048-3117). This screen drives its own turn loop, so it has to raise
+  -- that prompt itself -- the tail of Screen:advanceResolving calls
+  -- Screen:advancePlayerReplacement before the turn can be declared over.
+  --
+  -- A pick fills the FAINTED SLOT (self.playerBattlers[slot]) rather than
+  -- appending: the field keeps its shape and the incoming mon stands exactly
+  -- where the one it replaced stood. One slot at a time -- two battlers can
+  -- faint on the same turn, and each gets its own prompt and its own "Go, X!"
+  -- beat rather than both being clobbered together.
+  ------------------------------------------------------------------
+  local FORCED_SWITCH_TEXT = "choose your next pokemon"
+
+  -- The player's still-usable reserve: every party mon that is neither on the
+  -- field nor already down. Identity against the battler wrappers, because the
+  -- active mons ARE save.party entries (they share the table) -- a fainted
+  -- active mon must never count as its own replacement.
+  function Screen:playerBench()
+    local bench = {}
+    local party = (self.game.save and self.game.save.party) or {}
+    for _, mon in ipairs(party) do
+      if (mon.hp or 0) > 0 then
+        local active = false
+        for _, b in ipairs(self.playerBattlers) do
+          if b.mon == mon then active = true break end
+        end
+        if not active then bench[#bench + 1] = mon end
+      end
+    end
+    return bench
+  end
+
+  -- The player is beaten only when the field AND the reserve are both down --
+  -- the whole party fainted, not just the mons that happened to be out.
+  -- Screen:finishTurn reads this instead of a bare sideDefeated, so a battle is
+  -- not lost while a healthy mon is still sitting in the party.
+  function Screen:playerSideDefeated()
+    if not self.combat.sideDefeated(self.playerBattlers) then return false end
+    return #self:playerBench() == 0
+  end
+
+  -- Fills the first fainted active slot with a forced pick. Returns true while
+  -- a pick is pending (the caller holds the turn) and false when there is
+  -- nothing to do, so the tail can fall through to the enemy replacement and
+  -- finishTurn. A no-op when the enemy side is already finished: winning ends
+  -- the battle, and forcing a replacement into a won fight would be wrong.
+  function Screen:advancePlayerReplacement()
+    if self:enemySideDefeated() then return false end
+    if #self:playerBench() == 0 then return false end
+    for slot, battler in ipairs(self.playerBattlers) do
+      if not self.combat.isAlive(battler) then
+        self:openForcedSwitch(slot)
+        return true
+      end
+    end
+    return false
+  end
+
+  -- Opens the native party list in its forced dress -- no cancel: a cancel
+  -- attempt prints FORCED_SWITCH_TEXT and the player is put back on the list.
+  -- `open` is kept on the screen so a Gen 1 cancel (which closes the native
+  -- list before telling us) can reopen it.
+  function Screen:openForcedSwitch(slot)
+    local save = self.game.save
+    local open
+    open = function()
+      local list
+      if N.isGen2 then
+        -- No BattleMonMenu, so A answers straight away, and the list owns its
+        -- own update -- B / the CANCEL row calls onCancel and leaves the list
+        -- standing, which is the "stay put" the refusal wants.
+        list = Screens.push(self.game, N.partyMenuId(), {
+          save = save,
+          party = save.party,
+          prompt = "which",
+          onCancel = function() self:refuseForcedCancel(slot, list) end,
+          onChoose = function(index, mon) self:chooseForcedMon(slot, mon, list) end,
+        })
+      else
+        -- forceSwitch + pickOnly makes A call onSwitch immediately; keepOpen
+        -- stops the picker closing itself so a refused pick stays on screen
+        -- (the same shape the medicine flow uses). B still pops the list
+        -- before onCancel -- refuseForcedCancel puts the player back.
+        list = Screens.push(self.game, N.partyMenuId(), {
+          save = save,
+          party = save.party,
+          forceSwitch = true,
+          pickOnly = true,
+          keepOpen = true,
+          onSwitch = function(mon, menu) self:chooseForcedMon(slot, mon, list) end,
+          onCancel = function() self:refuseForcedCancel(slot, list) end,
+        })
+      end
+    end
+    self.forcedSwitchOpen = open
+    self.phase = "submenu"
+    if not (self.game and self.game.stack) then
+      -- No state stack to open a list on (headless): take the first healthy
+      -- reserve mon so the turn can never deadlock on an unseen prompt.
+      local bench = self:playerBench()
+      if bench[1] then self:applyForcedSwitch(slot, bench[1]) end
+      return
+    end
+    open()
+  end
+
+  -- A pick from the forced list. The two refusals mirror Screen:trySwitchIn's
+  -- own -- a fainted mon, or one already standing on the field -- and leave the
+  -- list up so the player keeps choosing.
+  function Screen:chooseForcedMon(slot, mon, list)
+    local reason
+    if (mon.hp or 0) <= 0 then
+      reason = displayName(mon) .. " has no energy left to battle!"
+    else
+      for _, b in ipairs(self.playerBattlers) do
+        if b.mon == mon and self.combat.isAlive(b) then
+          reason = displayName(mon) .. " is already in battle!"
+          break
+        end
+      end
+    end
+    if reason then
+      if list then list:refuse(reason) end
+      return
+    end
+    if list then
+      if N.isGen2 then self.game.stack:pop()
+      elseif list.close then list:close()
+      else self.game.stack:pop() end
+    end
+    self:applyForcedSwitch(slot, mon)
+  end
+
+  -- "We return player to party screen." Gen 2's list is still standing under
+  -- its own refusal, so the line prints in place; Gen 1 already closed itself,
+  -- so the line gets its own box and the list is reopened behind it.
+  function Screen:refuseForcedCancel(slot, list)
+    if N.isGen2 then
+      if list then list:refuse(FORCED_SWITCH_TEXT) end
+      return
+    end
+    local TextBox = require("src.render.TextBox")
+    self.game.stack:push(TextBox.new(self.game, FORCED_SWITCH_TEXT, function()
+      self.suppressInputFrame = true
+      if self.forcedSwitchOpen then self.forcedSwitchOpen() end
+    end))
+  end
+
+  -- Puts `mon` into the fainted slot and hands control back to the turn chaser.
+  -- The "Go, X!" line is a normal resolving beat: the NEXT press runs
+  -- Screen:advanceResolving again, which fills any further empty slot before
+  -- the enemy replacement and finishTurn get their turn.
+  function Screen:applyForcedSwitch(slot, mon)
+    local outgoing = self.playerBattlers[slot]
+    self.playerBattlers[slot] = self.combat.newBattler(mon, "player")
+    -- Same switch-in announcement the voluntary switch and the enemy
+    -- replacement raise (see Screen:advanceResolving): the engine's per-mon
+    -- switch-in bookkeeping (the arriving mon's Fake Out/First Impression
+    -- counter, the departing mon's Choice lock) has to run here too.
+    if Runtime and Runtime.emit then
+      Runtime.emit("battle.battler_switched", {
+        battle = self.battle,
+        previous = outgoing and outgoing.mon or nil,
+        battler = mon,
+      })
+    end
+    self.shownHp[mon] = mon.hp or 0
+    self.currentMessage = "Go, " .. displayName(mon) .. "!"
+    self.forcedSwitchOpen = nil
+    -- The press that confirmed the pick must not also be read as the press
+    -- that acknowledges the "Go, X!" line -- the same one-frame guard every
+    -- other native-menu callback in this file sets.
+    self.suppressInputFrame = true
+    self.phase = "resolving"
+  end
+
+  -- A beaten trainer pays up -- the one thing native's win sequence does that
+  -- a scene battle otherwise never did.  A battle drawn through this screen
+  -- replaces native's own, so nothing else pays: native Gen 2 hands it out in
+  -- WinTrainerBattle (Battle:awardPrizeMoney) and native Gen 1 in
+  -- BattleState:enemyMonFainted, and both run on the battle screen this scene
+  -- stands in for.  The routine is the generation's own, reached through the
+  -- backend (N.awardTrainerPrize -- the engine's Prize module on Gen 2, Gen 1's
+  -- baseMoney x level on Gen 1), so the amount is vanilla rather than an
+  -- approximation.  Wild fights, a run and a loss pay nothing; a legacy
+  -- nameless trainer (self.trainerData == true) has no baseMoney and so no
+  -- payout either.  Idempotent against self.prize so a second call -- the
+  -- screen can only reach this once, but the guard costs nothing -- cannot pay
+  -- twice.  The line native prints is folded into the over screen's own
+  -- message, since this screen's over screen is a single field the player
+  -- reads before pressing A out of the battle.
+  function Screen:awardTrainerPrize()
+    if self.prize ~= nil then return self.prize end
+    self.prize = false
+    if not (self.outcome == "win" and self.isTrainerBattle) then return false end
+    local award = N.awardTrainerPrize(self.battle, self.game.save,
+      self.trainerData)
+    if not award then return false end
+    self.prize = award
+    if award.text and award.text ~= "" then
+      self.overMessage = (self.overMessage or "")
+        .. (self.overMessage and self.overMessage ~= "" and " " or "")
+        .. award.text
+    end
+    return award
+  end
+
   function Screen:finishTurn()
     local enemiesDown = self:enemySideDefeated()
-    local playersDown = self.combat.sideDefeated(self.playerBattlers)
+    local playersDown = self:playerSideDefeated()
     if enemiesDown or playersDown then
       self.phase = "over"
       -- Starred here, not in updateOver: the blackout clock runs for the
@@ -5464,6 +5733,11 @@ return function(mod)
           self.overMessage = "You won the battle!"
         end
         self.outcome = "win"
+        -- A beaten trainer pays up (see Screen:awardTrainerPrize): the money
+        -- lands before the screen exits -- "at the end of the fight, after
+        -- defeating the enemy", native's own beat -- and its line joins the
+        -- over screen's message.
+        self:awardTrainerPrize()
       else
         self.overMessage = "Your team was defeated..."
         self.outcome = "lose"
@@ -5608,8 +5882,9 @@ return function(mod)
   -- file. Its two answers reach for two methods this screen already had
   -- before this feature existed, both public on the instance handed to
   -- the callback:
-  --   * catch  -> screen:throwBall(ballId), which runs the real native
-  --     formula (Catching.attempt calls battle:caught(mon) itself) and
+  --   * catch  -> screen:throwBall(ballId), which runs the modern
+  --     (Scarlet/Violet) formula and, on Gen 2, the native captured tail
+  --     (Battle:caught) on success -- and spends one ball from the bag -- and
   --     sets self.outcome="caught" / self.phase="over" on success.
   --   * leave  -> screen:chooseMenuItem("RUN"), which sets
   --     self.outcome="run", calls self:finishBattleExit() and pops.
@@ -6653,6 +6928,16 @@ return function(mod)
         .. "holding the battle it was told about is holding the wrong one.")
     end
     local battle = buildBattle(game, data)
+    -- Wild-boss special properties (SPECIAL BOSSES / SHINY BOSS) and the
+    -- BOSS CATCH marker -- see special_boss.lua's own header.  Runs BEFORE
+    -- Screen.new on purpose: the shiny flag decides which sprite the intro
+    -- fades in, the engine's stored tera/dynamax fields are what the screen
+    -- and the eventual catch both read, and the boss's stats are recomputed
+    -- here so the first HP bar matches.  A non-boss layout, or a TRAINER
+    -- routed to the bossFight layout, is left completely alone.
+    if mod.exports.specialBoss and mod.exports.specialBoss.applyWildBoss then
+      pcall(mod.exports.specialBoss.applyWildBoss, battle, game, data)
+    end
     -- Hand the engine's move-validity query and this live battle to the
     -- combat module so its move lists can be annotated (Choice move-lock,
     -- item move-type ban, Taunt/Torment, unmet move conditions). combat.engine
@@ -6726,8 +7011,9 @@ return function(mod)
   -- one public method call, and neither is wrapped in a helper here (the
   -- section header explains why):
   --
-  --   screen:throwBall("POKE_BALL")   -- real native Catching.attempt;
-  --       on a catch it files the mon, sets outcome="caught" and moves
+  --   screen:throwBall("POKE_BALL")   -- modern SV catch formula;
+  --       spends one ball, and on a catch files the mon, sets
+  --       outcome="caught" and moves
   --       to "over" (the player presses A and the screen pops); on a
   --       break-free it consumes the acting slot's action and resolves
   --       the turn, exactly as a ball thrown from the BAG would. Note it

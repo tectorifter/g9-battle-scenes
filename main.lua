@@ -27,6 +27,14 @@
 -- by name via mod.exports.pushLayoutBattle (e.g. "bossFight", "horde",
 -- "singles") and supplies the actual battler roster;
 -- battle_screen.lua reads that preset's GUI/sprite positions.
+--
+-- One thing here is NOT scene machinery: player_guard.lua is a crash fix for
+-- the BASE engine's player (a target-less walk-in-place beat assigns
+-- cellX = nil and the next line dies -- see that file's own header).  It is
+-- installed first because it must be in place before any frame can run, and
+-- because this mod is the one every routed battle leaves through -- so the
+-- hazard that plays over the hero around a fight is covered here once for
+-- every caller rather than in each of them.
 local function loadSibling(mod, filename)
   local body, readErr = mod:read(filename)
   assert(body, readErr)
@@ -35,13 +43,44 @@ local function loadSibling(mod, filename)
   return chunk()
 end
 
+-- A sibling that is plain data (returns a table), not a `return function(mod)`
+-- module -- options.lua, this mod's options schema.
+local function loadDataSibling(mod, filename)
+  local body, readErr = mod:read(filename)
+  assert(body, readErr)
+  local chunk, err = loadstring(body, "@" .. mod.path .. "/" .. filename)
+  assert(chunk, err)
+  return chunk()
+end
+
 return function(mod)
-  -- Generation backend FIRST: battle_screen.lua asserts it, and it is what
+  -- Base-engine crash fix FIRST, before anything else this mod does: the
+  -- player step guard must be in place before any frame can run.  See
+  -- player_guard.lua's own header for the crash and why it lives here.
+  loadSibling(mod, "player_guard.lua")(mod)
+  -- Generation backend next: battle_screen.lua asserts it, and it is what
   -- makes one scene source serve both Gold/Silver and Red/Blue/Yellow.
   -- See native.lua's own header for the split.
   loadSibling(mod, "native.lua")(mod)
+  -- Player-facing options (the manager renders these rows; the CATCH FORMULA
+  -- choice is what native.lua's CATCH RATE block reads per throw).  The same
+  -- table is the manifest's options_schema, so the manager can render it even
+  -- while this mod is disabled; define() here is what gives mod.options:get
+  -- its defaults at runtime.
+  if mod.options and type(mod.options.define) == "function" then
+    local ok, rows = pcall(loadDataSibling, mod, "options.lua")
+    if ok and type(rows) == "table" then mod.options:define(rows) end
+  end
   loadSibling(mod, "layouts.lua")(mod)
   loadSibling(mod, "combat.lua")(mod)
   loadSibling(mod, "battle_screen.lua")(mod)
+  -- Wild-boss options LAST, so battle_screen.lua's own install has already
+  -- run when this registers its battle.damage 1-HP wrap and its exports.
+  -- The screen reads mod.exports.specialBoss lazily at battle time, so the
+  -- order only matters for the wrap's position in the shared chain -- and
+  -- the wrap asks for the highest priority there is anyway (see its own
+  -- header).  See special_boss.lua for BOSS CATCH / SPECIAL BOSSES /
+  -- SHINY BOSS and why they are scoped to a WILD boss fight only.
+  loadSibling(mod, "special_boss.lua")(mod)
   mod.log:info("g9_Battle_Scene: loaded")
 end

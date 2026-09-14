@@ -19,8 +19,11 @@
 --   * Battle model      -- gen2 `Battle.new` (a real model) vs gen1 a
 --                          `BattleState` instance used purely as a model
 --                          (its move executor is the game's own).
---   * Catching          -- gen2 `Catching.attempt({opts})` vs gen1
---                          `Catching.attempt(ball, mon, def, rng, rate, opts)`.
+--   * Catching          -- one switchable rate for both arms, chosen by the
+--                          CATCH FORMULA mod option (options.lua): Gen IX
+--                          (Scarlet/Violet, the default), Gen II or Gen I --
+--                          see the CATCH RATE block below.  The native
+--                          `Catching.attempt` is no longer on the catch path.
 --   * EXP               -- gen2 `Battle:awardExperience` (screen-free model
 --                          method) vs gen1 `Experience.apply` (the pure module
 --                          `BattleState:awardExp` is built on; the method
@@ -136,43 +139,17 @@ return function(mod)
   -- whose items table has no index on the row.
   local POKE_BALL_ID = 5
 
-  -- data/battle/wobble_probabilities.asm WobbleProbabilities: catch rate, then
-  -- the chance out of 255 of wobbling again rather than breaking free.
-  local WOBBLE_PROBABILITIES = {
-    { 1, 63 }, { 2, 75 }, { 3, 84 }, { 4, 90 }, { 5, 95 }, { 7, 103 },
-    { 10, 113 }, { 15, 126 }, { 20, 134 }, { 30, 149 }, { 40, 160 },
-    { 50, 169 }, { 60, 177 }, { 80, 191 }, { 100, 201 }, { 120, 211 },
-    { 140, 220 }, { 160, 227 }, { 180, 234 }, { 200, 240 }, { 220, 246 },
-    { 240, 251 }, { 254, 253 }, { 255, 255 },
-  }
-
-  -- GetPokeBallWobble (engine/battle_anims/pokeball_wobble.asm), which
-  -- ANIM_THROW_POKE_BALL's own checkpokeball loop calls once per wobble: 0
-  -- wobble again, 1 click, 2 break free.  The counter goes up FIRST and the
-  -- fourth call ends the loop -- a caught mon clicks, anything else breaks
-  -- free.  Before that a caught mon always wobbles again and a doomed one
-  -- re-rolls: the first WobbleProbabilities row whose catch rate is at least
-  -- the final rate is the one whose byte the roll has to come in under.
-  -- `rand` is the battle's own random(n) (the scene passes self.battle.random,
-  -- the same function Catching.attempt rolls on).
-  N.ballWobble = function(caught, rate, rand)
-    local wobble = 0
-    return function()
-      wobble = wobble + 1
-      if wobble == 4 then return caught and 1 or 2 end
-      if caught then return 0 end
-      local chance = 0
-      for _, row in ipairs(WOBBLE_PROBABILITIES) do
-        if row[1] >= (rate or 0) then chance = row[2] break end
-      end
-      local roll = 0
-      if type(rand) == "function" then
-        local ok, value = pcall(rand, 256)
-        if ok and type(value) == "number" then roll = value end
-      end
-      return roll < chance and 0 or 2
-    end
-  end
+  -- The wobble hook used to be GetPokeBallWobble
+  -- (engine/battle_anims/pokeball_wobble.asm) itself: the cart re-rolled
+  -- WobbleProbabilities (data/battle/wobble_probabilities.asm) once per wobble
+  -- against the final catch rate, so the number of shakes was a property of
+  -- the animation loop rather than of how the throw resolved.  The catch is
+  -- formula-driven now (see the CATCH RATE block), so the wobble count comes
+  -- out of whichever formula the CATCH FORMULA option selected -- SV's four
+  -- shake checks, Gen II's three, or Gen I's shake tiers -- and is simply
+  -- replayed as the 0/1/2 answer the ball's script branches on
+  -- (N.ballWobbleFromChecks).  The native table is gone with it: keeping both
+  -- would leave two live sources of truth for the same shake.
 
   -- GetBallAnimPal (engine/battle_anims/functions.asm:292): the PAL_BATTLE_OB_*
   -- name the thrown ball wears, resolved for the item being thrown.
@@ -210,6 +187,733 @@ return function(mod)
   end
 
   ------------------------------------------------------------------
+  -- CATCH RATE -- one switchable formula per throw.
+  --
+  -- The CATCH FORMULA mod option (options.lua, default "gen9") chooses which
+  -- generation's capture maths a thrown ball uses.  All three arms return the
+  -- same four values -- caught, shakes (0-3 shown), a, chance -- so the ball's
+  -- animation, the failure line and the catch.rate seam never learn which one
+  -- ran (N.catchAttemptForMode is the single dispatcher; N.catchFormula reads
+  -- the option afresh each throw, so a change lands on the very next ball):
+  --
+  --   gen9  Scarlet/Violet  -- N.modernCatchAttempt (the default).
+  --   gen2  Gold/Silver     -- N.gen2CatchAttempt.
+  --   gen1  Red/Blue/Yellow -- N.gen1CatchAttempt.
+  --
+  -- The scene used to throw balls through the native per-generation rate
+  -- maths (Gen 2 PokeBallEffect's 0..255 roll, Gen 1 ItemUseBall's two-roll
+  -- with a per-ball randMax).  Those numbers are the games' own, and the
+  -- gen1/gen2 arms below are exactly them -- transcribed from the engine's
+  -- own src/battle/Catching.lua and src/battle/gen2/Catching.lua -- while the
+  -- default arm is the modern formula:
+  --
+  --   a = floor( (3*maxHp - 2*hp) / (3*maxHp) * 4096 * darkGrass
+  --              * rate_modified * bonus_ball * badgePenalty )
+  --       * bonus_level * bonus_status * bonus_misc
+  --
+  -- clamped to [1, 1044480] (255 * 4096).  a == 1044480 is certain -- a
+  -- Master Ball, or a rate that saturates.  The wobble count is the
+  -- generation-VI+ four-check model the modern games use:
+  --
+  --   b = floor( 65536 * (a / 1044480) ^ (3/16) )
+  --   four rolls in 0..65535; a check passes when roll < b; the mon is caught
+  --   when all four pass.  The wobbles SHOWN are the checks that passed before
+  --   the first failure, capped at three, so a catch wobbles three times and
+  --   clicks and a failure wobbles 0-3 times and breaks free -- the exact beat
+  --   the cart plays, and the same 0/1/2 answer the ball's animation script
+  --   already branches on.  The Gen I and Gen II arms feed the same shake
+  --   contract: Gen II from its three b(a) shake checks, Gen I from its
+  --   Z = X*Y/255 shake tiers.
+  --
+  -- Three terms of the SV formula have no Gen 1/Gen 2 counterpart and stay 1:
+  -- badgePenalty (SV obedience), darkGrass (Gen V dark grass) and bonus_misc
+  -- (Capture Power / back strike).  They are still read from `opts` so a
+  -- caller that knows them can pass them.
+  ------------------------------------------------------------------
+
+  local CATCH_SCALE = 4096 * 255          -- 1044480: a's ceiling
+  local CATCH_ROLLS = 4                   -- Gen VI+ shake checks
+  local CATCH_SHAKE_EXP = 3 / 16          -- 0.1875
+
+  local function floorNumber(value, fallback)
+    local n = tonumber(value)
+    if not n then return fallback end
+    return math.floor(n)
+  end
+
+  -- A uniform integer in 0..maxExclusive-1.  The scene hands us the running
+  -- battle's own random, which is love.math.random(a, b); a one-argument
+  -- random and love/math.random are the fallbacks so a harness or a trimmed
+  -- engine still rolls rather than raising.
+  local function modernRoll(random, maxExclusive)
+    if type(random) == "function" then
+      local ok, value = pcall(random, 0, maxExclusive - 1)
+      if ok and type(value) == "number" then return math.floor(value) end
+      ok, value = pcall(random, maxExclusive)
+      if ok and type(value) == "number" then return math.floor(value) - 1 end
+    end
+    local rng = (love and love.math and love.math.random) or math.random
+    return math.floor(rng(maxExclusive)) - 1
+  end
+
+  -- bonus_level: SV's curve.  The max() makes the below-level-13 cut-off
+  -- implicit -- at 13 the term reaches 1 and never falls short of it.
+  N.levelBonus = function(level)
+    local lv = floorNumber(level, 0)
+    if lv <= 0 then return 1 end
+    return math.max((36 - 2 * lv) / 10, 1)
+  end
+
+  -- bonus_status, Gen VIII+ numbers: sleep and freeze 2.5, the rest 1.5.  The
+  -- ids are the engine's own (Gen 1 Status.lua and Gen 2 Battle.STATUSES
+  -- agree): SLP, FRZ, PSN, BRN, PAR (TOX if a mod adds it).  Lower-case and
+  -- long names are accepted so a caller's own vocabulary still lands.
+  local STATUS_BONUS_MODERN = {
+    SLP = 2.5, FRZ = 2.5, sleep = 2.5, freeze = 2.5, asleep = 2.5,
+    PSN = 1.5, BRN = 1.5, PAR = 1.5, TOX = 1.5,
+    poison = 1.5, burn = 1.5, paralyze = 1.5, paralysed = 1.5, toxic = 1.5,
+  }
+  N.statusBonus = function(status)
+    if status == nil or status == false or status == "" then return 1 end
+    return STATUS_BONUS_MODERN[status] or 1
+  end
+
+  -- Gen VIII/IX flat ball multipliers.  MASTER/PARK are certainties rather
+  -- than multipliers, so they are handled before the table is consulted.
+  local BALL_MULTIPLIER_MODERN = {
+    POKE_BALL = 1, GREAT_BALL = 1.5, ULTRA_BALL = 2,
+    SAFARI_BALL = 1.5, SPORT_BALL = 1.5,
+    PREMIER_BALL = 1, LUXURY_BALL = 1, HEAL_BALL = 1,
+    FRIEND_BALL = 1, CHERISH_BALL = 1,
+  }
+  local BALL_CERTAIN = { MASTER_BALL = true, PARK_BALL = true }
+
+  local function typesOf(opts)
+    local def = opts.def
+    local list = opts.types or (def and (def.types or def.type))
+    if type(list) ~= "table" then list = { list } end
+    return list
+  end
+
+  local function hasType(opts, upper, mixed)
+    for _, t in ipairs(typesOf(opts)) do
+      if t == upper or t == mixed then return true end
+    end
+    return false
+  end
+
+  local function firstNumber(...)
+    for i = 1, select("#", ...) do
+      local n = tonumber((select(i, ...)))
+      if n then return n end
+    end
+    return nil
+  end
+
+  -- The Moon Ball's modern target list (the Moon Stone evolutionary families;
+  -- the item itself is the Gen 1/2 path, checked alongside).
+  local MOON_STONE_LINE = {
+    NIDORAN_F = true, NIDORINA = true, NIDOQUEEN = true,
+    NIDORAN_M = true, NIDORINO = true, NIDOKING = true,
+    CLEFAIRY = true, CLEFABLE = true,
+    JIGGLYPUFF = true, WIGGLYTUFF = true,
+    SKITTY = true, DELCATTY = true, MUNNA = true, MUSHARNA = true,
+  }
+
+  -- Heavy Ball's weight adjustment (Gen IV onward): additive to the species
+  -- rate, not a multiplier.  Bands in kilograms.
+  local function heavyBallAdjust(kg)
+    if not kg then return 0 end
+    if kg < 100 then return -20 end
+    if kg < 200 then return 0 end
+    if kg < 300 then return 20 end
+    if kg < 400 then return 30 end
+    return 40
+  end
+
+  -- One arm per conditional ball, fn(opts) -> bonus[, rateAdjust].
+  local BALL_ARM_MODERN = {
+    DREAM_BALL = function(opts)
+      local s = opts.status
+      return (s == "SLP" or s == "sleep" or s == "asleep") and 4 or 1
+    end,
+    DIVE_BALL = function(opts) return opts.fishing and 3.5 or 1 end,
+    DUSK_BALL = function(opts) return (opts.night or opts.cave) and 3 or 1 end,
+    NET_BALL = function(opts)
+      if hasType(opts, "WATER", "Water") or hasType(opts, "BUG", "Bug") then
+        return 3.5
+      end
+      return 1
+    end,
+    REPEAT_BALL = function(opts) return opts.registered and 3.5 or 1 end,
+    TIMER_BALL = function(opts)
+      local turns = tonumber(opts.turns) or 0
+      return math.min(1 + 0.3 * turns, 4)
+    end,
+    QUICK_BALL = function(opts)
+      return (tonumber(opts.turn) or 1) <= 1 and 5 or 1
+    end,
+    NEST_BALL = function(opts)
+      local level = tonumber(opts.level) or 100
+      return math.max(1, math.min(4, (41 - level) / 10))
+    end,
+    BEAST_BALL = function(opts) return opts.ultraBeast and 5 or 0.1 end,
+    LEVEL_BALL = function(opts)
+      local level, player = tonumber(opts.level), tonumber(opts.playerLevel)
+      if not (level and player) or level > player then return 1 end
+      if level <= math.floor(player / 4) then return 8 end
+      if level <= math.floor(player / 2) then return 4 end
+      return 2
+    end,
+    LURE_BALL = function(opts) return opts.fishing and 3 or 1 end,
+    FAST_BALL = function(opts)
+      local speed = firstNumber(opts.speed,
+        opts.mon and opts.mon.stats and opts.mon.stats.speed,
+        opts.def and opts.def.speed,
+        opts.def and opts.def.baseStats and opts.def.baseStats.speed)
+      return (speed and speed >= 100) and 4 or 1
+    end,
+    MOON_BALL = function(opts)
+      local species = opts.species or (opts.mon and opts.mon.species)
+      if species and MOON_STONE_LINE[species] then return 3 end
+      local def = opts.def
+      if def and def.evolveItem == "MOON_STONE" then return 3 end
+      return 1
+    end,
+    LOVE_BALL = function(opts)
+      local wild, player = opts.gender, opts.playerGender
+      if not wild or not player or wild == "unknown" or player == "unknown" then
+        return 1
+      end
+      if opts.species ~= opts.playerSpecies then return 1 end
+      return wild ~= player and 8 or 1
+    end,
+    HEAVY_BALL = function(opts) return 1, heavyBallAdjust(opts.weightKg) end,
+  }
+
+  -- The merged `balls` record for a ball id, or nil.  Gen 2 fills
+  -- data.gen2Balls from its loader; a Gen 1 boot may carry one too.
+  N.registeredBall = function(ball, opts)
+    local data = opts.data or (opts.battle and opts.battle.data)
+      or (opts.game and opts.game.data)
+    local balls = opts.balls or (data and (data.gen2Balls or data.balls))
+    return balls and balls[ball] or nil
+  end
+
+  -- bonus_ball (and, for the Heavy Ball, the additive rate_modified tweak).
+  -- Returns bonus, certain, rateAdjust.
+  N.ballBonus = function(ballId, opts)
+    opts = opts or {}
+    local ball = ballId or "POKE_BALL"
+    if BALL_CERTAIN[ball] then return 255, true, 0 end
+    local flat = BALL_MULTIPLIER_MODERN[ball]
+    if flat then return flat, false, 0 end
+    local arm = BALL_ARM_MODERN[ball]
+    if arm then
+      local bonus, adjust = arm(opts)
+      return bonus or 1, false, adjust or 0
+    end
+    -- A ball this table does not know is a mod's own: honour its registry
+    -- record before falling back to a plain ball.
+    local record = N.registeredBall(ball, opts)
+    if record then
+      if record.autoCatch or record.multiplier == math.huge then
+        return 255, true, 0
+      end
+      if type(record.multiplier) == "number" then
+        return record.multiplier, false, 0
+      end
+    end
+    return 1, false, 0
+  end
+
+  -- The modern formula.  Returns caught, shakes (0-3 shown), a, chance.
+  N.modernCatchAttempt = function(opts)
+    opts = opts or {}
+    local ball = opts.ball or "POKE_BALL"
+    local maxHp = math.max(1, floorNumber(opts.maxHp, 1))
+    local hp = math.max(0, math.min(floorNumber(opts.hp, maxHp), maxHp))
+    local speciesRate = tonumber(opts.catchRate) or tonumber(opts.rate) or 45
+
+    local bonus, certain, rateAdjust = N.ballBonus(ball, opts)
+    if certain then return true, 3, CATCH_SCALE, 1 end
+
+    local rateModified = math.max(1, math.min(255,
+      math.floor(speciesRate + (rateAdjust or 0))))
+
+    local hpFactor = (3 * maxHp - 2 * hp) / (3 * maxHp)
+    local a = math.floor(hpFactor * 4096 * (opts.darkGrass or 1)
+      * rateModified * bonus * (opts.badgePenalty or 1))
+    a = math.floor(a * N.levelBonus(opts.level)
+      * N.statusBonus(opts.status) * (opts.misc or 1))
+    if a >= CATCH_SCALE then return true, 3, CATCH_SCALE, 1 end
+    if a < 1 then a = 1 end
+
+    local b = math.floor(65536 * (a / CATCH_SCALE) ^ CATCH_SHAKE_EXP)
+    if b > 65535 then b = 65535 end
+
+    local passed = 0
+    for _ = 1, CATCH_ROLLS do
+      if modernRoll(opts.random, 65536) < b then
+        passed = passed + 1
+      else
+        break
+      end
+    end
+    local caught = passed >= CATCH_ROLLS
+    local chance = (b / 65536) ^ CATCH_ROLLS
+    return caught, math.min(passed, 3), a, chance
+  end
+
+  -- -- status, shared by the Gen I and Gen II arms -------------------
+  -- Both generations keep the cart's three-letter id ("SLP", "FRZ", "PSN",
+  -- "BRN", "PAR"); a table-shaped status is accepted too so a mod's record
+  -- still lands.
+  local function statusKey(opts)
+    local status = opts.status
+    if type(status) == "table" then
+      status = status.id or status.name or status.key
+    end
+    return status
+  end
+
+  local SLEEP_FREEZE = {
+    SLP = true, FRZ = true, slp = true, frz = true,
+    sleep = true, asleep = true, freeze = true, frozen = true,
+  }
+  local OTHER_STATUS = {
+    PSN = true, BRN = true, PAR = true, TOX = true,
+    psn = true, brn = true, par = true, tox = true,
+    poison = true, burn = true, paralyze = true, paralysed = true,
+    paralysis = true, toxic = true,
+  }
+  local function isSleepFreeze(status) return SLEEP_FREEZE[status] == true end
+  local function isOtherStatus(status) return OTHER_STATUS[status] == true end
+
+  -- -- Generation I ---------------------------------------------------
+  -- ItemUseBall (engine/items/item_effects.asm), the numbers the engine's own
+  -- src/battle/Catching.lua carries: each ball has its own catch-roll ceiling
+  -- (randMax), HP factor and wobble divisor (wobbleFactor).  An unknown ball
+  -- falls back to POKE_BALL's roll and the 150 wobble divisor, exactly as that
+  -- module's DEFAULT_BALL does.
+  local GEN1_BALLS = {
+    POKE_BALL   = { randMax = 255, hpFactor = 12, wobbleFactor = 255 },
+    GREAT_BALL  = { randMax = 200, hpFactor = 8,  wobbleFactor = 200 },
+    ULTRA_BALL  = { randMax = 150, hpFactor = 12, wobbleFactor = 150 },
+    SAFARI_BALL = { randMax = 150, hpFactor = 12, wobbleFactor = 150 },
+  }
+  local GEN1_BALL_DEFAULT = { randMax = 255, hpFactor = 12, wobbleFactor = 150 }
+
+  -- Status.recordFor's catchBonus / shakeBonus (src/battle/Status.lua): sleep
+  -- and freeze are worth 25 on the first roll and 10 on the wobble tier,
+  -- poison/burn/paralysis 12 and 5.
+  local function gen1CatchBonus(status)
+    if isSleepFreeze(status) then return 25 end
+    if isOtherStatus(status) then return 12 end
+    return 0
+  end
+  local function gen1ShakeBonus(status)
+    if isSleepFreeze(status) then return 10 end
+    if isOtherStatus(status) then return 5 end
+    return 0
+  end
+
+  -- The HP factor f = floor(floor(maxHp*255/factor) / max(1, floor(hp/4))),
+  -- capped at 255 (the cart shifts HP right twice, so its own /4 is integer).
+  local function gen1HpFactor(maxHp, hp, factor)
+    local f = math.floor(math.floor(maxHp * 255 / factor)
+      / math.max(1, math.floor(hp / 4)))
+    if f < 1 then f = 1 end
+    if f > 255 then f = 255 end
+    return f
+  end
+
+  -- The wobble tiers: Y = rate*100/wobbleFactor, Z = f*Y/255 (+ the status
+  -- shake bonus), Z<10 -> 0 shakes, <30 -> 1, <70 -> 2, else 3.
+  local function gen1Shakes(rate, f, wobbleFactor, status)
+    local y = math.floor(rate * 100 / wobbleFactor)
+    local z
+    if y > 255 then z = 255 else z = math.floor(f * y / 255) end
+    z = z + gen1ShakeBonus(status)
+    if z < 10 then return 0 end
+    if z < 30 then return 1 end
+    if z < 70 then return 2 end
+    return 3
+  end
+
+  -- Gen I's two-roll catch.  `a` is reported as f (the 1..255 HP factor),
+  -- Gen I's own final catch value.
+  N.gen1CatchAttempt = function(opts)
+    opts = opts or {}
+    local ball = opts.ball or "POKE_BALL"
+    if ball == "MASTER_BALL" then return true, 3, 255, 1 end
+    local def = GEN1_BALLS[ball] or GEN1_BALL_DEFAULT
+    local maxHp = math.max(1, floorNumber(opts.maxHp, 1))
+    local hp = math.max(1, math.min(floorNumber(opts.hp, maxHp), maxHp))
+    local rate = tonumber(opts.catchRate) or tonumber(opts.rate) or 45
+    local status = statusKey(opts)
+    local catchBonus = gen1CatchBonus(status)
+    local f = gen1HpFactor(maxHp, hp, def.hpFactor)
+    local outcomes = def.randMax + 1
+    local automatic = math.min(outcomes, catchBonus)
+    local passed = math.min(outcomes, math.max(0, rate + catchBonus + 1))
+    local chance = (automatic + (passed - automatic) * (f + 1) / 256) / outcomes
+    if chance < 0 then chance = 0 elseif chance > 1 then chance = 1 end
+    -- First roll: randMax-wide, less the status bonus.  r < 0 catches on the
+    -- status alone; r above the species rate breaks free before the HP roll.
+    local r = modernRoll(opts.random, outcomes) - catchBonus
+    if r < 0 then return true, 3, f, chance end
+    if r > rate then
+      return false, gen1Shakes(rate, f, def.wobbleFactor, status), f, chance
+    end
+    if modernRoll(opts.random, 256) <= f then return true, 3, f, chance end
+    return false, gen1Shakes(rate, f, def.wobbleFactor, status), f, chance
+  end
+
+  -- -- Generation II --------------------------------------------------
+  -- PokeBallEffect (engine/items/item_effects.asm), the numbers the engine's
+  -- own src/battle/gen2/Catching.lua carries.  `multiplier` is the flat factor
+  -- applied to the species rate; the balls whose factor depends on the battle
+  -- live in GEN2_SPECIALTY below.  MASTER_BALL is handled before this table.
+  local GEN2_MULTIPLIER = {
+    ULTRA_BALL = 2, GREAT_BALL = 1.5,
+    POKE_BALL = 1, SAFARI_BALL = 1.5, PARK_BALL = 1.5, FRIEND_BALL = 1,
+  }
+  -- FastBallMultiplier's cart bug: the loop only ever reaches the first three
+  -- SometimesFleeMons rows, so only these species get the x4.
+  local GEN2_FAST_BALL_SPECIES = {
+    MAGNEMITE = true, GRIMER = true, TANGELA = true,
+  }
+
+  -- HeavyBallMultiplier's weight conversion: the dex weight (tenths of a
+  -- pound) becomes tenths of a kilogram via w/2 - w/32 - w/64, and only its
+  -- HIGH byte is compared.  Additive to the species rate, not a multiplier.
+  local function gen2HeavyBallBoost(weight)
+    local half = math.floor((weight or 0) / 2)
+    local sub1 = math.floor(half / 16)
+    local sub2 = math.floor(sub1 / 2)
+    local high = math.floor((half - sub1 - sub2) / 256)
+    if high < 4 then return -20 end   -- under 102.4 kg
+    if high < 8 then return 0 end     -- under 204.8 kg
+    if high < 12 then return 20 end   -- under 307.2 kg
+    if high < 16 then return 30 end   -- under 409.6 kg
+    return 40
+  end
+
+  -- The first EVOLVE_ITEM a species has, the way the engine's Gen 2 catch site
+  -- derives evolveItem for the Moon Ball.
+  local function evolveItemOf(opts)
+    local evolutions = opts.def and opts.def.evolutions
+    if type(evolutions) ~= "table" then return nil end
+    for _, entry in ipairs(evolutions) do
+      if entry.method == "EVOLVE_ITEM" then return entry.item end
+    end
+    return nil
+  end
+
+  -- BallMultiplierFunctionTable's conditional arms.  Three cart bugs are kept
+  -- deliberately (the engine's module documents them): Fast Ball only knows
+  -- three species, Love Ball boosts SAME-sex pairs, and Moon Ball compares
+  -- against BURN_HEAL (nothing evolves by it) so it never boosts.  Each caps
+  -- at 255 the way every `sla b / jr c` does.
+  local GEN2_SPECIALTY = {
+    HEAVY_BALL = function(rate, opts)
+      if not opts.weight then return rate end
+      return math.max(1, rate + gen2HeavyBallBoost(opts.weight))
+    end,
+    LEVEL_BALL = function(rate, opts)
+      local player, enemy = tonumber(opts.playerLevel), tonumber(opts.level)
+      if not (player and enemy) or enemy >= player then return rate end
+      rate = rate * 2
+      if enemy < math.floor(player / 2) then rate = rate * 2 end
+      if enemy < math.floor(player / 4) then rate = rate * 2 end
+      return math.min(255, rate)
+    end,
+    LURE_BALL = function(rate, opts)
+      if not opts.fishing then return rate end
+      return math.min(255, rate * 3)
+    end,
+    FAST_BALL = function(rate, opts)
+      if not GEN2_FAST_BALL_SPECIES[opts.species] then return rate end
+      return math.min(255, rate * 4)
+    end,
+    MOON_BALL = function(rate, opts)
+      if evolveItemOf(opts) ~= "BURN_HEAL" then return rate end
+      return math.min(255, rate * 4)
+    end,
+    LOVE_BALL = function(rate, opts)
+      if not opts.species or opts.species ~= opts.playerSpecies then
+        return rate
+      end
+      local wild, player = opts.gender, opts.playerGender
+      if not wild or not player or wild == "unknown"
+          or player == "unknown" then
+        return rate
+      end
+      if wild ~= player then return rate end -- the cart's same-sex boost
+      return math.min(255, rate * 8)
+    end,
+  }
+
+  -- rate_modified: the species rate through the flat multiplier or the
+  -- conditional arm, clamped to [1, 255].  Returns rate, certain.
+  local function gen2BallRate(catchRate, ball, opts)
+    local multiplier = GEN2_MULTIPLIER[ball]
+    if multiplier then return math.floor(catchRate * multiplier), false end
+    local arm = GEN2_SPECIALTY[ball]
+    if arm then return arm(catchRate, opts), false end
+    -- A ball this table does not know is a mod's own: honour its merged
+    -- registry record (a numeric multiplier, an autoCatch, or a specialty
+    -- fn), the same fallback the engine's Gen 2 module uses.
+    local record = N.registeredBall(ball, opts)
+    if record then
+      if record.autoCatch or record.multiplier == math.huge then
+        return catchRate, true
+      end
+      if type(record.multiplier) == "number" then
+        return math.floor(catchRate * record.multiplier), false
+      end
+      if type(record.specialty) == "function" then
+        return record.specialty(catchRate, opts), false
+      end
+    end
+    return catchRate, false
+  end
+
+  -- The shake-probability b(a), the cart's WobbleProbabilities table
+  -- (data/battle/wobble_probabilities.asm; Bulbapedia's "Capture method
+  -- (Generation II)" a-ranges give the same numbers).  Each row is
+  -- { aCeiling, b }: the FIRST row whose aCeiling is at least a supplies the
+  -- chance out of 255 that a shake check passes.  This is the exact scan the
+  -- engine's Gen 2 screen performs (src/ui/gen2/BattleState.lua:pokeballWobble,
+  -- `if row[1] >= rate`), transcribed verbatim so the two can be diffed.
+  local GEN2_SHAKE_B = {
+    { 1, 63 }, { 2, 75 }, { 3, 84 }, { 4, 90 }, { 5, 95 }, { 7, 103 },
+    { 10, 113 }, { 15, 126 }, { 20, 134 }, { 30, 149 }, { 40, 160 },
+    { 50, 169 }, { 60, 177 }, { 80, 191 }, { 100, 201 }, { 120, 211 },
+    { 140, 220 }, { 160, 227 }, { 180, 234 }, { 200, 240 }, { 220, 246 },
+    { 240, 251 }, { 254, 253 }, { 255, 255 },
+  }
+  local function gen2ShakeB(a)
+    for _, row in ipairs(GEN2_SHAKE_B) do
+      if row[1] >= a then return row[2] end
+    end
+    return GEN2_SHAKE_B[#GEN2_SHAKE_B][2]
+  end
+
+  -- bonus_status: 10 for sleep or freeze, 0 otherwise.  The cart MEANT 5 for
+  -- burn/poison/paralysis but its `and` test falls through, so those give no
+  -- bonus (the engine's own Gen 2 module reproduces the same bug).
+  local function gen2StatusBonus(status)
+    if isSleepFreeze(status) then return 10 end
+    return 0
+  end
+
+  -- The Gen II catch: modify the species rate by the ball, build `a` from the
+  -- HP term plus the status bonus (with the cart's 8-bit truncation), roll
+  -- `a` for the catch, and only on a failure roll the three shake checks
+  -- against b(a).  A catch is always three wobbles and a click.
+  N.gen2CatchAttempt = function(opts)
+    opts = opts or {}
+    local ball = opts.ball or "POKE_BALL"
+    if ball == "MASTER_BALL" then return true, 3, 255, 1 end
+    local maxHp = math.max(1, floorNumber(opts.maxHp, 1))
+    local hp = math.max(0, math.min(floorNumber(opts.hp, maxHp), maxHp))
+    local speciesRate = tonumber(opts.catchRate) or tonumber(opts.rate) or 45
+
+    local rate, certain = gen2BallRate(speciesRate, ball, opts)
+    if certain then return true, 3, 255, 1 end
+    rate = math.max(1, math.min(255, math.floor(rate)))
+
+    -- The cart shifts both HP terms right twice once 3*maxHp fills a byte, and
+    -- then compares only the low byte of the shifted max; the shifted HP term
+    -- floors at 1.  Kept, because it is what Gold/Silver really does.
+    local tripleMax = maxHp * 3
+    local doubleHp = hp * 2
+    if tripleMax >= 256 then
+      tripleMax = math.floor(tripleMax / 4) % 256
+      doubleHp = math.max(1, math.floor(doubleHp / 4))
+    end
+    tripleMax = math.max(1, tripleMax)
+
+    local a = math.floor((tripleMax - doubleHp) * rate / tripleMax)
+    a = math.max(1, a) + gen2StatusBonus(statusKey(opts))
+    if a > 255 then a = 255 end
+
+    if a >= 255 then return true, 3, a, 1 end
+    local chance = (a + 1) / 256
+    -- The catch check (one byte, caught on roll <= a) resolves the catch
+    -- FIRST; the shake checks only decide how a failure looks.
+    if modernRoll(opts.random, 256) <= a then return true, 3, a, chance end
+    local b = gen2ShakeB(a)
+    local passed = 0
+    for _ = 1, 3 do
+      if modernRoll(opts.random, 256) < b then
+        passed = passed + 1
+      else
+        break
+      end
+    end
+    return false, passed, a, chance
+  end
+
+  -- The selected formula, read from the CATCH FORMULA option at throw time (so
+  -- a change lands on the very next ball, no reload), defaulting to Gen IX
+  -- when the option is absent (a harness, or the mod disabled).
+  local CATCH_FORMULA_DEFAULT = "gen9"
+  local CATCH_FORMULA_KEYS = { gen1 = true, gen2 = true, gen9 = true }
+  N.catchFormula = function()
+    local options = mod and mod.options
+    if options and type(options.get) == "function" then
+      local ok, value = pcall(function() return options:get("catch_formula") end)
+      if ok and CATCH_FORMULA_KEYS[value] then return value end
+    end
+    return CATCH_FORMULA_DEFAULT
+  end
+
+  -- One dispatcher for all three arms, so the throw, the mod seam and the
+  -- failure line follow the option without knowing which formula it names.
+  N.catchAttemptForMode = function(mode, opts)
+    if mode == "gen1" then return N.gen1CatchAttempt(opts) end
+    if mode == "gen2" then return N.gen2CatchAttempt(opts) end
+    return N.modernCatchAttempt(opts)
+  end
+
+  -- The wobble count when only the outcome and the rate are known -- a mod
+  -- that replaced the catch.rate result instead of the formula.  Same
+  -- four-check model; a catch is always shown as three wobbles and a click.
+  N.shakesFor = function(caught, a, random)
+    if caught then return 3 end
+    local rate = tonumber(a) or 0
+    if rate >= CATCH_SCALE then return 3 end
+    if rate < 1 then rate = 1 end
+    local b = math.floor(65536 * (rate / CATCH_SCALE) ^ CATCH_SHAKE_EXP)
+    if b > 65535 then b = 65535 end
+    local passed = 0
+    for _ = 1, CATCH_ROLLS do
+      if modernRoll(random, 65536) < b then passed = passed + 1 else break end
+    end
+    if passed >= CATCH_ROLLS then return 3 end
+    return math.min(passed, 3)
+  end
+
+  -- GetPokeBallWobble's answer, but driven by the modern check count: the
+  -- ball wobbles `shakes` times and the NEXT call is the verdict (1 click,
+  -- 2 break free).  Same 0/1/2 contract as N.ballWobble, so the native
+  -- ANIM_THROW_POKE_BALL script branches on it identically.
+  N.ballWobbleFromChecks = function(caught, shakes)
+    local shown = math.max(0, math.min(3, floorNumber(shakes, 0)))
+    local wobble = 0
+    return function()
+      wobble = wobble + 1
+      if wobble > shown then return caught and 1 or 2 end
+      return 0
+    end
+  end
+
+  -- UseDisposableItem (Gen 2) / Bag.remove (Gen 1): one copy of the thrown
+  -- ball leaves the bag on every valid throw, miss or catch, exactly as the
+  -- cart spends it.  Returns true when a copy was actually removed.
+  N.consumeItem = function(save, ballId)
+    if not (save and ballId) then return false end
+    local inventory = save.inventory
+    if type(inventory) ~= "table" or inventory[ballId] == nil then
+      return false
+    end
+    if not N.isGen2 then
+      local Bag = tryRequire("src.inventory.Bag")
+      if Bag and type(Bag.remove) == "function" then
+        Bag.remove(save, ballId, 1)
+        return true
+      end
+    end
+    inventory[ballId] = math.max(0, (tonumber(inventory[ballId]) or 1) - 1)
+    if inventory[ballId] == 0 then inventory[ballId] = nil end
+    return true
+  end
+
+  -- The four failure lines, indexed by the number of wobbles shown.  Gen IX
+  -- and Gen II share the Crystal/common_3.asm set (data/text/common_3.asm:239-
+  -- 258); Gen I rolls its own (ItemUseBallText01..04, text_6.asm:29-35), where
+  -- a 0-shake result really is "the Ball missed" and every tier reads
+  -- differently.  The line follows whichever formula the CATCH FORMULA option
+  -- selected, so a Gen I throw fails in Gen I's voice.
+  local BALL_FAILURE_TEXT = {
+    "Oh no! The POKéMON broke free!",
+    "Aww! It appeared to be caught!",
+    "Aargh! Almost had it!",
+    "Shoot! It was so close too!",
+  }
+  local BALL_FAILURE_TEXT_GEN1 = {
+    "You missed the POKéMON!",
+    "Darn! The POKéMON broke free!",
+    "Aww! It appeared to be caught!",
+    "Shoot! It was so close too!",
+  }
+  N.ballMissMessage = function(shakes)
+    local count = math.max(0, math.min(3, floorNumber(shakes, 0)))
+    if N.catchFormula() == "gen1" then
+      return BALL_FAILURE_TEXT_GEN1[count + 1]
+    end
+    return BALL_FAILURE_TEXT[count + 1]
+  end
+
+  -- The caught line, likewise per generation: Gen I announces a catch with
+  -- "All right! %s was caught!" (data/text/text_6.asm:29, ItemUseBallText05)
+  -- while Gen II onwards use "Gotcha! %s was caught!" (data/text/common_3.asm
+  -- :265, Text_BallCaught).  The caught tail is identical either way, so only
+  -- the wording follows the CATCH FORMULA option.
+  N.caughtMessage = function(name)
+    if N.catchFormula() == "gen1" then
+      return "All right! " .. name .. " was caught!"
+    end
+    return "Gotcha! " .. name .. " was caught!"
+  end
+
+  -- The whole modern attempt, behind the mod catch.rate hook.  The hook
+  -- contract is unchanged -- (ball, mon, def, opts) in, `caught, rate` out --
+  -- with `rate` now the modern `a`; the wrapper also forwards `shakes` and
+  -- `chance` so a pass-through chain keeps the exact wobble count it rolled.
+  -- A mod that returns only `caught, rate` gets the count re-derived from the
+  -- rate it chose (N.shakesFor).
+  local function vanillaCatchHook(_, _, _, o)
+    local caught, shakes, a, chance = N.catchAttemptForMode(N.catchFormula(), o)
+    return caught, a, shakes, chance
+  end
+
+  N.runCatch = function(opts)
+    opts = opts or {}
+    local Runtime = tryRequire("src.mods.Runtime")
+    local caught, a, shakes, chance
+    if Runtime and type(Runtime.call) == "function" then
+      caught, a, shakes, chance = Runtime.call("catch.rate", vanillaCatchHook,
+        opts.ball or "POKE_BALL", opts.mon, opts.def, opts)
+    end
+    if caught == nil then
+      caught, shakes, a, chance = N.catchAttemptForMode(N.catchFormula(), opts)
+    else
+      caught = caught and true or false
+      a = a or 0
+      if shakes == nil then shakes = N.shakesFor(caught, a, opts.random) end
+    end
+    if shakes == nil then shakes = 0 end
+    return caught, shakes, a, chance
+  end
+
+  N.ballThrownWanted = function()
+    local Runtime = tryRequire("src.mods.Runtime")
+    return (Runtime and type(Runtime.wants) == "function"
+      and Runtime.wants("battle.ball_thrown")) and true or false
+  end
+
+  N.emitBallThrown = function(payload)
+    local Runtime = tryRequire("src.mods.Runtime")
+    if Runtime and type(Runtime.emit) == "function" then
+      Runtime.emit("battle.ball_thrown", payload)
+    end
+  end
+
+  ------------------------------------------------------------------
   -- GENERATION 2 -- the real modules and data fields, unchanged.
   ------------------------------------------------------------------
   if N.isGen2 then
@@ -239,6 +943,11 @@ return function(mod)
 
     N.isBall = function(id, def) return def ~= nil and def.pocket == "BALL" end
 
+    -- The engine's own prize-money routine (WinTrainerBattle's money arm,
+    -- engine/battle/core.asm:2310-2323), required lazily so a boot without the
+    -- module still loads the scene.
+    local Prize = tryRequire("src.battle.gen2.Prize")
+
     N.buildBattle = function(opts) return N.Battle.new(opts) end
     N.newStages = function() return N.Battle.newStages() end
     N.takeEvents = function(battle) return battle:takeEvents() end
@@ -259,7 +968,57 @@ return function(mod)
 
     N.awardExperience = function(battle, loser) battle:awardExperience(loser) end
 
-    N.catchAttempt = function(opts) return N.Catching.attempt(opts) end
+    -- Prize money for beating a trainer -- the engine's OWN routine, not a
+    -- re-derivation: Prize.award is ComputeTrainerReward + WinTrainerBattle
+    -- (baseMoney x wCurPartyLevel, four quarters split between the wallet and
+    -- the Bank of Mom, the Amulet Coin doubling before the split) and
+    -- Prize.message is the exact line the cart prints.  wCurPartyLevel is
+    -- Prize.rewardLevel(enemyParty) -- the LAST row ReadTrainerParty built,
+    -- whichever mon actually fainted last -- which is what vanilla pays for
+    -- (Falkner's level 9 Pidgeotto, not the level 7 Pidgey that came out
+    -- first).  `trainer` is passed explicitly because the caller owns the real
+    -- trainer record and battle.trainer is not guaranteed on every arm (the
+    -- Gen 1 model carries none at all) -- one signature, both arms.  Returns
+    -- nil when there is nothing to pay, so a caller can never print a line for
+    -- money that was not handed over.
+    N.awardTrainerPrize = function(battle, save, trainer)
+      if not (battle and save and save.player) then return nil end
+      if not (Prize and Prize.award and Prize.rewardLevel and Prize.message) then
+        return nil
+      end
+      trainer = trainer or battle.trainer
+      if type(trainer) ~= "table" then return nil end
+      local award = Prize.award(save, {
+        baseMoney = trainer.baseMoney,
+        level = Prize.rewardLevel(battle.enemyParty),
+        amuletCoin = battle.amuletCoin,
+      })
+      if not award or (award.total or 0) <= 0 then return nil end
+      return {
+        amount = award.total,
+        award = award,
+        text = Prize.message(award, save.player.name),
+      }
+    end
+
+    -- The selected catch formula (see the CATCH RATE block above).  Gen 2
+    -- keeps its captured tail: a caught mon is reloaded out of its base data
+    -- and the battle.catch_exp hook runs, both through Battle:caught.
+    N.catchAttempt = function(opts)
+      opts = opts or {}
+      local caught, shakes, a, chance = N.runCatch(opts)
+      if caught and opts.battle and type(opts.battle.caught) == "function" then
+        opts.battle:caught(opts.mon)
+      end
+      if N.ballThrownWanted() then
+        N.emitBallThrown({
+          battle = opts.battle, ball = opts.ball or "POKE_BALL",
+          caught = caught, shakes = shakes, rate = a, chance = chance,
+          mon = opts.mon, species = opts.species,
+        })
+      end
+      return caught, shakes, a, chance
+    end
 
     -- The pre-existing Gen 2 full-party destination: insertion at the head of
     -- the current box, refilling PP.  Returns ok, message-suffix.
@@ -791,6 +1550,32 @@ return function(mod)
 
     N.awardExperience = function(battle, loser) battle:awardExperience(loser) end
 
+    -- Prize money for beating a trainer.  Gen 1's own routine, the one
+    -- BattleState:enemyMonFainted runs: `local prize = (self.trainer.baseMoney
+    -- or 0) * self.enemy.mon.level; self.game.save.money = self.game.save.money
+    -- + prize`.  No quarter split and no Bank of Mom -- those are Gen 2's
+    -- WinTrainerBattle, not Gen 1's -- and the level is wCurPartyLevel, the
+    -- LAST row of the roster, which is the mon whose faint ended the fight
+    -- (the roster is sent out in order).  Signed exactly like the Gen 2 arm so
+    -- battle_screen.lua never branches on generation.
+    N.awardTrainerPrize = function(battle, save, trainer)
+      if not (battle and save) then return nil end
+      trainer = trainer or battle.trainer
+      if type(trainer) ~= "table" then return nil end
+      local party = battle.enemyParty or {}
+      local last = party[#party]
+      local level = (last and last.level) or 0
+      local amount = math.floor(tonumber(trainer.baseMoney) or 0) * level
+      if amount <= 0 then return nil end
+      save.money = (save.money or 0) + amount
+      local name = (save.player and save.player.name) or "PLAYER"
+      return {
+        amount = amount,
+        text = require("src.core.Strings")("%s got \xc2\xa5%d for winning!",
+          name, amount),
+      }
+    end
+
     N.statusLabel = function(mon, data)
       if not (mon and mon.status) then return nil end
       -- A build carrying the Gen 2 status table uses its authored HUD label
@@ -861,10 +1646,21 @@ return function(mod)
       return gen1Path, BattleState.trainerTrueColor(data, trainerRec), nil
     end
 
+    -- The selected catch formula (see the CATCH RATE block above).  Gen 1 has
+    -- no captured tail here: the scene owns the party/box filing, and
+    -- BattleState:caught does not exist -- the native store path is the
+    -- screen's own storeCaughtMon, which this scene replaces.
     N.catchAttempt = function(opts)
-      local data = require("src.core.Data")
-      return Catching.attempt(opts.ball, opts.mon, opts.def, opts.random,
-        opts.catchRate, { statuses = data.statuses, battle = opts.battle })
+      opts = opts or {}
+      local caught, shakes, a, chance = N.runCatch(opts)
+      if N.ballThrownWanted() then
+        N.emitBallThrown({
+          battle = opts.battle, ball = opts.ball or "POKE_BALL",
+          caught = caught, shakes = shakes, rate = a, chance = chance,
+          mon = opts.mon, species = opts.species,
+        })
+      end
+      return caught, shakes, a, chance
     end
 
     N.depositCatch = function(save, mon)
