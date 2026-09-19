@@ -35,6 +35,12 @@
 -- because this mod is the one every routed battle leaves through -- so the
 -- hazard that plays over the hero around a fight is covered here once for
 -- every caller rather than in each of them.
+--
+-- background.lua adds the one purely cosmetic extra: a near-top-down GROUND
+-- PLANE behind the sprites, chosen from the encounter out of the player's own
+-- assets/backgrounds/ folder (the BACKGROUND option, default auto -- OFF
+-- restores the old white field).  No art ships; see that file's header for
+-- the tag scheme and why a missing PNG can never break a battle.
 local function loadSibling(mod, filename)
   local body, readErr = mod:read(filename)
   assert(body, readErr)
@@ -71,8 +77,26 @@ return function(mod)
     local ok, rows = pcall(loadDataSibling, mod, "options.lua")
     if ok and type(rows) == "table" then mod.options:define(rows) end
   end
+  -- Optional ground art (the BACKGROUND option).  Loaded after the options
+  -- schema is defined -- it reads that row lazily -- and before
+  -- battle_screen.lua, which calls the seam it exposes from drawContent.
+  -- See background.lua for the terrain detection, the shipped set and the
+  -- degrade-to-white contract.
+  loadSibling(mod, "background.lua")(mod)
   loadSibling(mod, "layouts.lua")(mod)
   loadSibling(mod, "combat.lua")(mod)
+  -- The FANTASY COMBAT modernized GUI (the FANTASY COMBAT option).  Loaded
+  -- after the options schema (F.enabled reads the fantasy_combat row the
+  -- define() above created) and before battle_screen.lua, which captures
+  -- mod.exports.fantasyCombat at its own load time and draws through it
+  -- from drawContent.  See fantasy_combat.lua's own header.
+  loadSibling(mod, "fantasy_combat.lua")(mod)
+  -- The EXP SHARE distribution rules (the EXP SHARE option).  Loaded after
+  -- the options schema -- it reads that row lazily, per award -- and before
+  -- battle_screen.lua so the screen's own Gen 1 model can raise the same
+  -- battle.exp_award seam this module wraps.  See exp_share.lua's own
+  -- header for the per-generation split and the active-set contract.
+  loadSibling(mod, "exp_share.lua")(mod)
   loadSibling(mod, "battle_screen.lua")(mod)
   -- Wild-boss options LAST, so battle_screen.lua's own install has already
   -- run when this registers its battle.damage 1-HP wrap and its exports.

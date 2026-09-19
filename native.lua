@@ -926,6 +926,12 @@ return function(mod)
     N.AnimRunner = require("src.battle.gen2.AnimRunner")
     N.BattleAnimView = require("src.ui.gen2.BattleAnimView")
     N.Sprites = require("src.pokemon.Sprites")
+    -- The Gen 2 item engine the PACK's battle arm runs through
+    -- (engine/items/pack.asm UseItem -> item_effects.asm): partyAction says
+    -- which family an item runs on a mon, useOnMon/usePpItem apply it and
+    -- own every number and refusal.  The scene calls these rather than
+    -- re-deriving an item's effect (see battle_screen's Screen:applyPartyItem).
+    N.ItemEffects = require("src.core.gen2.ItemEffects")
 
     N.paletteData = function(data) return data and data.gen2Palettes end
     N.menuGfxData = function(data) return data and data.gen2MenuGfx end
@@ -967,6 +973,48 @@ return function(mod)
     end
 
     N.awardExperience = function(battle, loser) battle:awardExperience(loser) end
+
+    -- THE MULTI-FAINT EXP POOL (see battle_screen.lua's Screen:awardFaintExp).
+    -- A horde -- or any multi-slot layout -- can lose several enemies on ONE
+    -- turn.  Per the user's rule their exp is summed into ONE pool first, and
+    -- the EXP SHARE config then splits that pool, so the award narrates one
+    -- active line and one bench line instead of a pair per enemy.  The scene
+    -- asks here for a synthetic stand-in "loser": a species def carrying the
+    -- summed single-participant exp as `baseExp` and the summed base stats as
+    -- `baseStats`, plus a loser sitting at the engine's own divisor as its
+    -- level.  Mon.experienceGain is `floor(baseExp * level / 7)`, so at level
+    -- 7 it collapses to exactly the pool, and the config's split divides it
+    -- once.  The trainer/traded/lucky multipliers stay OUT of the pool -- the
+    -- generation's own pass re-applies them per recipient, exactly as it does
+    -- for a single faint.  Returns nil (the caller falls back to one award per
+    -- loser) when no loser has a def.
+    N.expBatch = function(battle, losers)
+      local Mon = N.Mon
+      local data = battle and battle.data
+      if not Mon or type(losers) ~= "table" or type(data) ~= "table"
+          or type(data.pokemon) ~= "table" then return nil end
+      local exp, stats, count = 0, {}, 0
+      for _, loser in ipairs(losers) do
+        local def = battle:speciesDef(loser)
+        if def then
+          exp = exp + Mon.experienceGain(def, loser.level or 1, 1, false, {})
+          for key, value in pairs(def.baseStats or {}) do
+            stats[key] = (stats[key] or 0) + (tonumber(value) or 0)
+          end
+          count = count + 1
+        end
+      end
+      if count == 0 then return nil end
+      local id = "__g9_exp_batch__"
+      return {
+        id = id,
+        def = {
+          id = id, name = "EXP BATCH", baseExp = exp,
+          baseStats = stats, learnset = {},
+        },
+        loser = { species = id, level = 7 },
+      }
+    end
 
     -- Prize money for beating a trainer -- the engine's OWN routine, not a
     -- re-derivation: Prize.award is ComputeTrainerReward + WinTrainerBattle
@@ -1086,6 +1134,7 @@ return function(mod)
     local BattleState = require("src.battle.BattleState")
     local Catching = require("src.battle.Catching")
     local Experience = require("src.battle.Experience")
+    local Stats = tryRequire("src.pokemon.Stats")
     local Growth = require("src.pokemon.Growth")
     local Status = require("src.battle.Status")
     local TurnOrder = require("src.battle.TurnOrder")
@@ -1513,26 +1562,86 @@ return function(mod)
       end
 
       -- Experience, via the pure module the native screen's awardExp is built
-      -- on.  Participants are mon-keyed (set by N.setParticipants below).
+      -- on, now raised through the engine's shared battle.exp_award seam so
+      -- the EXP SHARE option (exp_share.lua) has one hook point on BOTH
+      -- generations -- previously this override resolved the split itself and
+      -- the hook never fired on a scene-driven Gen 1 battle at all.
+      --
+      -- ctx is built to the engine's own Gen 1 shape.  `participants`/`alive`
+      -- describe whichever player mons the scene marked active for THIS
+      -- enemy (battle.expSharePending.active, the per-enemy "stood on the
+      -- field during its stay" set Screen:awardFaintExp stashes); without it
+      -- the mon-keyed self.participants the screen rebuilds from the field is
+      -- used, exactly as before.  `applyShare(mon, split, announce)` pays one
+      -- mon through the engine's Experience.apply and raises
+      -- battle.exp_gained for it -- the same event the Gen 2 pass emits and
+      -- the g9-battle-engine EV-yield subscriber reads.
       function state:awardExperience(loser)
         local def = loser and self.data.pokemon[loser.species]
         if not def then return end
-        local count = 0
-        if self.participants then
-          for _ in pairs(self.participants) do count = count + 1 end
-        end
-        if count == 0 then count = 1 end
-        local party = (self.game.save and self.game.save.party) or {}
+        local Runtime = tryRequire("src.mods.Runtime")
+        local party = (self.game and self.game.save and self.game.save.party)
+          or {}
         local playerId = self.game.save and self.game.save.player
           and self.game.save.player.id
+        local pending = self.expSharePending
+        local activeSet = pending and pending.active or nil
+        if not (type(activeSet) == "table" and next(activeSet)) then
+          activeSet = nil
+        end
+        local participants, alive = 0, {}
         for _, mon in ipairs(party) do
-          if self.participants[mon] and (mon.hp or 0) > 0 then
-            local traded = playerId ~= nil
-              and ((mon.otId ~= nil and mon.otId ~= playerId)
-                or (mon.otId == nil and mon.traded == true))
-            Experience.apply(self.data, mon, def, loser.level or 1,
-              self.kind == "trainer", count, traded, nil)
+          local isActive = activeSet and activeSet[mon]
+            or (not activeSet and self.participants and self.participants[mon])
+          if isActive then
+            participants = participants + 1
+            if (mon.hp or 0) > 0 then alive[#alive + 1] = mon end
           end
+        end
+        if participants == 0 and self.player and self.player.mon
+            and (self.player.mon.hp or 0) > 0 then
+          participants, alive = 1, { self.player.mon }
+        end
+        local function applyShare(mon, split, announce)
+          local traded = playerId ~= nil
+            and ((mon.otId ~= nil and mon.otId ~= playerId)
+              or (mon.otId == nil and mon.traded == true))
+          local levels, gained = Experience.apply(self.data, mon, def,
+            loser.level or 1, self.kind == "trainer", split, traded, nil)
+          if Runtime and type(Runtime.emit) == "function" then
+            Runtime.emit("battle.exp_gained", {
+              battle = self, mon = mon, gained = gained, levels = levels,
+            })
+          end
+          -- exp_share.lua's condensed summary reads each mon's real gain off
+          -- battle.exp_gained; this return is the no-Runtime fallback for the
+          -- same figure (the argument it prints from).
+          return gained
+        end
+        -- The vanilla award, unchanged: the mon-keyed self.participants the
+        -- screen sets right before awarding, split across the survivors.
+        local function vanillaExpAward(ctx)
+          local count = 0
+          if self.participants then
+            for _ in pairs(self.participants) do count = count + 1 end
+          end
+          if count == 0 then count = 1 end
+          for _, mon in ipairs(party) do
+            if self.participants and self.participants[mon]
+                and (mon.hp or 0) > 0 then
+              ctx.applyShare(mon, count, true)
+            end
+          end
+        end
+        local ctx = {
+          battle = self, participants = math.max(1, participants),
+          alive = alive, applyShare = applyShare,
+        }
+        if Runtime and type(Runtime.wantsHook) == "function"
+            and Runtime.wantsHook("battle.exp_award") then
+          Runtime.call("battle.exp_award", vanillaExpAward, ctx)
+        else
+          vanillaExpAward(ctx)
         end
       end
 
@@ -1549,6 +1658,55 @@ return function(mod)
     N.takeEvents = function(battle) return battle:takeEvents() end
 
     N.awardExperience = function(battle, loser) battle:awardExperience(loser) end
+
+    -- THE MULTI-FAINT EXP POOL (see battle_screen.lua's Screen:awardFaintExp).
+    -- A horde -- or any multi-slot layout -- can lose several enemies on ONE
+    -- turn.  Per the user's rule their exp is summed into ONE pool first, and
+    -- the EXP SHARE config then splits that pool, so the award narrates one
+    -- active line and one bench line instead of a pair per enemy.  The scene
+    -- asks here for a synthetic stand-in "loser": a species def carrying the
+    -- summed single-participant exp as `baseExp` and the summed base stats as
+    -- `baseStats`, plus a loser sitting at the engine's own divisor as its
+    -- level.  Experience.apply is `floor(floor(baseExp / split) * level /
+    -- divisor)`, so at level == divisor it collapses to exactly
+    -- `floor(pool / split)`.  The trainer/traded multipliers stay OUT of the
+    -- pool -- this arm's own applyShare re-applies them per recipient, exactly
+    -- as it does for a single faint.  Returns nil (the caller falls back to
+    -- one award per loser) when no loser has a def.
+    N.expBatch = function(battle, losers)
+      local data = battle and battle.data
+      if type(losers) ~= "table" or type(data) ~= "table"
+          or type(data.pokemon) ~= "table" then return nil end
+      local consts = data.constants
+      local divisor = (consts and consts.exp and consts.exp.divisor) or 7
+      local exp, stats, count = 0, {}, 0
+      for _, loser in ipairs(losers) do
+        local def = loser and data.pokemon[loser.species]
+        if def then
+          exp = exp + Experience.gainFor(def, loser.level or 1, false, 1,
+            false, consts)
+          for key, value in pairs(def.baseStats or {}) do
+            stats[key] = (stats[key] or 0) + (tonumber(value) or 0)
+          end
+          count = count + 1
+        end
+      end
+      if count == 0 then return nil end
+      -- Every Stats.ORDER key has to be present: Experience.apply divides the
+      -- block without a nil guard.
+      if Stats and Stats.ORDER then
+        for _, key in ipairs(Stats.ORDER) do stats[key] = stats[key] or 0 end
+      end
+      local id = "__g9_exp_batch__"
+      return {
+        id = id,
+        def = {
+          id = id, name = "EXP BATCH", baseExp = exp,
+          baseStats = stats, learnset = {},
+        },
+        loser = { species = id, level = divisor },
+      }
+    end
 
     -- Prize money for beating a trainer.  Gen 1's own routine, the one
     -- BattleState:enemyMonFainted runs: `local prize = (self.trainer.baseMoney
@@ -1769,47 +1927,87 @@ return function(mod)
       return battle:takeEvents()
     end
 
-    -- -- the BALL list ------------------------------------------------
-    -- Gen 1's native BagMenu throws balls through the native BattleState
-    -- (`battle:throwBall`), which owns a different battle object than this
-    -- scene's.  A ball-only native ListMenu wired straight to the scene's own
-    -- throwBall is the equivalent, and keeps ball choice.
+    -- -- stepwise turn resolution (Gen 1) ------------------------------
+    -- The scene displays a turn one visible beat at a time, so for Gen 1 it
+    -- asks for the turn ONE ACTION at a time instead of all at once: that is
+    -- what keeps a Transform's sprite/stat exchange landing AFTER the
+    -- higher-priority move whose announcement is still on screen, rather
+    -- than every action's state landing up front. (On Gen 2 -- and against
+    -- an engine with no stepwise arm -- N.beginTurn below is simply undefined
+    -- and the scene falls back to the whole-turn N.resolveTurn above,
+    -- unchanged.)
+    --
+    -- N.beginTurn computes this turn's real order and returns true when the
+    -- engine supports stepping; false tells the caller to fall back.
+    N.beginTurn = function(g9dex, battle, actingBattlers)
+      if not battle then return false end
+      local eng = g9dex and g9dex.exports
+      if not (eng and type(eng.beginTurnActionsForGen1) == "function") then
+        -- No stepwise arm: return false BEFORE the turn-head reset, so the
+        -- fallback batch N.resolveTurn below performs it exactly once.
+        return false
+      end
+      -- Head of every Gen 1 turn -- the same pre-resolution call N.resolveTurn
+      -- makes (see its note): a flinch set by a SLOWER attacker after its
+      -- victim already moved must not survive into the next turn.
+      if type(BattleState.clearTurnFlinches) == "function" then
+        pcall(BattleState.clearTurnFlinches, battle)
+      end
+      local ok = pcall(eng.beginTurnActionsForGen1, battle, actingBattlers)
+      return ok and true or false
+    end
+
+    -- Resolves ONE actor of the stepwise turn begun above. Returns
+    -- (events, done): `events` is everything that action emitted, drained
+    -- here so nothing is lost between this call and the next, and `done` is
+    -- true once the order is exhausted -- at which point end-of-turn runs and
+    -- its own status text is appended to the same batch. The caller then
+    -- finishes the turn exactly as the batch path does.
+    N.resolveNextAction = function(g9dex, battle)
+      local eng = g9dex and g9dex.exports
+      if not (eng and type(eng.resolveNextActionForGen1) == "function") then
+        return battle:takeEvents(), true
+      end
+      local ok, resolved = pcall(eng.resolveNextActionForGen1, battle)
+      local events = battle:takeEvents()
+      if not ok or not resolved then
+        N.applyGen1EndOfTurn(battle)
+        for _, e in ipairs(battle:takeEvents()) do events[#events + 1] = e end
+        return events, true
+      end
+      return events, false
+    end
+
+    -- Gen 1's battle bag is the cart's OWN bag -- the engine's BagMenu --
+    -- not a ball-only list.  BagMenu lists every item, opens the real party
+    -- picker for a targeted one (item_effects.asm's ItemUseMedicine), runs
+    -- the effect through src.inventory.ItemEffects, animates the party HP
+    -- fill and prints every message itself.  When it is done it hands the
+    -- spent turn back through `battle:itemUsed(messages, opts)` for a
+    -- non-ball item and `battle:throwBall(id)` for a ball.
+    --
+    -- Those two are the NATIVE BattleState methods, and they would run the
+    -- native battle loop against the native battle object -- a different
+    -- battle than the one this screen is playing.  So they are shadowed on
+    -- THIS scene's own model instance and routed back into the screen,
+    -- exactly the instance-only override the model already uses for
+    -- state:useMove / state:statusGate (see the note by those).  Everything
+    -- the player sees or reads stays the cart's own.
     N.openBag = function(screen)
       local Screens = require("src.ui.Screens")
-      local Strings = require("src.core.Strings")
-      local save = screen.game.save
-      local inventory = save.inventory or {}
-      local order = { "MASTER_BALL", "ULTRA_BALL", "GREAT_BALL",
-                      "POKE_BALL", "SAFARI_BALL" }
-      local items = {}
-      for _, id in ipairs(order) do
-        if Catching.BALLS[id] and (inventory[id] or 0) > 0 then
-          local def = screen.data.items and screen.data.items[id]
-          items[#items + 1] = { value = id, label = (def and def.name) or id,
-                                count = inventory[id] }
+      local battle = screen.battle
+      if battle then
+        battle.itemUsed = function(_, messages, opts)
+          screen:onBagItemUsed(messages, opts)
+        end
+        battle.throwBall = function(_, id)
+          -- BagMenu runs consume() on the ball BEFORE it calls this, so the
+          -- copy already left the bag; spend no second one.
+          screen:throwBall(id, true)
         end
       end
-      if #items == 0 then
-        screen.message = "You have no BALLS to throw!"
-        screen.phase = "actionMenu"
-        return
-      end
-      items[#items + 1] = { cancel = true, label = Strings("CANCEL") }
-      Screens.push(screen.game, "ListMenu", "BALLS", items, {
-        -- The CANCEL row is a real row of the list (ListMenu only pops itself
-        -- on B), so A on it has to close and hand back to the action menu here
-        -- -- exactly as B does through onCancel below.  Without this the row
-        -- was inert: pressed and nothing happened, with the bag still up.
-        onChoose = function(item, list)
-          if not item then return end
-          list:close()
-          screen.suppressInputFrame = true
-          if item.cancel or not item.value then
-            screen.phase = "actionMenu"
-            return
-          end
-          screen:throwBall(item.value)
-        end,
+      Screens.push(screen.game, "BagMenu", {
+        battle = battle,
         onCancel = function()
           screen.suppressInputFrame = true
           screen.phase = "actionMenu"

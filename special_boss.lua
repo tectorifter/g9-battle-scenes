@@ -43,11 +43,28 @@
 --               too -- the "gigantamaxed (if possible)" half of the request.
 --   mega     -- the species' own Mega Stone, set as its held item, so it
 --               holds that stone after capture.  The pairing table is
---               battle_forms' data/megas.lua, transcribed below; a species
---               with no mega falls back to a plain Dynamax so a boss the
---               option rolled "mega" for is still special rather than
---               silently ordinary.
---   all      -- one of the three at an equal 1/3 roll, as requested.
+--               battle_forms' data/megas.lua, transcribed below; the
+--               single-value MEGA option falls back to a plain Dynamax for a
+--               species with no mega, so a boss it was asked to make special
+--               is never left silently ordinary.
+--   all      -- an even roll over the properties THIS boss can actually
+--               take, so an inapplicable one is dropped from the pool
+--               instead of collapsing onto another.  MEGA is in the pool
+--               only when the species really has a Mega Stone (the old
+--               mega->dynamax fallback double-weighted Dynamax, which is
+--               what made this wrong); TERA is always in it, and so is
+--               DYNAMAX, which becomes Gigantamax when the species is
+--               Gigantamax-eligible.  A boss that can be neither
+--               Gigantamaxed nor Mega-evolved is therefore an even 50/50
+--               TERA vs DYNAMAX -- exactly the case this rule exists for.
+--
+-- The property this file settles is also what the scene names in its opening
+-- F-box line -- "You have found a Tera FIRE Charizard raid!", "You have found
+-- a Mega Charizard raid!", and the Dynamax/Gigantamax equivalents.  The
+-- applied kind is stamped on the battle (`g9BossKind`) and the wording is
+-- built by bossAnnouncement, which the screen reads lazily; a boss with no
+-- applied property announces nothing, so an ordinary fight's intro is
+-- unchanged.
 --
 -- Every special boss also rolls 3 of its 6 IVs to the maximum 31.  The IV
 -- write goes through the engine's own ModernStats when it is loaded, and the
@@ -207,11 +224,13 @@ return function(mod)
     return engine and engine.exports or nil
   end
 
-  -- The species' own Mega Stone, or nil for a species with no mega.  Handles
-  -- a form id (e.g. a regional or battle form) by asking national_dex for its
-  -- base species first, then falling back to the plain `BASE_SUFFIX` split --
-  -- the same two-step resolution battle_forms' own eligibility code uses.
-  local function stoneForSpecies(species)
+  -- The raw MEGA_STONES entry for a species, or nil for one with no mega.
+  -- Handles a form id (e.g. a regional or battle form) by asking
+  -- national_dex for its base species first, then falling back to the plain
+  -- `BASE_SUFFIX` split -- the same two-step resolution battle_forms' own
+  -- eligibility code uses.  Deliberately does no random pick, so eligibility
+  -- can be tested for the `all` pool without consuming an RNG draw.
+  local function megaEntryForSpecies(species)
     if type(species) ~= "string" or species == "" then return nil end
     local entry = MEGA_STONES[species]
     if entry == nil then
@@ -227,6 +246,13 @@ return function(mod)
       local base = species:match("^([A-Z0-9]+)_")
       if base then entry = MEGA_STONES[base] end
     end
+    return entry
+  end
+
+  -- The species' own Mega Stone (one entry of its list when it has several),
+  -- or nil for a species with no mega.
+  local function stoneForSpecies(species)
+    local entry = megaEntryForSpecies(species)
     if type(entry) == "string" then return entry end
     if type(entry) == "table" and #entry > 0 then return entry[randInt(1, #entry)] end
     return nil
@@ -406,13 +432,56 @@ return function(mod)
     if mode ~= "normal" then
       local kind = mode
       if mode == "all" then
-        local roll = randInt(1, 3)
-        kind = (roll == 1 and "tera") or (roll == 2 and "dynamax") or "mega"
+        -- Roll only over what this boss can actually take.  TERA and
+        -- DYNAMAX are always possible (DYNAMAX upgrades to Gigantamax when
+        -- the species is eligible); MEGA joins the pool only when the
+        -- species really has a Mega Stone.  A boss that can be neither
+        -- Gigantamaxed nor Mega-evolved is left with TERA + DYNAMAX, i.e. a
+        -- 50/50, rather than the old mega->dynamax collapse that gave
+        -- Dynamax two of the three slots.
+        local pool = { "tera", "dynamax" }
+        if megaEntryForSpecies(mon.species) ~= nil then pool[#pool + 1] = "mega" end
+        kind = pool[randInt(1, #pool)]
       end
       local applied = applyKind(kind, mon, battle, game)
-      if applied then maxThreeIvs(mon, game) end
+      -- TERA is the one arm that can genuinely decline (a species the
+      -- running game's data cannot resolve a type for); never leave the boss
+      -- ordinary because of it -- Dynamax always can.
+      if not applied and kind == "tera" then
+        applied = applyKind("dynamax", mon, battle, game)
+      end
+      if applied then
+        -- Remember what the boss turned out to be, so the scene's opening
+        -- F-box line can name the raid -- see bossAnnouncement below.
+        battle.g9BossKind = applied
+        maxThreeIvs(mon, game)
+      end
     end
     return true
+  end
+
+  -- The scene's opening F-box line for a special wild boss, e.g.
+  -- "You have found a Tera FIRE Charizard raid!".  Built here, beside the
+  -- vocabulary that decides the kinds, so the wording lives with the
+  -- mechanic; `name` is the display name the caller already uses for its own
+  -- intro narration (a nickname/name/species string).  Returns nil when this
+  -- battle carries no applied special property -- an ordinary boss, or
+  -- SPECIAL BOSSES = normal -- so the scene can simply skip the line.
+  local KIND_LABEL = {
+    tera = "Tera", mega = "Mega",
+    dynamax = "Dynamax", gigantamax = "Gigantamax",
+  }
+  function M.bossAnnouncement(battle, name)
+    local info = battle and battle.g9BossKind
+    if type(info) ~= "table" then return nil end
+    local label = KIND_LABEL[info.kind]
+    if not label then return nil end
+    if type(name) ~= "string" or name == "" then name = "Pokemon" end
+    local typeId = info.detail
+    if info.kind == "tera" and type(typeId) == "string" and typeId ~= "" then
+      label = label .. " " .. (typeId:upper():gsub("_TYPE$", ""))
+    end
+    return "You have found a " .. label .. " " .. name .. " raid!"
   end
 
   -- BOSS CATCH's 1-HP half.  Highest priority so it is the outermost wrap and

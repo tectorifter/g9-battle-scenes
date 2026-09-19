@@ -181,22 +181,14 @@ return function(mod)
     return { actor = battler, index = pick.index, slot = pick.slot, def = pick.def, target = target }
   end
 
-  -- Resolves a WHOLE turn's worth of queued actions in one call --
-  -- resolveTurnActions' own real contract ("hand me everyone acting this
-  -- turn"), not one action at a time the way g2-Battle-Scene's own
-  -- resolveAction did. `queuedActions` is this mod's own array (actor/
-  -- target battler wrappers + slot/def), translated here into the flat
-  -- { mon =, move =, target = } list g9-battle-engine actually
-  -- wants -- real mon tables and a plain move-id string, not battler
-  -- wrappers or def tables (battle:useMove(attacker, defender, moveId)
-  -- reads attacker/defender directly, confirmed Battle.lua:1337-1341).
-  --
-  -- Returns the events g9-battle-engine's own battle:useMove calls
-  -- emitted (battle:takeEvents(), drained here so nothing is lost between
-  -- this call and the next) -- {kind=, text=, ...} tables, native's own
-  -- shape, not reshaped into this mod's old plain-string convention here;
-  -- battle_screen.lua extracts .text per event itself.
-  function Combat.resolveTurn(g9dex, battle, queuedActions)
+  -- Translates this mod's own queued actions (actor/target battler
+  -- wrappers + slot/def) into the flat { mon =, move =, target = } list
+  -- g9-battle-engine wants -- real mon tables and a plain move-id string,
+  -- not battler wrappers or def tables (battle:useMove(attacker, defender,
+  -- moveId) reads attacker/defender directly, confirmed
+  -- Battle.lua:1337-1341). Shared by the batch and stepwise resolution
+  -- paths below so the two cannot drift.
+  local function toActingBattlers(queuedActions)
     local actingBattlers = {}
     for _, action in ipairs(queuedActions) do
       if Combat.isAlive(action.actor) and action.target then
@@ -207,7 +199,40 @@ return function(mod)
         }
       end
     end
-    return N.resolveTurn(g9dex, battle, actingBattlers)
+    return actingBattlers
+  end
+
+  -- Resolves a WHOLE turn's worth of queued actions in one call --
+  -- resolveTurnActions' own real contract ("hand me everyone acting this
+  -- turn"), not one action at a time the way g2-Battle-Scene's own
+  -- resolveAction did.
+  --
+  -- Returns the events g9-battle-engine's own battle:useMove calls
+  -- emitted (battle:takeEvents(), drained here so nothing is lost between
+  -- this call and the next) -- {kind=, text=, ...} tables, native's own
+  -- shape, not reshaped into this mod's old plain-string convention here;
+  -- battle_screen.lua extracts .text per event itself.
+  function Combat.resolveTurn(g9dex, battle, queuedActions)
+    return N.resolveTurn(g9dex, battle, toActingBattlers(queuedActions))
+  end
+
+  -- Stepwise resolution (see N.beginTurn's own note): begin this turn's REAL
+  -- order, then ask for one action at a time -- which lets the scene display
+  -- each action's own events (and the sprite/stat changes that go with them)
+  -- before the next action resolves. Returns false when the backend has no
+  -- stepwise arm (Gen 2, or an older g9-battle-engine), and the scene then
+  -- falls back to the whole-turn Combat.resolveTurn above -- so those paths
+  -- are byte-for-byte unchanged.
+  function Combat.beginTurn(g9dex, battle, queuedActions)
+    if type(N.beginTurn) ~= "function" then return false end
+    return N.beginTurn(g9dex, battle, toActingBattlers(queuedActions))
+      and true or false
+  end
+
+  -- One actor's worth of the turn begun above: (events, done).
+  function Combat.resolveNextAction(g9dex, battle)
+    if type(N.resolveNextAction) ~= "function" then return nil, true end
+    return N.resolveNextAction(g9dex, battle)
   end
 
   function Combat.sideDefeated(battlers)

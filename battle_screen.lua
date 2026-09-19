@@ -66,6 +66,13 @@ return function(mod)
   -- native.lua's header for the full split and for the combat-authority rule.
   local N = assert(mod.exports.native,
     "g9-Battle-Scene: native.lua must load before battle_screen.lua")
+  -- The FANTASY COMBAT modernized GUI module (fantasy_combat.lua, loaded
+  -- just before this file).  Nil for a caller that loaded this scene
+  -- without that sibling (or an older build), and every use below is
+  -- guarded -- so the option can only ever turn the new surfaces ON, never
+  -- take a battle down.  Screen.new reads Fantasy.enabled() fresh per
+  -- battle, exactly like settings.lua is reread per screen.
+  local Fantasy = mod.exports.fantasyCombat
   -- Real native Battle, constructed here so battle:useMove (driven
   -- through g9-battle-engine's mod.exports.resolveTurnActions) has
   -- the type chart/stats/RNG/event-queue machinery it needs -- see
@@ -181,6 +188,100 @@ return function(mod)
     return nil
   end
 
+  -- ------------------------------------------------------------------
+  -- Real triples adjacency (2026-09-10 user directive).
+  --
+  -- The scene has always known each battler's OWN slot column (sideColumns
+  -- / self.playerBattlers[i] / self.enemyBattlers[i], index-aligned), but
+  -- until now the hook below reported the FULL roster on both sides: every
+  -- ally was "adjacent" to every other ally and every foe reachable from
+  -- every slot. Spread moves (Surf/Earthquake/Muddy Water) therefore hit a
+  -- non-adjacent teammate in a triple battle -- the reported bug.
+  --
+  -- The real rule, now implemented for non-boss fights:
+  --   * within a side, slot i is adjacent to i-1 and i+1 only -- slot 1 and
+  --     slot 3 are NOT adjacent (the user's own wording), same on both sides;
+  --   * across sides, slot i reaches the opposing slots i-1, i, i+1 -- the
+  --     wings hit two columns, the centre hits all three. Doubles and
+  --     singles degrade to "everything", since every index is within 1.
+  -- Boss fights keep the long-standing exception the user reaffirmed:
+  -- ALL allies count as adjacent to all allies (and all foes to all foes).
+  --
+  -- HORDES have their own declared behavior -- the whole point of a Horde
+  -- Encounter (2026-09-10 user directive): from a player's mon EVERY enemy is adjacent, so all five horde foes are
+  -- reachable and a spread move sweeps the lot. Keyed on the active layout's
+  -- own `horde` flag (`screen.isHorde`, the same flag that also places the
+  -- lone ally at a2 / gives the swarm its e2..e6 row), never on the enemy
+  -- count, so an ordinary 2-3 enemy fight is never widened by it.
+  --
+  -- moveId == nil is NOT a move use at all -- it is the engine's roster
+  -- query (allActiveBattlers) and the switch-in/ally-scope ability seam
+  -- (Intimidate/Hospitality). Those MUST still see the whole roster or they
+  -- silently miss battlers #2/#3, so a nil moveId always answers full.
+  --
+  -- Distance-capable moves (Flying/Airborne, pulse/aura, and the
+  -- counter/revenge family) may strike a non-adjacent target, so they too
+  -- answer full and the picker offers every live foe. The capability is a
+  -- property of the MOVE'S OWN ID, never its current type -- national_dex's
+  -- own `distance` flag and the curated set below are both keyed on the id,
+  -- so an Aerilate Normal move gains nothing and a Normalize Air Slash keeps
+  -- everything (the user's explicit type-change clause).
+  local NONADJACENT_MOVE_IDS = {
+    -- Flying-type / airborne attacks.
+    ACROBATICS = true, AERIALACE = true, AEROBLAST = true, AIRSLASH = true,
+    BOUNCE = true, BRAVEBIRD = true, CHATTER = true, DRILLPECK = true,
+    FLY = true, FLYINGPRESS = true, GUST = true, HURRICANE = true,
+    OBLIVIONWING = true, PECK = true, PLUCK = true, SKYATTACK = true,
+    SKYDROP = true, WINGATTACK = true, DRAGONASCENT = true,
+    -- Pulse & aura attacks (Heal Pulse may reach a non-adjacent ALLY too).
+    AURASPHERE = true, DARKPULSE = true, DRAGONPULSE = true,
+    HEALPULSE = true, WATERPULSE = true,
+    -- Counter/revenge family: can answer a foe that struck them even from a
+    -- non-adjacent slot.
+    COUNTER = true, MIRRORCOAT = true, METALBURST = true, BIDE = true,
+    DESTINYBOND = true, GRUDGE = true,
+  }
+
+  -- Uppercased with every separator removed, the one spelling the curated
+  -- sets are keyed on. "AIR SLASH", "Air-Slash" and "AIRSLASH" all collapse
+  -- to the same key.
+  local function normaliseMoveId(id)
+    return (tostring(id or ""):upper():gsub("[^A-Z0-9]", ""))
+  end
+
+  -- national_dex's moveFlags, resolved lazily and cached only on success
+  -- (a lookup before national_dex has loaded must not poison the cache).
+  -- The engine does not re-export it, so this reaches the data mod
+  -- directly. Its generated table spells ids inconsistently (AERIALACE but
+  -- DRILL_PECK), so the caller below tries both spellings.
+  local nationalMoveFlags
+  local function moveFlagsFn()
+    if nationalMoveFlags then return nationalMoveFlags end
+    local nat = mod.find and mod:find("national_dex")
+    local fn = nat and nat.exports and nat.exports.moveFlags
+    if type(fn) == "function" then nationalMoveFlags = fn return fn end
+    return nil
+  end
+
+  -- canReachNonAdjacent(moveId, flagsFn) -> boolean. nil moveId means "not
+  -- a move use" and answers true (full roster), matching the hook's own
+  -- nil rule. flagsFn is optional (the engine's/national_dex's moveFlags);
+  -- the curated set alone already covers the user's list.
+  local function canReachNonAdjacent(moveId, flagsFn)
+    if moveId == nil then return true end
+    local key = normaliseMoveId(moveId)
+    if NONADJACENT_MOVE_IDS[key] then return true end
+    if flagsFn then
+      for _, cand in ipairs({ moveId, key }) do
+        local ok, flags = pcall(flagsFn, cand)
+        if ok and type(flags) == "table" and flags.distance == true then
+          return true
+        end
+      end
+    end
+    return false
+  end
+
   mod.hooks:wrap("g9.request_adjacency", function(nextFn, battle, caster, moveId)
     local screen = lastScreen
     if not (screen and screen.battle == battle) then
@@ -197,48 +298,46 @@ return function(mod)
     local combat = mod.exports.combat
     local isAlive = combat and combat.isAlive
 
-    -- Boss-fight rule, explicit user directive (2026-08-28), matching
-    -- combat/MULTI_BATTLE_HOOKS.md's own "Boss-fight rule" section
-    -- verbatim: "the allies a wrapped handler reports should be the FULL
-    -- ally roster regardless of real proximity ('adjacent allies = all
-    -- allies'), independent of which boss-fight protections are active."
-    -- Checked generically -- battle.bossFightFlags being a non-empty
-    -- table means SOME boss-fight protection is active, regardless of
-    -- which specific one -- rather than one named flag, matching that
-    -- doc's own "independent of which... are active" wording exactly.
-    --
-    -- Structured as its own explicit branch on purpose, not folded into
-    -- the loop below via an extra condition: this file has NO real
-    -- positional/slot-adjacency restriction anywhere today (every ally
-    -- already counts as adjacent regardless of real proximity, for every
-    -- fight), so this branch is functionally identical to the plain one
-    -- right now -- but a future real triples adjacency feature (e.g.
-    -- restricting a corner slot's own spread hit from reaching the far
-    -- corner) would only ever be added to the ELSE branch, never here,
-    -- so the boss-fight guarantee stays structurally enforced rather
-    -- than accidentally preserved by the absence of a feature that
-    -- doesn't exist yet.
+    -- Boss-fight rule, explicit user directive (2026-08-28, reaffirmed
+    -- 2026-09-10), matching combat/MULTI_BATTLE_HOOKS.md's own
+    -- "Boss-fight rule" section verbatim: "the allies a wrapped handler
+    -- reports should be the FULL ally roster regardless of real proximity
+    -- ('adjacent allies = all allies'), independent of which boss-fight
+    -- protections are active." Checked generically -- a non-empty
+    -- battle.bossFightFlags table means SOME protection is active,
+    -- regardless of which -- rather than one named flag.
     local isBossFight = battle.bossFightFlags ~= nil and next(battle.bossFightFlags) ~= nil
+    -- Horde rule, explicit user directive (2026-09-10): the unique behavior
+    -- of a Horde Encounter is that, to the player's mon, EVERY enemy counts
+    -- as adjacent -- so all five foes are reachable and a spread move sweeps
+    -- the swarm. Keyed on the active layout's own `horde` flag (the SAME
+    -- flag that places the lone ally at a2 and the five enemies at e2..e6),
+    -- never on the enemy count, so a normal 2-3 enemy fight is never
+    -- widened by this. Read off the screen, which owns the layout.
+    local isHorde = screen.isHorde == true
+    -- The one switch for "report the whole roster": a boss fight, a horde
+    -- fight, a non-move roster query (nil moveId), or a move whose own id
+    -- can reach across a slot. Otherwise real positional adjacency applies.
+    local full = isBossFight or isHorde or canReachNonAdjacent(moveId, moveFlagsFn())
     local allies, enemies = {}, {}
-    if isBossFight then
-      for i, b in ipairs(ownArr) do
-        if i ~= casterIndex and (not isAlive or isAlive(b)) then
-          allies[#allies + 1] = b.mon
-        end
-      end
-    else
-      -- No real positional restriction exists yet -- see the boss-fight
-      -- branch's own comment above. When one is built, it belongs here,
-      -- never in the isBossFight branch.
-      for i, b in ipairs(ownArr) do
-        if i ~= casterIndex and (not isAlive or isAlive(b)) then
+    for i, b in ipairs(ownArr) do
+      if i ~= casterIndex and (not isAlive or isAlive(b)) then
+        -- Same side: literal neighbours only (|i - caster| == 1); the
+        -- far slot on a three-wide side is NOT adjacent.
+        if full or math.abs(i - casterIndex) == 1 then
           allies[#allies + 1] = b.mon
         end
       end
     end
-    for _, b in ipairs(oppArr) do
+    for j, b in ipairs(oppArr) do
       if not isAlive or isAlive(b) then
-        enemies[#enemies + 1] = b.mon
+        -- Across sides: this slot's own column and the two beside it
+        -- (|caster - j| <= 1) -- wings reach two foes, the centre all
+        -- three. A two-wide side is entirely within 1, so doubles and
+        -- singles are unchanged.
+        if full or math.abs(j - casterIndex) <= 1 then
+          enemies[#enemies + 1] = b.mon
+        end
       end
     end
     return { allies = allies, enemies = enemies }
@@ -341,6 +440,40 @@ return function(mod)
     local p = math.min(1, time / duration)
     return math.floor(p * steps) * 8
   end
+  -- INPUT PACING (round two-hundred-and-six; revised round two-hundred-
+  -- and-seven, user request). This screen is a per-frame keyboard state
+  -- machine with no debounce of its own: a menu commit that changes phase
+  -- used to leave the very next frame free to read the SAME physical press
+  -- again (suppressInputFrame only covers a native sub-menu popping back),
+  -- so a mash could walk FIGHT -> move -> resolve -> next battler inside a
+  -- second.
+  --
+  -- INPUT_DELAY is the minimum wall-clock gap, armed ONLY when an action is
+  -- genuinely committed: a move queued (its target just picked, or the move
+  -- needed no picker) or a positional swap queued -- see Screen:queueAction
+  -- and Screen:queueSwapAction. Merely opening a menu or moving the cursor
+  -- does NOT arm it (the user's "no delay between FIGHT > move selection >
+  -- selecting target"), and neither does a B cancel backing out to a
+  -- previous menu. Directional input is exempt for the same reason.
+  local INPUT_DELAY = 0.3
+  -- RESOLVING BEAT HOLDS. Screen:advanceResolving shows the engine's
+  -- emitted events one at a time; each visible text beat must stay on
+  -- screen for its minimum before the player's next A/B may advance it, so
+  -- lines never machine-gun past. A plain line holds BEAT_HOLD_TEXT; a move
+  -- event whose move animation did NOT start (moveAnimations off -- the
+  -- default settings.lua) holds BEAT_HOLD_MOVE, the user's "animation time
+  -- defaults to 0.3 seconds". A move whose animation DID start is paced by
+  -- the animation itself instead, and gets no extra hold.
+  local BEAT_HOLD_TEXT = 0.3
+  local BEAT_HOLD_MOVE = 0.3
+  -- A moving HP bar's own drain, in seconds. The cart's frame-rate chase is
+  -- replaced by the fixed 0.3s depletion the user specified.
+  local HP_ANIM_DURATION = 0.3
+  -- Safety valve ONLY: a move animation normally owns its whole duration
+  -- (its runner reports completion itself), but a malformed script that
+  -- never reports done must not be able to hang the battle, so after this
+  -- many seconds a press may skip it. Not a pacing value.
+  local MOVE_ANIM_SAFETY = 5
   -- The classic multi-target ("hits every adjacent opponent") move ids,
   -- used by Screen:isSpreadMove as the LAST-resort check when the move
   -- def carries no `target` field and the engine mod is too old to
@@ -358,6 +491,19 @@ return function(mod)
     MUDDY_WATER = true, HEAT_WAVE = true, BLIZZARD = true, ERUPTION = true,
     WATER_SPOUT = true, DISCHARGE = true, DAZZLING_GLEAM = true,
     MORTALSPIN = true, BOOMBURST = true,
+  }
+  -- national_dex target archetypes that never need a recipient pick --
+  -- the last-resort fallback for Screen:needsTargetChoice when the engine
+  -- mod is too old to export needsTargetChoice. Anything NOT listed keeps
+  -- the picker (the safe default: a wrongly-skipped picker is worse than
+  -- an extra one). Self, side, whole-field and team-wide moves only.
+  local NO_CHOICE_TARGET_ARCHETYPES = {
+    ["user"] = true, ["users-field"] = true, ["opponents-field"] = true,
+    ["entire-field"] = true, ["all-opponents"] = true,
+    ["all-other-pokemon"] = true, ["all-allies"] = true,
+    ["user-and-allies"] = true, ["random-opponent"] = true,
+    ["fainting-pokemon"] = true, ["specific-move"] = true,
+    ["all-pokemon"] = true,
   }
   -- Lose outro: how long the faint-to-black takes to climb the whole
   -- canvas after your last mon falls (vanilla's blackout). Purely
@@ -395,42 +541,48 @@ return function(mod)
   -- battle in Screen.new); selecting it fires a hook instead of a
   -- built-in action (see Screen:chooseMenuItem).
   local MENU_LABELS = { FIGHT = "FIGHT", BAG = "BAG", PKMN = "PKMN", RUN = "RUN",
-    SWITCH = "SWITCH" }
+    SWITCH = "SWITCH", CUSTOM = "FORMS" }
 
-  -- Plain 2x2 grid coordinates (confirmed directly by the user: FIGHT/
-  -- PKMN on top, BAG/RUN on bottom). Real row/col toggling works fine
-  -- here (only 2 rows and 2 columns, so "the other one" is always
-  -- unambiguous) -- no need for the explicit-cycle workaround below.
+  -- Singles / Horde / Boss fight grids (swapEnabled = false).
+  --   With FORMS/CUSTOM: 3-row x 2-col
+  --     FIGHT | PKMN
+  --     FORMS | BAG
+  --           | RUN
+  --   Without FORMS/CUSTOM: plain 2x2 (RUN replaces the FORMS slot)
+  --     FIGHT | PKMN
+  --     BAG   | RUN
   local GRID2_ROWS = { { "FIGHT", "PKMN" }, { "BAG", "RUN" } }
+  local GRID3_ROWS = { { "FIGHT", "PKMN" }, { "CUSTOM", "BAG" }, { nil, "RUN" } }
 
-  -- 3x3 slot grid for the cross layout (grid mode + a custom button
-  -- set), nil = empty/skipped cell -- purely for DRAWING positions.
+  -- Doubles / Triples grids (swapEnabled = true).
+  --   With FORMS/CUSTOM: 3-row x 2-col
+  --     FIGHT  | PKMN
+  --     SWITCH | BAG
+  --     FORMS  | RUN
+  --   Without FORMS/CUSTOM: 3-row x 2-col, RUN fills the FORMS slot
+  --     FIGHT  | PKMN
+  --     SWITCH | BAG
+  --     RUN    |
+  local GRID2_ROWS_SW  = { { "FIGHT", "PKMN" }, { "SWITCH", "BAG" }, { "RUN", nil } }
+  local GRID3_ROWS_SW  = { { "FIGHT", "PKMN" }, { "SWITCH", "BAG" }, { "CUSTOM", "RUN" } }
+
+  -- 3x3 slot grid for the cross layout (kept for any legacy caller that
+  -- still references self.crossSlots; grid mode no longer sets it).
   local CROSS_SLOTS = {
     { "FIGHT", nil, "PKMN" },
     { nil, "CUSTOM", nil },
     { "BAG", nil, "RUN" },
   }
-
-  -- SWITCH-ENABLED shapes, used when the battle has two or more living
-  -- allies and is not a bossFight (see the layout note by the geometry
-  -- constants far below). SWITCH sits directly UNDER FIGHT in both: the
-  -- wide grid gains a middle row, the cross gains its empty middle-left
-  -- cell -- everything else keeps its old place, CUSTOM included.
-  local GRID2_ROWS_SW = { { "FIGHT", "PKMN" }, { "SWITCH", "BAG" }, { "RUN", nil } }
   local CROSS_SLOTS_SW = {
     { "FIGHT", nil, "PKMN" },
     { "SWITCH", "CUSTOM", nil },
     { "BAG", nil, "RUN" },
   }
 
-  -- Cross NAVIGATION is two explicit cycles, not coordinate math: a
-  -- single row/column step from any corner lands on a skipped cell and
-  -- keeps going straight through to the OPPOSITE corner, so the center
-  -- is geometrically unreachable by any raw up/down/left/right step from
-  -- a corner. These exact orders were specified directly by the user,
-  -- not derived from the grid layout above.
+  -- Cross NAVIGATION explicit cycles (kept so the cross drawing path
+  -- still works if self.crossSlots is set by any external caller).
   local CROSS_RIGHT_CYCLE = { "FIGHT", "CUSTOM", "PKMN", "BAG", "RUN" }
-  local CROSS_DOWN_CYCLE = { "FIGHT", "CUSTOM", "BAG", "PKMN", "RUN" }
+  local CROSS_DOWN_CYCLE  = { "FIGHT", "CUSTOM", "BAG", "PKMN", "RUN" }
 
   -- Emitted (mod.events:emit) when the custom button is chosen, kept
   -- alongside the real, direct battle_forms call below (Screen:
@@ -486,7 +638,7 @@ return function(mod)
   -- broken file degrades to the original list layout with no custom
   -- button, never a crash.
   local function loadSettingsFile()
-    local defaults = { menuLayout = "list", customButtonLabel = "" }
+    local defaults = { menuLayout = "list", customButtonLabel = "", moveAnimations = false }
     local body = mod:read("settings.lua")
     if not body then return defaults end
     local chunk, err = loadstring(body, "@" .. mod.path .. "/settings.lua")
@@ -500,6 +652,37 @@ return function(mod)
       return defaults
     end
     return data
+  end
+
+  -- FANTASY LAYOUT (options.lua's FANTASY LAYOUT row).  ON replaces the
+  -- horizontal placement EVERY preset ships with a grouped field: each side
+  -- stands in a wide, shallow ZIG-ZAG -- the player's on the LEFT of the
+  -- field, the enemy's on the RIGHT -- with the lead battler at the bottom
+  -- and later ones stepping up and outward, each drawn a layer further BACK
+  -- so the mon in front is never covered (the same arrangement the concept
+  -- art shows).  Each Pokemon's HP/exp readout rides directly over its own
+  -- head.
+  -- The player's side is drawn from each Pokemon's FRONT battle sprite,
+  -- mirrored horizontally, instead of its back sprite -- both teams read
+  -- from the same front sheets, turned to face one another.
+  --
+  -- Read fresh per battle (Screen.new), so a change in the mod manager takes
+  -- effect on the next fight -- the same defensive, pcall'd, string-only
+  -- read fantasy_combat.lua's F.enabled() uses, with an `off` fallback so a
+  -- harness (or a disabled mod) sees the normal horizontal layout.
+  --
+  -- Hung off the Screen class rather than declared as module-level locals on
+  -- purpose: this closure sits at Lua 5.1's 200-active-local ceiling, so even
+  -- one more `local` at this scope would stop the file compiling. These are
+  -- pure helpers/data with no upvalue state, so a field on the class every
+  -- consumer already reaches through is the same thing with no local cost.
+  function Screen.fantasyLayoutEnabled()
+    local options = mod and mod.options
+    if options and type(options.get) == "function" then
+      local ok, value = pcall(function() return options:get("fantasy_layout") end)
+      if ok and type(value) == "string" then return value == "on" end
+    end
+    return false
   end
 
   -- ------------------------------------------------------------------
@@ -824,6 +1007,311 @@ return function(mod)
     return cols
   end
 
+  -- -- FANTASY LAYOUT geometry (options.lua's FANTASY LAYOUT) ----------
+  -- The vertical FIELD every fantasy battle shares. The two sides occupy
+  -- opposite ends of the 320x180 design field, as COLUMNS rather than rows:
+  -- the player's column is centred on FANTASY.playerX, the enemy's on
+  -- FANTASY.enemyX (mirror images about the centre seam at 160). Each side's
+  -- lead battler stands on FANTASY.baseY and each one after it sits
+  -- FANTASY.step higher up (smaller y), so slot i's ground line is
+  -- baseY - (i-1)*step. Because the STEP is much shorter than a sprite's own
+  -- height the columns read as a tight, overlapping group where each mon
+  -- partly stands in front of the one below it -- and the sprite PASS draws
+  -- slot 1 last, so the lead mon always ends up on top (see Screen:paintOrder
+  -- / drawContent).
+  --
+  -- ZIG-ZAG (the concept art's own arrangement). A column is not a straight
+  -- stack: consecutive slots alternate horizontally about the column centre
+  -- by FANTASY.zig px -- slot 1 (the bottom, lead mon) takes the OUTER x
+  -- (further from the centre seam), slot 2 the INNER x, slot 3 outer again,
+  -- and so on -- so the side reads as a zig-zag running up the field instead
+  -- of a plumb line. Both sides share the same phase (odd slots outer), so
+  -- the two zig-zags MIRROR each other: the player's outer x is to the left,
+  -- the enemy's to the right, and each team leans toward the other on its
+  -- even slots. Purely horizontal: the ground lines above are unchanged, so
+  -- a slot's index -- and therefore every index-aligned consumer (targets,
+  -- turns, bench replacement, adjacency) -- still means exactly what it did.
+  --
+  -- WIDE AND SHALLOW (round 223 -- user: "pattern is too spread vertically,
+  -- move the stat info gui (hp bar) to be on each of their overheads, spread
+  -- them more horizontally"). The round-222 values (zig 20, step 20,
+  -- playerX 96, enemyX 224) drew each side as a NARROW TALL ladder: 40px of
+  -- horizontal swing against 80px of rise down a five-mon horde. The rise is
+  -- traded for width here -- step 20 -> 15 and zig 20 -> 40, with both column
+  -- centres pushed outward (96/224 -> 88/232) so the widened swing still
+  -- clears the centre seam -- turning a side into a WIDE SHALLOW zig-zag:
+  -- 80px of swing against 60px of rise for the whole five-slot enemy stack.
+  --
+  -- LOWERED (round 224 -- user: "lower even more positions, till the feet of
+  -- pos 1 pokemon are slightly under hp bar row and action box, keep same
+  -- spacing and order between both side battlers"). baseY 122 -> 134 drops
+  -- the whole formation so the LEAD mon's feet now sit slightly UNDER the
+  -- top edge of the bottom HUD band (BOTTOM_Y = 128 -- the hp-bar row and the
+  -- action box's own top edge) instead of just above it.  The normal layout
+  -- stands its ally exactly ON that line (ALLY_FEET_T = BOTTOM_Y), so the
+  -- fantasy lead now tucks a few px in where a normal fight's mon sits flush
+  -- -- the reference the user asked for.  step/zig and the two column centres
+  -- are untouched, so both sides keep exactly the same spacing and order.
+  --
+  -- HAND-TUNED ENEMY SLOTS (round 225 -- user: "push up enemy pos 4 and 5 ...
+  -- for hordes only down enemy pos 2"). On top of the uniform staircase a
+  -- couple of named ENEMY slots get an absolute ground line: slot 4 and slot
+  -- 5 are RAISED to 64 (the user's 305 image px / ~4.756), so the top two
+  -- enemies end up level; in a HORDE slot 2 is LOWERED to 115 (the user's 548
+  -- image px), the rest of the five-enemy column keeping the staircase. The
+  -- overrides live in FANTASY.enemySlotY / FANTASY.hordeEnemySlotY and are
+  -- applied by Screen.fantasyGroundY -- the ONE ground-line lookup both the
+  -- draw grid (slotRects) and every other consumer share -- so all unnamed
+  -- enemy slots are byte-for-byte unchanged.
+  --
+  -- PAIRED PLAYER COLUMN (round 226 -- user: "lower down ally pos 2 and pos 4
+  -- to match respectively ally pos 1's y value and ally pos 3's y value"). The
+  -- ally side's EVEN slots now drop onto the odd slot below them (pos 2 onto
+  -- pos 1's line, pos 4 onto pos 3's), so the player column reads as pairs at
+  -- one line each instead of a staircase. Held as the rule
+  -- FANTASY.playerPairsWithBelow and applied by the same
+  -- Screen.fantasyGroundY, so it follows baseY/step automatically. The enemy
+  -- side is untouched by it.
+  --
+  -- The values are chosen for the FULLEST shipped stacks: a five-mon horde
+  -- puts its last enemy's ground line at 64 (raised from the staircase's
+  -- 134 - 4*15 = 74), leaving room for
+  -- its art AND for the readout that now rides on its head under the field's
+  -- top edge, while the lead mon of a shorter stack keeps the same bottom
+  -- line (the concept's own rule: the first Pokemon of each side is placed
+  -- bottom-most). The swing (2*zig = 80px) is deliberately wider than a
+  -- readout box (GUI_BOX_W = 56.4px) and same-column slots stand 2*step =
+  -- 30px apart -- more than the taller PLAYER box's own 22.6px height -- so
+  -- the per-slot readouts that now sit OVER each mon's own head (see the HUD
+  -- pass in drawContent) can never collide, whatever the team size. A horde's
+  -- five enemies are 1,3,5 on the outer x and 2,4 on the inner one, so their
+  -- five boxes clear each other the same way.
+  -- Fantasy values live on the Screen class (not as more module-level locals
+  -- -- see the note on Screen.fantasyLayoutEnabled above for the 200-local
+  -- ceiling). baseY is the lead slot's ground line, step the rise between
+  -- slots, zig the per-slot horizontal swing about the column centre,
+  -- playerX/enemyX the two sprite-column centres, slotW the anchor's hit-box
+  -- width (the ball's fallback landing spot and the move-anim anchors), and
+  -- headLift the fallback head line -- how far above a slot's own ground line
+  -- the HUD puts a readout's bottom edge for a mon whose sprite is not on the
+  -- field this frame. (The round-222 guiPlayerX/guiEnemyX readout columns are
+  -- GONE: with the boxes riding their own mons there is no second column.)
+  Screen.FANTASY = {
+    baseY = 134,
+    step = 15,
+    zig = 40,
+    playerX = 88,
+    enemyX = 232,
+    slotW = 88,
+    headLift = 20,
+    -- (v3.5.12) THE FANTASY-EXCLUSIVE ASSET SIZE. A sprite-size MULTIPLIER
+    -- for BOTH sides, applied only while the FANTASY LAYOUT is on, on top of
+    -- whatever scale the side already draws at (so the normal per-side
+    -- `spriteScaleFront`/`spriteScaleBack` tuning is preserved underneath).
+    -- 1 = today's sizes, exactly. A side may be given its own multiplier by
+    -- adding `spriteScaleFront` (enemy) / `spriteScaleBack` (ally) here --
+    -- deliberately NOT listed, so an ABSENT key means "use this one" -- and a
+    -- preset may override either with its own `spriteScaleFantasy` /
+    -- `spriteScaleFantasyFront` / `spriteScaleFantasyBack`, and the mod
+    -- manager's FANTASY SIZE option scales the lot. Every layer is a
+    -- multiplier defaulting to 1, so nothing here can change a battle until
+    -- one is actually set, and none of it is read with the layout off. See
+    -- Screen:battleSpriteScale.
+    spriteScale = 1,
+  }
+
+  -- ROUND TWO HUNDRED AND TWENTY-FIVE: per-slot enemy ground-line overrides.
+  -- The uniform staircase (baseY - (slot-1)*step) is still the default for
+  -- BOTH sides and for every slot that is not named here. The user read the
+  -- on-screen y of a few enemy slots off a screenshot and asked for a
+  -- hand-tuned formation on top of the staircase:
+  --   * enemy slot 4 and slot 5 are RAISED to the same line -- 64 design px
+  --     (the two highest enemy slots end up level with each other). The user
+  --     gave 305 image px for both; the screenshots run at ~4.756 image px
+  --     per design px (a full-field capture is 1522x856 for the 320x180
+  --     canvas), so 305/4.756 ~= 64.
+  --   * in a HORDE (self.isHorde, the enemy-side 1v5) enemy slot 2 is LOWERED
+  --     to 115 design px instead of its staircase 119 (user's 548 image px,
+  --     548/4.756 ~= 115) -- i.e. only slot 2 of a five-enemy horde drops,
+  --     the rest of the column keeps the staircase.
+  -- These are ENEMY-side only and slot-indexed exactly like every other
+  -- index-aligned consumer (the anchor's ground line is the only thing that
+  -- moves), so targets/turns/adjacency are untouched. The overrides are
+  -- deliberately not on the uniform grid: the two raised slots are 64 apart
+  -- in x (inner vs outer column) so their readout boxes still cannot
+  -- overlap, and the lowered horde slot 2 is one slot away from slot 1/3.
+  Screen.FANTASY.enemySlotY = {
+    [4] = 64,
+    [5] = 64,
+  }
+  Screen.FANTASY.hordeEnemySlotY = {
+    [2] = 115,
+  }
+
+  -- ROUND TWO HUNDRED AND TWENTY-SIX: the PLAYER column pairs up. Ally slots
+  -- 2 and 4 are LOWERED onto the ground line of the odd slot just below them
+  -- (pos 2 onto pos 1's baseY, pos 4 onto pos 3's line) -- the user's
+  -- "lower down ally pos 2 and pos 4 to match respectively ally pos 1's y
+  -- value and ally pos 3's y value". Expressed as a RULE (not two literals)
+  -- so it keeps matching pos 1/pos 3 if baseY or step is ever retuned: an
+  -- even player slot simply adopts its preceding odd slot's line. The enemy
+  -- side is governed by the override tables above instead.
+  Screen.FANTASY.playerPairsWithBelow = true
+
+  -- The ground line (design px) one fantasy slot stands on: the uniform
+  -- staircase F.baseY - (slot-1)*F.step, unless a per-slot override applies.
+  -- ENEMY slots: the horde table first (only when `horde`), then the always-on
+  -- one. PLAYER slots: when playerPairsWithBelow is on, an EVEN slot adopts
+  -- the line of the odd slot below it (pos 2 -> pos 1, pos 4 -> pos 3).
+  -- `side` is "enemy" or "player" and `horde` the scene's own self.isHorde.
+  -- Pure lookup + arithmetic, so the whole per-side draw/target/animation path
+  -- keeps reading one function.
+  function Screen.fantasyGroundY(side, slot, horde)
+    local F = Screen.FANTASY
+    if side == "enemy" then
+      if horde and F.hordeEnemySlotY[slot] then return F.hordeEnemySlotY[slot] end
+      if F.enemySlotY[slot] then return F.enemySlotY[slot] end
+    elseif F.playerPairsWithBelow and slot % 2 == 0 then
+      slot = slot - 1
+    end
+    return F.baseY - (slot - 1) * F.step
+  end
+
+  -- The x centre of slot `slot` in a zig-zag column centred on `baseX`, whose
+  -- OUTER side is the direction `outward` (+1 = to the right, -1 = to the
+  -- left). Odd slots take the OUTER x (baseX + outward*zig), even slots the
+  -- INNER one (baseX - outward*zig), so the column alternates about baseX.
+  -- The player passes outward = -1 (its outer side is the left edge), the
+  -- enemy +1; both start on an outer slot, so the two zig-zags mirror.
+  function Screen.fantasySlotX(baseX, slot, outward)
+    local zig = Screen.FANTASY.zig
+    local odd = (slot % 2 == 1)
+    return baseX + (odd and outward or -outward) * zig
+  end
+
+  -- The slot (an ANCHOR: centre-x + ground line, exactly like slotRect) for
+  -- one battler in a fantasy column: the frame's WIDTH is the column's own
+  -- hit-box (used only by the ball's fallback landing spot and the
+  -- move-animation anchors), its HEIGHT a band tall, and its BOTTOM edge the
+  -- ground line the sprite's feet stand on.
+  function Screen.fantasySlot(centerX, groundY)
+    local w = Screen.FANTASY.slotW
+    local h = ROW_H * 8
+    return {
+      x = math.floor(centerX - w / 2 + 0.5),
+      y = groundY - h,
+      w = w,
+      h = h,
+    }
+  end
+
+  -- The head line (design px) a FANTASY LAYOUT readout puts its BOTTOM edge
+  -- on, for ONE battler: the head point of the sprite ACTUALLY drawn for it
+  -- this frame -- drawContent's sprite pass records it in `headLines` exactly
+  -- the way the horizontal HUD's sideHeadY reads it (GUI_HEAD_PCT of the way
+  -- up the sprite's own drawn height), so the box is a hat on that mon rather
+  -- than a sign beside its team. Falls back to FANTASY.headLift px above the
+  -- slot's own ground line for a mon whose sprite is not on the field yet (its
+  -- trainer pic still stands in the slot, or its ball has not landed); the
+  -- readout is hidden until that mon is revealed, so the fallback only has to
+  -- be sensible, not exact. Called per slot by the HUD pass, so every box
+  -- tracks its own mon's head instead of the one shared line the horizontal
+  -- layout uses (that line exists to keep a HORIZONTAL row level; a zig-zag
+  -- needs each box on its own mon).
+  function Screen.fantasyHeadY(headLines, battler, groundY)
+    return headLines[battler] or (groundY - Screen.FANTASY.headLift)
+  end
+
+  -- (v3.5.12) The FANTASY SIZE option (options.lua's `fantasy_asset_size`): a
+  -- fantasy-exclusive ASSET-SIZE multiplier, read fresh per battle. Only ever
+  -- consulted by Screen:battleSpriteScale, and only once that has confirmed
+  -- self.fantasyLayout, so a normal (horizontal) battle can never see it.
+  -- Defensive + pcall'd exactly like Screen.fantasyLayoutEnabled; a missing,
+  -- disabled or garbled value degrades to 1 -- no change at all. The stored
+  -- choices are plain multiplier strings ("0.5" .. "2"), so percentages land
+  -- here as the number they mean.
+  function Screen.fantasyAssetMul()
+    local options = mod and mod.options
+    if options and type(options.get) == "function" then
+      local ok, value = pcall(function() return options:get("fantasy_asset_size") end)
+      if ok then
+        local n = tonumber(value)
+        if n and n > 0 then return n end
+      end
+    end
+    return 1
+  end
+
+  -- (v3.5.12) The sprite scale ONE side is drawn at for THIS battle -- the
+  -- per-side front/back scale the scene has always used, with a FANTASY-
+  -- EXCLUSIVE asset-size modifier layered on top when the fantasy layout is
+  -- on. Normal layout is byte-for-byte the old expression: the preset's own
+  -- `spriteScaleFront`/`spriteScaleBack` (or the legacy single `spriteScale`),
+  -- else SPRITE_SCALE_FRONT/BACK. FANTASY LAYOUT instead multiplies that scale
+  -- by the fantasy asset-size factor for the side: the preset's
+  -- `spriteScaleFantasyFront`/`spriteScaleFantasyBack`, else its single
+  -- `spriteScaleFantasy`, else Screen.FANTASY.spriteScaleFront/Back, else
+  -- Screen.FANTASY.spriteScale (1 by default), and finally the FANTASY SIZE
+  -- option (Screen.fantasyAssetMul). Every fantasy layer is a multiplier
+  -- defaulting to 1, so with none of them set the fantasy scales are the
+  -- normal ones -- exactly as before -- and with the layout OFF none of this
+  -- is read at all. `sideBack` selects the ally/back scale (true) or the
+  -- enemy/front one (false). Relative sizes within a side are preserved (it
+  -- is one factor for the whole side), while the two teams still resize
+  -- independently.
+  function Screen:battleSpriteScale(activeLayout, legacyScale, sideBack)
+    local preset = activeLayout or {}
+    local scale
+    if sideBack then
+      scale = tonumber(preset.spriteScaleBack) or legacyScale or SPRITE_SCALE_BACK
+    else
+      scale = tonumber(preset.spriteScaleFront) or legacyScale or SPRITE_SCALE_FRONT
+    end
+    if not self.fantasyLayout then return scale end
+    local F = Screen.FANTASY
+    local mul
+    if sideBack then
+      mul = tonumber(preset.spriteScaleFantasyBack) or tonumber(preset.spriteScaleFantasy)
+        or F.spriteScaleBack or F.spriteScale
+    else
+      mul = tonumber(preset.spriteScaleFantasyFront) or tonumber(preset.spriteScaleFantasy)
+        or F.spriteScaleFront or F.spriteScale
+    end
+    return scale * (mul or 1) * Screen.fantasyAssetMul()
+  end
+
+  -- The order the sprite pass paints ONE side's slots in. Normal layout is
+  -- the original 1..N (slot 1 painted first, then 2, ...); FANTASY LAYOUT
+  -- reverses it (slot N first ... slot 1 last), because a column stacks its
+  -- battlers and the concept wants the lead mon -- slot 1, at the bottom --
+  -- to end up ON TOP, i.e. every mon above it a layer further BACK. Pure
+  -- index maths, so it never touches WHICH battler stands in which slot.
+  function Screen:paintOrder(list)
+    local n = #list
+    local order = {}
+    if self.fantasyLayout then
+      for i = 1, n do order[i] = n - i + 1 end
+    else
+      for i = 1, n do order[i] = i end
+    end
+    return order
+  end
+
+  -- Which sheet FIELD and horizontal mirror ONE side's battlers are drawn
+  -- from this frame. Normal layout: the player reads its own BACK sprite
+  -- (the native over-the-shoulder view, unmirrored) and the enemy its FRONT
+  -- sprite. FANTASY LAYOUT turns the player's column around too, so both
+  -- teams read the SAME front sheets mirrored to face one another -- the
+  -- player's FRONT sprite flipped about the y-axis (drawSprite's flipX),
+  -- the enemy's exactly as before. Returns (field, flipX).
+  function Screen:spriteArt(side)
+    if side == "player" then
+      if self.fantasyLayout then return "spriteFront", true end
+      return "spriteBack", false
+    end
+    return "spriteFront", false
+  end
+
   -- The x centres (design px) for one side's row of readouts, one per entry
   -- in `centres` (that side's slot centres, in battler order).
   --
@@ -970,7 +1458,12 @@ return function(mod)
   end
 
   local function displayName(mon)
-    return mon.nickname or mon.name or mon.species or "???"
+    -- __g9DisplayName is recorded by combat/modern_transform.lua when a
+    -- Transform / Imposter / Illusion tells the ENGINE to present this battler
+    -- as another species (round 181). This screen reads the HUD name straight
+    -- off the mon, so without this the engine's rename landed on the battler
+    -- only and the name replacement was invisible here.
+    return mon.__g9DisplayName or mon.nickname or mon.name or mon.species or "???"
   end
 
   -- The mon's maximum hit points, whichever field this generation keeps it in.
@@ -1080,8 +1573,34 @@ return function(mod)
   local function resolveSprite(r, boss, battler, spriteField, data, scaleMul)
     local mon = battler and battler.mon
     if not mon then return nil end
-    local def = data and data.pokemon and data.pokemon[mon.species]
+    -- DISPLAY SPECIES (round 181). A Transform / Imposter / Illusion asks the
+    -- ENGINE to present this battler as another species --
+    -- combat/modern_transform.lua records it as __g9DisplaySpecies. The engine
+    -- swaps mon.species only for the duration of the NATIVE draw (whose pic it
+    -- draws from battler.sprite); this screen resolves every pic from
+    -- mon.species ITSELF, so without this it kept drawing the real species and
+    -- both the Transform art and the Illusion disguise stayed invisible here.
+    -- Prefer the recorded species; mon.__g9DisplaySpecies (same value, written
+    -- by the engine for calls with no battler -- e.g. prewarmSlot's) is the
+    -- fallback, then the real species.
+    local shown = (battler and battler.__g9DisplaySpecies)
+      or mon.__g9DisplaySpecies or mon.species
+    local def = data and data.pokemon and data.pokemon[shown]
     local path = def and def[spriteField]
+    -- A sprite pack keys its sheet off mon.species (g9-battle-sprites'
+    -- monStem -> resolveStem(mon.species)), so the two seams below are raised
+    -- with mon.species temporarily set to the species being drawn and restored
+    -- right after -- the same pcall-guarded swap the engine uses for its own
+    -- draw. The real value is never left mutated, even if a seam errors.
+    local realSpecies = mon.species
+    local function withShownSpecies(fn)
+      if shown == realSpecies then return fn() end
+      mon.species = shown
+      local ok, a, b = pcall(fn)
+      mon.species = realSpecies
+      if not ok then error(a, 0) end
+      return a, b
+    end
     -- Resolve through the engine's own art seam instead of drawing the raw
     -- species-record field. National Dex sets spriteFront/spriteBack to its
     -- OWN placeholder for every species past the cart's roster, so reading
@@ -1091,7 +1610,7 @@ return function(mod)
     -- so this is the seam every other mon-pic consumer on Gen 2 already uses.
     if path and Runtime.wantsHook("pokemon.sprite") then
       local ctx = {
-        species = mon.species,
+        species = shown,
         side = (spriteField == "spriteBack") and "back" or "front",
         kind = "battle",
         mon = mon,
@@ -1099,8 +1618,10 @@ return function(mod)
         data = data,
         shiny = mon.shiny and true or false,
       }
-      local hooked = Runtime.call("pokemon.sprite",
-        function(value) return value end, path, ctx)
+      local hooked = withShownSpecies(function()
+        return Runtime.call("pokemon.sprite",
+          function(value) return value end, path, ctx)
+      end)
       if type(hooked) == "string" and hooked ~= "" then path = hooked end
     end
     local img = path and loadSprite(path)
@@ -1123,7 +1644,7 @@ return function(mod)
     local fieldScale = scaleMul or (sideBack and SPRITE_SCALE_BACK or SPRITE_SCALE_FRONT)
     if Runtime.wantsHook("battle.mon_pic") then
       local pctx = {
-        species = mon.species,
+        species = shown,
         side = (spriteField == "spriteBack") and "back" or "front",
         mon = mon,
         battler = battler,
@@ -1132,6 +1653,17 @@ return function(mod)
         -- data already -- so this carries the real table rather than
         -- reaching for a screen `self` that is not in scope here.
         battle = data and { data = data } or nil,
+        -- A WILD raid boss's gimmick is stamped on the battle by
+        -- special_boss.lua (battle.g9BossKind) but deliberately never
+        -- ACTIVATED, so the sprite mod cannot see it in any live tera/dynamax
+        -- state -- it draws the boss ordinary while the opening F-box
+        -- announces "Tera WATER". pushBattleBattleScreen copies that
+        -- declaration onto the boss battler as `g9RaidGimmick`; forward it
+        -- here (boss slot only) so the mod can paint the declared crystal
+        -- film / Dynamax cloud. Visual only: the live state still wins
+        -- whenever it exists, and no declaration means no change at all.
+        boss = boss and true or nil,
+        bossGimmick = boss and battler.g9RaidGimmick or nil,
         -- NATURAL SIZE: the slot is an anchor, not a box. The mod bakes the
         -- sheet at exactly `scale` x its own (trimmed) pixels and returns an
         -- image that is ALREADY the final size, so the blit below is 1:1 in
@@ -1156,8 +1688,10 @@ return function(mod)
         natural = true,
         scale = fieldScale * (boss and BOSS_MUL or 1) * DS,
       }
+      if shown ~= realSpecies then mon.species = shown end
       local ok, swapped = pcall(Runtime.call, "battle.mon_pic",
         function(value) return value end, img, pctx)
+      mon.species = realSpecies
       -- The pack's natural bake comes back rasterised at CANVAS scale, so
       -- it is blitted 1:1 there -- one design px is DS canvas px, hence the
       -- / DS in the draw scale below. A vanilla pic (no pack, or a sheet
@@ -1213,7 +1747,16 @@ return function(mod)
   -- here so the mon materializes without moving; every existing caller
   -- omits it and draws fully opaque (alpha defaults to 1), so nothing
   -- else about a sprite's draw changes.
-  local function drawSprite(r, boss, battler, spriteField, data, anchorRight, offX, offY, appear, scaleMul, alpha)
+  --
+  -- An optional `flipX` mirrors the blit horizontally about the slot's own
+  -- centre (used only by the FANTASY LAYOUT's player column, which draws
+  -- front battle sprites turned to face the enemy side). love.graphics.draw
+  -- anchors at the image's top-LEFT and a negative x-scale mirrors toward
+  -- -x, so the blit is drawn from (dx + dw) with sx = -scale for the exact
+  -- same on-screen box, reversed; the returned bottom-center anchor is
+  -- unchanged either way, so the HUD, the ball's landing spot and every
+  -- move animation still agree with where the art lands.
+  local function drawSprite(r, boss, battler, spriteField, data, anchorRight, offX, offY, appear, scaleMul, alpha, flipX)
     local img, naturalBake = resolveSprite(r, boss, battler, spriteField, data, scaleMul)
     if not img then return nil end
     local iw, ih = img:getDimensions()
@@ -1234,14 +1777,22 @@ return function(mod)
     -- with the art.
     if boss then dy = dy + BOSS_Y_SHIFT end
     love.graphics.setColor(1, 1, 1, alpha or 1)
-    love.graphics.draw(img, dx, dy, 0, scale, scale)
+    if flipX then
+      love.graphics.draw(img, dx + dw, dy, 0, -scale, scale)
+    else
+      love.graphics.draw(img, dx, dy, 0, scale, scale)
+    end
     -- The bottom-center anchor; this sprite's own drawn box (top y and
     -- height, design px); and that height at appear = 1 (see the header
     -- note -- `appear` is only ever a plain multiplier on the scale, so
     -- the full-size height is just the art's height over its bake
     -- divisor, which is also the right answer when appear is 0).
     local fullH = ih / (naturalBake and DS or 1)
-    return dx + dw / 2, dy + dh, dy, dh, fullH
+    -- The drawn width, returned alongside the height: the spriteAnchor below
+    -- carries it so the background sibling can size a life ring to the mon
+    -- (a wide mon gets a wide ring). Same units and same blit scale as dw --
+    -- it grows on the materialize exactly like dh does.
+    return dx + dw / 2, dy + dh, dy, dh, fullH, dw
   end
 
   -- Draws a raw image -- a trainer's pic, which has no species record --
@@ -1953,6 +2504,48 @@ return function(mod)
     love.graphics.pop()
   end
 
+  -- Build the player's FIELD roster for a battle -- the mons that actually
+  -- stand on the field when the fight opens, as an array of combat battlers.
+  --
+  -- A fainted Pokemon can never be sent out, so it is skipped ENTIRELY.  The
+  -- caller's own payload is what decides the field SIZE (its length is
+  -- `wanted`), and a fainted mon in that payload is replaced by the next
+  -- HEALTHY mon in the party (walked in order) so the fight still opens with
+  -- the number of battlers the caller asked for instead of silently
+  -- shrinking.  Identity-guarded: a mon already on the field is never added
+  -- twice, so a caller that already sends a healthy roster gets exactly what
+  -- it sent (no backfill happens once `wanted` is met).
+  function Screen.playerFieldRoster(players, party, combat)
+    local out = {}
+    local seen = {}
+    local wanted = 0
+    local function add(mon)
+      if mon == nil or seen[mon] then return end
+      if (mon.hp or 0) <= 0 then return end
+      seen[mon] = true
+      out[#out + 1] = combat.newBattler(mon, "player")
+    end
+    for _, mon in ipairs(players or {}) do
+      wanted = wanted + 1
+      add(mon)
+    end
+    if #out < wanted then
+      for _, mon in ipairs(party or {}) do
+        if #out >= wanted then break end
+        add(mon)
+      end
+    end
+    -- Degenerate guard: if EVERY candidate is fainted (the player has already
+    -- lost), keep the caller's own roster rather than opening the fight with
+    -- an empty field to draw.
+    if #out == 0 then
+      for i, mon in ipairs(players or {}) do
+        out[i] = combat.newBattler(mon, "player")
+      end
+    end
+    return out
+  end
+
   function Screen.new(game, world, payload, combat, gameData, battle, g9dex)
     local self = setmetatable({}, Screen)
     self.game = game
@@ -1972,6 +2565,18 @@ return function(mod)
     -- constructor's own arguments are assembled.
     self.battle = battle
     self.g9dex = g9dex
+    -- FANTASY COMBAT (options.lua's row): read fresh per battle, so a
+    -- change in the mod manager takes effect on the next fight.  When ON,
+    -- drawContent hands the whole bottom band to fantasy_combat.lua and
+    -- the ally over-the-head HUD readouts are dropped in favour of its
+    -- party status list (see drawContent's own HUD pass).
+    self.fantasyCombat = (Fantasy ~= nil) and Fantasy.enabled() or false
+    -- FANTASY LAYOUT (options.lua's own row): read fresh per battle too, so
+    -- a change in the mod manager takes effect on the next fight. When ON,
+    -- Screen:slotRects swaps the horizontal grid for the vertical columns
+    -- below and drawContent draws the player's side from its front sprites,
+    -- mirrored, with slot 1 painted last (see the FANTASY LAYOUT block).
+    self.fantasyLayout = Screen.fantasyLayoutEnabled()
     -- Read fresh from this mod's own active layout preset (layouts.lua)
     -- rather than baked in -- see that file's own header for the preset
     -- file shape/naming and how the active one is chosen. Read up here,
@@ -1990,11 +2595,15 @@ return function(mod)
     -- once here and threaded into every drawSprite call. Each side is then
     -- drawn at its own scale x its OWN pixels, so relative sizes within a
     -- side are preserved while the two teams resize independently.
+    -- (v3.5.12) Screen:battleSpriteScale owns the resolution so the FANTASY-
+    -- EXCLUSIVE asset size can layer on it: with the fantasy layout on it
+    -- multiplies each side by the fantasy asset-size factor (the preset's
+    -- `spriteScaleFantasy*`, else Screen.FANTASY.spriteScale*, times the
+    -- FANTASY SIZE option). With the layout off the values below are exactly
+    -- the old expression -- the fantasy layers are never read.
     local legacyScale = tonumber(activeLayout and activeLayout.spriteScale)
-    self.spriteScaleFront = tonumber(activeLayout and activeLayout.spriteScaleFront)
-      or legacyScale or SPRITE_SCALE_FRONT
-    self.spriteScaleBack = tonumber(activeLayout and activeLayout.spriteScaleBack)
-      or legacyScale or SPRITE_SCALE_BACK
+    self.spriteScaleFront = self:battleSpriteScale(activeLayout, legacyScale, false)
+    self.spriteScaleBack = self:battleSpriteScale(activeLayout, legacyScale, true)
     -- Looped, not hardcoded to exactly 2 -- combat.lua's own logic
     -- (isAlive/chooseAiAction/orderActions/sideDefeated/etc) already
     -- just iterates these arrays with ipairs, so rendering (drawContent,
@@ -2029,9 +2638,22 @@ return function(mod)
         self.enemyBench[#self.enemyBench + 1] = roster[i]
       end
     end
-    self.playerBattlers = {}
-    for i, mon in ipairs(payload.players) do
-      self.playerBattlers[i] = combat.newBattler(mon, "player")
+    self.playerBattlers = Screen.playerFieldRoster(payload.players,
+      (self.game and self.game.save and self.game.save.party)
+        or (self.battle and self.battle.party),
+      combat)
+    -- EXP SHARE active-set tracking (exp_share.lua / the EXP SHARE option).
+    -- Per enemy mon, the set of player mons that stood on the field at any
+    -- point during that enemy's presence.  The rule: a mon is "active" for an
+    -- enemy's exp if it was out while the enemy was out, and only an enemy
+    -- SWITCH-OUT (not a faint) resets the set.  Seeded here with the opening
+    -- field; extended when a player mon switches in (Screen:expMarkActive,
+    -- from the voluntary and forced switch paths) and reset for a replacement
+    -- enemy (Screen:advanceEnemyReplacement).  Read only by the EXP SHARE
+    -- seam (Screen:awardFaintExp -> battle.expSharePending).
+    self.expActive = {}
+    for _, enemy in ipairs(self.enemyBattlers) do
+      self.expActive[enemy.mon] = self:expFieldSet()
     end
     self.message = nil
     -- Kept for anything reading it, though the 1.5x trainer EXP bonus
@@ -2052,6 +2674,19 @@ return function(mod)
     -- the side). Screen:shownHpOf reads it; Screen:stepHpAnim walks it.
     self.shownHp = {}
     self.hpAnim = nil
+    -- The input-pacing clocks (see INPUT_DELAY's own note above).
+    -- inputLock is armed only when an action is actually committed (a move
+    -- or positional swap queued -- Screen:queueAction/queueSwapAction) and
+    -- freezes every selection phase while it runs; beatHold counts down
+    -- after a resolving text beat and gates that beat's acknowledgement.
+    -- Both are decremented once per frame in Screen:update.
+    self.inputLock = 0
+    self.beatHold = 0
+    -- The HP chase's own clock/start values, paired with self.hpAnim by
+    -- Screen:armHpAnim and consumed by Screen:stepHpAnim (a fixed
+    -- HP_ANIM_DURATION drain rather than the old per-frame step).
+    self.hpAnimT = 0
+    self.hpAnimFrom = nil
     -- Damage Numbers (option-gated by g9-battle-engine's
     -- "damage_numbers" option -- see Screen:spawnDmgNumber): a short list
     -- of { mon, text, color, t } floating HP-change labels. Emptied and
@@ -2066,6 +2701,7 @@ return function(mod)
     self.menuLayout = (settings.menuLayout == "grid") and "grid" or "list"
     self.customButtonLabel = (type(settings.customButtonLabel) == "string"
       and settings.customButtonLabel ~= "") and settings.customButtonLabel or nil
+    self.moveAnimations = (settings.moveAnimations == true)
     self.menuOrder = { "FIGHT", "BAG", "PKMN", "RUN" }
     if self.customButtonLabel then self.menuOrder[#self.menuOrder + 1] = "CUSTOM" end
     -- SWITCH -- the positional ally swap -- is a LAYOUT capability, not a
@@ -2081,15 +2717,22 @@ return function(mod)
     end
     self.swapEnabled = (not self.isBoss) and livingAllies >= 2
     if self.swapEnabled then table.insert(self.menuOrder, 2, "SWITCH") end
-    -- The E-cell layout tables this screen draws/navigates (grid/cross
-    -- modes; list mode reads self.menuOrder directly). Built per screen
-    -- because the SWITCH cell is conditional; the shared module constants
-    -- stay the no-SWITCH shapes so existing behaviour is untouched.
+    -- The E-cell layout tables this screen draws/navigates (grid mode;
+    -- list mode reads self.menuOrder directly). Grid mode is always the
+    -- 3-row x 2-col shape now -- no cross layout in grid mode. Built per
+    -- screen because the SWITCH and FORMS cells are conditional.
+    --
+    -- Doubles / Triples (swapEnabled):  Singles / Horde / Boss:
+    --   FIGHT | PKMN                      FIGHT | PKMN
+    --   SWITCH| BAG                       FORMS | BAG   (if customButtonLabel)
+    --   FORMS | RUN  (if custom)               | RUN
+    --   RUN   |      (no custom)          BAG   | RUN   (no customButtonLabel)
+    self.crossSlots = nil  -- cross layout retired from grid mode
     if self.menuLayout == "grid" then
-      if self.customButtonLabel then
-        self.crossSlots = self.swapEnabled and CROSS_SLOTS_SW or CROSS_SLOTS
+      if self.swapEnabled then
+        self.gridRows = self.customButtonLabel and GRID3_ROWS_SW or GRID2_ROWS_SW
       else
-        self.gridRows = self.swapEnabled and GRID2_ROWS_SW or GRID2_ROWS
+        self.gridRows = self.customButtonLabel and GRID3_ROWS or GRID2_ROWS
       end
     end
     -- Battlers that own a queued (not yet resolved) positional swap, kept
@@ -2117,6 +2760,11 @@ return function(mod)
     -- guessed position. moveAnim is nil when nothing is playing.
     self.spriteAnchor = {}
     self.moveAnim = nil
+    -- How long the CURRENT move animation has been playing, and which
+    -- animation that is -- Screen:update accumulates the former and resets
+    -- it whenever self.moveAnim changes (see MOVE_ANIM_SAFETY).
+    self.moveAnimTime = 0
+    self.moveAnimTracked = nil
     self:installEventProbe()
     -- Real vanilla entry sequence: narration lines ("Wild X appeared!"
     -- / "{TRAINER} wants to battle!" + sent-out lines), then "Go! P!"
@@ -2338,6 +2986,7 @@ return function(mod)
   function Screen:armHpAnim(snapshot)
     if type(snapshot) ~= "table" then return end
     local pending = nil
+    local from = nil
     for mon, hp in pairs(snapshot) do
       if self.shownHp[mon] == nil then
         self.shownHp[mon] = hp
@@ -2349,60 +2998,64 @@ return function(mod)
         self:spawnDmgNumber(mon, hp - self.shownHp[mon])
         pending = pending or {}
         pending[mon] = hp
+        -- Where this drain starts from, so Screen:stepHpAnim can
+        -- interpolate start->target over HP_ANIM_DURATION.
+        from = from or {}
+        from[mon] = self.shownHp[mon]
       end
     end
     self.hpAnim = pending
+    self.hpAnimFrom = from
+    self.hpAnimT = 0
   end
 
-  -- One frame of the chase, over every bar at once.
-  --
-  -- Step size is the cart's own, per mon: under 48 max HP the bar moves
-  -- one hit point a frame (_AnimateHPBar's ShortAnim_UpdateVariables);
-  -- from 48 up it moves one PIXEL a frame, i.e. maxHp/48 hit points
-  -- (LongAnim_UpdateVariables) -- engine/battle/anim_hp_bar.asm:42-82,
-  -- ported here off src/ui/gen2/BattleState.lua:1013-1039 rather than
-  -- reinvented as a seconds-based lerp, so a bar drains at exactly the
-  -- rate the native screen drains it at. Screen:update, like
-  -- BattleState:update(_dt) (:2113), ignores dt and runs once a frame,
-  -- so "a frame" means the same thing on both screens.
-  --
-  -- Widened from native's single anim.side to every mon with a pending
-  -- target, because a spread move legitimately drains several bars in
-  -- the same beat here and there is no reason to serialize them.
+  -- One frame of the chase, over every bar at once, over a FIXED
+  -- HP_ANIM_DURATION (0.3s) wall-clock window rather than the cart's own
+  -- per-frame step -- the user's "0.3 seconds duration of this depletion
+  -- animation". Start values come from Screen:armHpAnim (self.hpAnimFrom),
+  -- so the displayed position is a pure function of elapsed time rather
+  -- than of frame count. Widened from native's single anim.side to every
+  -- mon with a pending target, because a spread move legitimately drains
+  -- several bars in the same beat here and there is no reason to serialize
+  -- them.
   --
   -- Returns true while it still had work, so the caller can hold the
   -- message queue the way AnimateHPBar's own loop holds the cart
-  -- (BattleState.lua:2183-2185).
-  function Screen:stepHpAnim()
+  -- (BattleState.lua:2183-2185). p >= 1 forces every value onto its target,
+  -- so this always terminates -- the chase cannot stall a battle even if an
+  -- event ever carried a nonsense number.
+  function Screen:stepHpAnim(dt)
     local pending = self.hpAnim
     if not pending then return false end
+    self.hpAnimT = (self.hpAnimT or 0) + (dt or 0)
+    local p = math.min(1, self.hpAnimT / HP_ANIM_DURATION)
     local moved, remaining = false, false
     for mon, target in pairs(pending) do
+      local start = (self.hpAnimFrom and self.hpAnimFrom[mon])
+        or self.shownHp[mon] or target
       local shown = self.shownHp[mon]
       if shown == nil then
         self.shownHp[mon] = target
       elseif shown ~= target then
-        local maxHp = mon.maxHp or (mon.stats and mon.stats.hp) or 0
-        local step = 1
-        if maxHp >= HpBar.LENGTH_PX then
-          step = math.max(1, math.ceil(maxHp / HpBar.LENGTH_PX))
-        end
-        if shown < target then
-          shown = math.min(target, shown + step)
+        -- Whole hit points only, never past the target in either direction.
+        local v = math.floor(start + (target - start) * p + 0.5)
+        if target > shown then
+          v = math.min(target, math.max(shown, v))
         else
-          shown = math.max(target, shown - step)
+          v = math.max(target, math.min(shown, v))
         end
-        self.shownHp[mon] = shown
+        self.shownHp[mon] = v
         moved = true
-        if shown ~= target then remaining = true end
+        if v ~= target then remaining = true end
       end
     end
-    -- Cleared on the same frame the last hit point lands, so the hold
-    -- ends the instant the bars are honest again. Every walk above is a
-    -- clamped integer step of at least 1 toward a fixed target, so this
-    -- always terminates -- the chase cannot stall a battle even if an
-    -- event ever carried a nonsense number.
-    if not remaining then self.hpAnim = nil end
+    -- Cleared on the same frame the last hit point lands, so the hold ends
+    -- the instant the bars are honest again.
+    if not remaining then
+      self.hpAnim = nil
+      self.hpAnimFrom = nil
+      self.hpAnimT = 0
+    end
     return moved
   end
 
@@ -2842,7 +3495,10 @@ return function(mod)
   --   WILD:   one "Wild X appeared!" per enemy -- each appears in place
   --     at its final sprite position and fades from invisible to visible
   --     (there is no slide-in at all) -> backpicSlide -> "Go! P!" per
-  --     player battler (pokeball throw).
+  --     player battler (pokeball throw).  A SPECIAL BOSS's raid line
+  --     ("You have found a Tera FIRE Charizard raid!") is what that first
+  --     enemy's own beat SAYS -- it replaces "Wild X appeared!", shown
+  --     while the boss fades in, rather than preceding it.
   -- A battle with no enemies at all skips straight to the menu (empty
   -- sequence). Kinds: "msg" narration only, "trainerSlide"/"backpicSlide"
   -- start a pic's slide-off (the next beat advances when it completes),
@@ -2852,8 +3508,27 @@ return function(mod)
   -- slot `slot`'s platform and materializes that battler there.
   function Screen:buildIntroSequence()
     local seq = {}
+    -- A SPECIAL BOSS's raid line replaces the native "Wild X appeared!"
+    -- narration: a wild raid boss opens ON that line while it fades in (see
+    -- the wild branch below), rather than reading the raid line and then a
+    -- plain "Wild X appeared!" for the same mon.  The line comes from
+    -- special_boss.lua's bossAnnouncement, read lazily like every other use of
+    -- that module; an ordinary boss, or SPECIAL BOSSES = normal, yields nil,
+    -- so every other fight's intro is exactly what it was.  A TRAINER fight
+    -- (which has no "Wild X appeared!" line to replace, and which
+    -- special_boss.lua never touches anyway) keeps it as a leading narration
+    -- beat.
+    local bossLine = nil
+    local specialBoss = mod.exports.specialBoss
+    if specialBoss and specialBoss.bossAnnouncement then
+      local first = self.enemyBattlers and self.enemyBattlers[1]
+      local ok, line = pcall(specialBoss.bossAnnouncement, self.battle,
+        first and displayName(first.mon) or nil)
+      if ok and type(line) == "string" and line ~= "" then bossLine = line end
+    end
     local tName = self:trainerDisplayName()
     if tName then
+      if bossLine then seq[#seq + 1] = { text = bossLine, kind = "msg" } end
       seq[#seq + 1] = { text = tName .. " wants to battle!", kind = "msg" }
       if self.showEnemyTrainer then
         seq[#seq + 1] = { kind = "trainerSlide" }
@@ -2864,8 +3539,10 @@ return function(mod)
       end
     else
       for i, b in ipairs(self.enemyBattlers) do
-        seq[#seq + 1] = { text = "Wild " .. displayName(b.mon) .. " appeared!",
-          kind = "fade", slot = i }
+        -- The raid line takes the first (and, for a boss fight, only) enemy's
+        -- own appearing beat: one line, shown while the boss fades in.
+        local text = (i == 1 and bossLine) or ("Wild " .. displayName(b.mon) .. " appeared!")
+        seq[#seq + 1] = { text = text, kind = "fade", slot = i }
       end
     end
     if self.showPlayerTrainer then
@@ -2989,6 +3666,10 @@ return function(mod)
     self.menuCursor = "FIGHT"
     self.message = nil
     self.phase = "actionMenu"
+    -- No delay here: the action box is SHOWN and immediately selectable.
+    -- Opening a menu is not a commit (the user's "no delay between FIGHT >
+    -- move selection > selecting target"), so the window is armed only
+    -- where a move/swap is actually queued, not on entry.
   end
 
   -- CUSTOM ("FORMS", per this mod's own settings.lua default) opens a
@@ -3294,6 +3975,10 @@ return function(mod)
       end
       self.gimmickCandidates = nil
       self.gimmickArmState = nil
+      -- A real pick (whether it armed, or battle_forms refused it) is a
+      -- commit, so it arms the window like a queued move. The B cancel
+      -- above returns before this, so backing out of FORMS adds no delay.
+      self.inputLock = INPUT_DELAY
       self.phase = "actionMenu"
       return
     end
@@ -3401,12 +4086,15 @@ return function(mod)
     return sr, sc
   end
 
-  -- Moves self.menuCursor for GRID mode -- the SWITCH cross and the plain
-  -- grids by coordinate movement (stepCell), or, when SWITCH is off and a
-  -- custom button is set, the original 5-cell cross and its two explicit
-  -- cycles. Same true/false return contract as moveMenuCursorList.
+  -- Moves self.menuCursor for GRID mode -- plain 2x2 and 3x2 grids use
+  -- free four-direction coordinate movement (stepCell). The legacy
+  -- cross layout, if self.crossSlots is ever set by an external caller,
+  -- uses the original explicit cycles. Same true/false return contract
+  -- as moveMenuCursorList.
   function Screen:moveMenuCursorGrid(input)
-    if self.customButtonLabel and not self.swapEnabled then
+    if self.crossSlots then
+      -- Legacy cross layout: explicit-cycle navigation (a step from any
+      -- corner lands on a nil cell; coordinate math skips straight through).
       if input:wasPressed("right") then
         self.menuCursor = cycleStep(CROSS_RIGHT_CYCLE, self.menuCursor, 1)
       elseif input:wasPressed("left") then
@@ -3420,7 +4108,8 @@ return function(mod)
       end
       return true
     end
-    local grid = self.crossSlots or self.gridRows
+    -- Plain grid (2x2 or 3x2): free four-direction movement via stepCell.
+    local grid = self.gridRows
     local row, col = findCell(grid, self.menuCursor)
     if not row then return false end
     local nr, nc
@@ -3618,11 +4307,10 @@ return function(mod)
   -- nil holes ({"FIGHT", nil, "PKMN"}), and ipairs stops dead at the
   -- first nil, so it would never reach the third column at all.
   function Screen:drawActionMenuEGrid()
-    if self.customButtonLabel then
-      -- Column geometry swaps to the wider-col-1 SWITCH variant when this
-      -- battle offers SWITCH; the plain/cross shapes are chosen by
-      -- Screen.new (self.crossSlots) and the two column tables below stay
-      -- in lockstep with them.
+    if self.crossSlots then
+      -- Cross layout (only reached when self.crossSlots is explicitly set --
+      -- grid mode no longer sets it; crossSlots is kept for any external
+      -- caller that still forces the old 3x3 cross shape).
       local slotColX = self.swapEnabled and CROSS_SLOT_X_SW or CROSS_SLOT_X
       local slotColW = self.swapEnabled and CROSS_SLOT_W_SW or CROSS_SLOT_W
       local centerBudget = self.swapEnabled and CROSS_CENTER_BUDGET_SW or CROSS_CENTER_BUDGET
@@ -3645,12 +4333,13 @@ return function(mod)
       end
       return
     end
-    -- Plain grid: the original 2x2 at GRID_ROW_GAP_2/GRID_TEXT_SCALE_2, or
-    -- the 3-row SWITCH shape at the cross's own tighter gap/scale -- a 3rd
-    -- row at the 2-row spacing would run past the shorter bottom box.
+    -- Plain grid: 2x2 uses GRID_ROW_GAP_2 / GRID_TEXT_SCALE_2; any 3-row
+    -- shape (SWITCH or FORMS adds the third row) needs the tighter gap
+    -- and smaller text scale so the third row doesn't run past the box.
     local grid = self.gridRows
-    local scale = self.swapEnabled and CROSS_TEXT_SCALE or GRID_TEXT_SCALE_2
-    local gap = self.swapEnabled and GRID_ROW_GAP_3 or GRID_ROW_GAP_2
+    local is3rows = #grid >= 3
+    local scale = is3rows and CROSS_TEXT_SCALE or GRID_TEXT_SCALE_2
+    local gap   = is3rows and GRID_ROW_GAP_3   or GRID_ROW_GAP_2
     for r = 1, #grid do
       for c = 1, 2 do
         local id = grid[r] and grid[r][c]
@@ -3661,7 +4350,7 @@ return function(mod)
           local y = self.eTextY + GRID_Y_OFFSET + (r - 1) * gap
           drawScaledText(label, x, y, scale)
           if id == self.menuCursor then
-            if self.swapEnabled then
+            if is3rows then
               drawScaledCode(CURSOR_CODE, x - CROSS_CURSOR_OFFSET, y, scale)
             else
               Font.drawCode(CURSOR_CODE, x - GRID_CURSOR_OFFSET_2, y)
@@ -3690,9 +4379,14 @@ return function(mod)
   -- own real battle call site uses (BattleState:openPack,
   -- src/ui/gen2/BattleState.lua:2171-2185) -- battle=true so picking an
   -- item goes straight to onChoose with no submenu, world={} matching
-  -- that real call verbatim. Only ball items (def.pocket == "BALL",
-  -- the same field BattleState:useItem itself branches on) do anything
-  -- here yet -- every other item is a stated stub, not silently ignored.
+  -- that real call verbatim.  Every battle-usable item is real now: a ball
+  -- throws, a battle-only stat item runs on the active mon, and every
+  -- party-target item (the potion line, the status cures and their berries,
+  -- REVIVE / MAX REVIVE, the ETHER / ELIXER family, BITTER BERRY) opens the
+  -- engine's own party picker and is applied through the engine's Gen 2
+  -- ItemEffects -- see Screen:useItemGen2 and Screen:applyPartyItem.  Gen 1
+  -- is the cart's own BagMenu, which applies its items itself and reports
+  -- the spent turn back through battle:itemUsed (native.lua's N.openBag).
   --
   -- suppressInputFrame (set in every callback below that returns
   -- control to this screen) guards against a real bug found live: B
@@ -3702,11 +4396,29 @@ return function(mod)
   -- stack and dropped straight back to the overworld instead of
   -- returning to this battle. See Screen:update's own check.
   ------------------------------------------------------------------
+  -- data/items/heal_status.asm StatusHealingActions: the four rows whose
+  -- status mask is %11111111.  HealStatus's `.not_full_heal` arm is what makes
+  -- exactly these also clear SUBSTATUS_CONFUSED, and IsItemUsedOnConfusedMon
+  -- what lets them be spent on a mon whose only complaint IS the confusion
+  -- (see Screen:applyPartyItem).
+  local FULL_MASK_HEALERS = {
+    FULL_HEAL = true, FULL_RESTORE = true, HEAL_POWDER = true,
+    MIRACLEBERRY = true,
+  }
   function Screen:openBag()
     self.phase = "submenu"
-    -- Gen 1's native BagMenu throws through the native BattleState, not this
-    -- scene's model, so the backend opens a ball-only ListMenu wired straight
-    -- to this screen's own throwBall instead (see native.lua).
+    -- Where each party mon's HP stands right now, so a Gen 1 item used out
+    -- of the cart's own bag can animate this screen's own HP bar from the
+    -- value the player was looking at when the bag opened
+    -- (Screen:onBagItemUsed reads it back).  Gen 2 captures the same pre-use
+    -- value per item in Screen:applyPartyItem instead.
+    self.bagHpBefore = {}
+    for _, mon in ipairs(self.game.save and self.game.save.party or {}) do
+      if mon then self.bagHpBefore[mon] = mon.hp or 0 end
+    end
+    -- Gen 1's bag is the cart's own BagMenu (native.lua's N.openBag): it
+    -- applies each item through ItemEffects and reports the spent turn back
+    -- through battle:itemUsed, which the backend routes to onBagItemUsed.
     if not N.isGen2 then
       N.openBag(self)
       return
@@ -3728,19 +4440,251 @@ return function(mod)
     })
   end
 
+  -- One PACK row was chosen.  A ball throws exactly as before; everything
+  -- else in a Gen 2 battle is the engine's own in-battle item use (see
+  -- Screen:useItemGen2).  Gen 1 never reaches here -- its BagMenu applies
+  -- its own items and reports back through Screen:onBagItemUsed.
   function Screen:useItem(itemId)
     local def = self.data.items and self.data.items[itemId]
-    if not N.isBall(itemId, def) then
+    if N.isBall(itemId, def) then
+      if not self:catchAllowed() then
+        self.message = "Can't throw a ball -- 2+ foes still standing!"
+        self.phase = "actionMenu"
+        return
+      end
+      self:throwBall(itemId)
+      return
+    end
+    if not N.isGen2 then
       self.message = "Can't use that here yet."
       self.phase = "actionMenu"
       return
     end
-    if not self:catchAllowed() then
-      self.message = "Can't throw a ball -- 2+ foes still standing!"
+    self:useItemGen2(itemId, def)
+  end
+
+  -- The non-ball half of the Gen 2 pack's battle arm, mirroring
+  -- src/ui/gen2/BattleState.lua's own BattleState:useItem: the engine's item
+  -- knowledge (Battle.X_ITEM_STATS / Battle.SUBSTATUS_ITEMS and the Gen 2
+  -- ItemEffects records) decides what an item does; this screen only opens
+  -- whichever real picker the item needs and then spends the turn the pack
+  -- costs.  Nothing here re-derives an effect, a number or a refusal line.
+  function Screen:useItemGen2(itemId, def)
+    local ItemEffects = N.ItemEffects
+    local BattleMod = N.Battle
+    -- Battle-only stat items (X ATTACK ... X ACCURACY / DIRE HIT / GUARD
+    -- SPEC): the BATTLE applies the stage or the substatus bit.  A refused
+    -- re-use (WontHaveAnyEffect_NotUsedMessage) costs neither the item nor
+    -- the turn.
+    if BattleMod and (BattleMod.X_ITEM_STATS[itemId]
+        or BattleMod.SUBSTATUS_ITEMS[itemId]) then
+      if not self.battle:useBattleItem(itemId) then
+        self.message = ItemEffects.TEXT_NO_EFFECT
+        self.phase = "actionMenu"
+        return
+      end
+      N.consumeItem(self.game.save, itemId)
+      -- The "Used the X!" / substatus lines come out of the battle itself
+      -- (Battle:useBattleItem emits them), so they are already queued.
+      self:queueItemResult(nil, nil, nil)
+      return
+    end
+    -- BattlePack's .ItemFunctionJumptable (engine/items/pack.asm): an item
+    -- that is ITEMMENU_NOUSE in a battle does nothing there at all.  The gate
+    -- has to sit here rather than in the pack, because the battle pack has no
+    -- field-menu filter of its own and the two nibbles disagree: a RARE CANDY
+    -- is ITEMMENU_PARTY in the FIELD and must not level a mon mid-fight, and a
+    -- BITTER BERRY is the reverse.
+    def = def or (self.data.items and self.data.items[itemId])
+    if def and def.battleMenu == "ITEMMENU_NOUSE" then
+      self.message = "That isn't going to help here."
       self.phase = "actionMenu"
       return
     end
-    self:throwBall(itemId)
+    -- BITTER BERRY: its whole effect is a battle substatus (confusion), so
+    -- it has no party target and never opens the party list (BitterBerryEffect).
+    if itemId == "BITTER_BERRY" then
+      return self:useBitterBerry(itemId)
+    end
+    -- Everything the pack can spend on a party mon -- the potion line and
+    -- the drinks, the status cures and their berries, REVIVE / MAX REVIVE,
+    -- the ETHER / ELIXER family, and (where the pack's battle menu allows
+    -- them) a RARE CANDY or a stone.
+    local action = ItemEffects.partyAction(itemId, self.data)
+    if action then
+      return self:openItemTargetPicker(itemId, action)
+    end
+    self.message = "That isn't going to help here."
+    self.phase = "actionMenu"
+  end
+
+  -- BitterBerryEffect reads wPlayerSubStatus3 straight off, so it acts on
+  -- whoever is out and a mon that is not confused refuses without spending
+  -- anything.
+  function Screen:useBitterBerry(itemId)
+    local ItemEffects = N.ItemEffects
+    local mon = self.battle.player
+    local state = mon and self.battle:volatile(mon)
+    if not (state and state.confuseCount) then
+      self.message = ItemEffects.TEXT_NO_EFFECT
+      self.phase = "actionMenu"
+      return
+    end
+    state.confuseCount = nil
+    N.consumeItem(self.game.save, itemId)
+    local name = mon.nickname or mon.name or mon.species
+    self:queueItemResult({ Strings("%s's confused no more!", name) }, nil, nil)
+  end
+
+  -- UseItem_SelectMon: every party-target item picks its mon FIRST, so a
+  -- benched mon can be healed, cured or stood back up mid-battle.  The
+  -- cart's own Gen 2 party list; backing out returns to the pack with
+  -- nothing spent (the routine's .SelectMon carry path).
+  function Screen:openItemTargetPicker(itemId, action)
+    local ItemEffects = N.ItemEffects
+    local restore = ItemEffects.RESTORE_PP[itemId]
+    local picksMove = (action == "pp") and restore and not restore.each
+    local party = (self.battle and self.battle.party)
+      or (self.game.save and self.game.save.party) or {}
+    self.phase = "submenu"
+    Screens.push(self.game, "Gen2PartyMenu", {
+      prompt = "useItem",
+      battle = true,
+      party = party,
+      onCancel = function()
+        self.suppressInputFrame = true
+        self:openBag()
+      end,
+      onChoose = function(slot, mon)
+        if picksMove and mon and not mon.isEgg then
+          return self:openItemMovePicker(itemId, mon, slot)
+        end
+        self:applyPartyItem(itemId, action, mon, nil, slot)
+      end,
+    })
+  end
+
+  -- RestorePPEffect's ETHER pair picks the move before the item lands; the
+  -- ELIXER pair walks every slot itself and needs no picker.
+  function Screen:openItemMovePicker(itemId, mon, partySlot)
+    Screens.push(self.game, "Gen2MoveDeleter", {
+      mon = mon,
+      moves = self.data and self.data.moves,
+      onCancel = function() self.game.stack:pop() end,
+      onChoose = function(moveIndex)
+        self.game.stack:pop()
+        self:applyPartyItem(itemId, "pp", mon, moveIndex, partySlot)
+      end,
+    })
+  end
+
+  -- The effect itself, exactly as src/ui/gen2/BattleState.lua's own
+  -- BattleState:applyPartyItem runs it: ItemEffects owns the arithmetic and
+  -- every refusal, the party picker it came from animates the HP fill, the
+  -- spent copy leaves the bag, and a landed use costs the turn.  `moveIndex`
+  -- is only read by the PP family; `partySlot` is what the picker's fill
+  -- addresses.
+  function Screen:applyPartyItem(itemId, action, mon, moveIndex, partySlot)
+    local ItemEffects = N.ItemEffects
+    local menu = self.game.stack and self.game.stack:top()
+    if not (menu and menu.showItemResult) then menu = nil end
+    local before = (mon and mon.hp) or 0
+    local result
+    if action == "pp" then
+      result = ItemEffects.usePpItem(itemId, mon, moveIndex, self.data)
+    else
+      result = ItemEffects.useOnMon(itemId, mon, self.data)
+    end
+    -- HealStatus's `.not_full_heal` and IsItemUsedOnConfusedMon: a $ff-mask
+    -- item used on whoever is OUT also clears SUBSTATUS_CONFUSED, and clears
+    -- it even when the status byte was already empty -- which is the one case
+    -- where a FULL HEAL the field routine refuses is still spent in battle.
+    if mon and FULL_MASK_HEALERS[itemId] and mon == self.battle.player then
+      local state = self.battle:volatile(mon)
+      if state and state.confuseCount then
+        state.confuseCount = nil
+        if not (result and result.used) then
+          result = { used = true,
+            text = Strings("%s came to its senses.", displayName(mon)) }
+        end
+      end
+    end
+    if not (result and result.used) then
+      -- A refusal costs neither the item nor the turn; the picker comes
+      -- down and the cart's own "no effect" line stands in the action box.
+      if menu then self.game.stack:pop() end
+      self.message = (result and result.text) or ItemEffects.TEXT_NO_EFFECT
+      self.suppressInputFrame = true
+      self.phase = "actionMenu"
+      return
+    end
+    N.consumeItem(self.game.save, itemId)
+    -- Every HP-restoring effect animates from the value latched before the
+    -- item landed (item_effects.asm .doneHealing / wHPBarOldHP); a status
+    -- cure, a revive that moved nothing, or a PP restore just prints.
+    local climbs = (action == "heal" or action == "revive")
+      and mon and (mon.hp or 0) ~= before
+    local function finish(messages)
+      if menu then self.game.stack:pop() end
+      self:queueItemResult(messages, climbs and mon or nil, climbs and before or nil)
+    end
+    if menu and climbs then
+      self:stopItemAlarm()
+      menu:showItemResult(partySlot, {
+        fromHp = before,
+        toHp = mon.hp,
+        sfx = "Sfx_Potion",
+        text = result.text,
+        onDone = function() finish(nil) end,
+      })
+      return
+    end
+    finish(result.text and { result.text } or nil)
+  end
+
+  -- engine/items/item_effects.asm:1657: every HP-restoring effect zeroes
+  -- wLowHealthAlarm before it touches the HP or runs the fill, so the low-HP
+  -- siren dies with the item rather than with the bar.  Gen 1 owns its own
+  -- copy in ItemEffects.use; Gen 2's Battle only carries the alarm on its
+  -- own screen, so this is a no-op hook unless the model grew one.
+  function Screen:stopItemAlarm()
+    local battle = self.battle
+    if battle and type(battle.stopAlarm) == "function" then
+      pcall(battle.stopAlarm, battle)
+    end
+  end
+
+  ------------------------------------------------------------------
+  -- ITEM TURN OUTCOME.  Both generations funnel here once an item has
+  -- landed: a Gen 1 BagMenu reports through battle:itemUsed
+  -- (Screen:onBagItemUsed), a Gen 2 row through Screen:applyPartyItem.
+  -- An item spends the slot's action exactly as a move does -- the turn
+  -- then resolves with the AI's action and the residual, the same path a
+  -- missed ball already takes through Screen:advanceSlotOrResolve -- and
+  -- any line the screen itself owes the player is queued as a beat ahead
+  -- of the engine's own events (see Screen:beginResolving).
+  ------------------------------------------------------------------
+  function Screen:onBagItemUsed(messages, opts)
+    local target = opts and opts.target
+    local before = target and self.bagHpBefore and self.bagHpBefore[target]
+    self:queueItemResult(messages, target, before)
+  end
+
+  function Screen:queueItemResult(messages, target, before)
+    if messages then
+      self.itemMessages = self.itemMessages or {}
+      for _, m in ipairs(messages) do
+        self.itemMessages[#self.itemMessages + 1] = m
+      end
+    end
+    if target and before ~= nil then
+      -- Seed the bar this mon was showing before the item, so the fill
+      -- animates in the resolving pass instead of snapping to the new value.
+      self.preResolveShownHp = self.preResolveShownHp or {}
+      self.preResolveShownHp[target] = before
+    end
+    self.suppressInputFrame = true
+    self:advanceSlotOrResolve()
   end
 
   -- The BALL is thrown at whichever single enemy is still alive --
@@ -3762,7 +4706,7 @@ return function(mod)
   -- screen used to state the opposite as a known gap; the cart only ever
   -- spends the ball, so that gap is now closed.  Either way a miss still
   -- consumes this slot's action for the turn, the same as a move would.
-  function Screen:throwBall(ballId)
+  function Screen:throwBall(ballId, alreadySpent)
     local target = nil
     for _, e in ipairs(self.enemyBattlers) do
       if self.combat.isAlive(e) then target = e break end
@@ -3773,7 +4717,10 @@ return function(mod)
       return
     end
     ballId = ballId or "POKE_BALL"
-    N.consumeItem(self.game.save, ballId)
+    -- alreadySpent: Gen 1's BagMenu removes the ball itself before it calls
+    -- battle:throwBall, so only spend a copy when nobody else has.  The
+    -- screen's own ball paths (the Gen 2 pack, N.openBag's roster) pass false.
+    if not alreadySpent then N.consumeItem(self.game.save, ballId) end
     -- The selected catch formula, in the backend -- see the CATCH RATE block
     -- in native.lua (the CATCH FORMULA mod option picks Gen IX, Gen II or
     -- Gen I).  The options carry the whole formula's context: the HP and
@@ -4024,6 +4971,13 @@ return function(mod)
       kind = "fight",
       actor = battler, index = picked.index, slot = picked.slot, def = picked.def, target = target,
     }
+    -- The action is now committed -- a move whose target was just picked,
+    -- or one that needed no picker -- so this is where the user wants the
+    -- delay armed: "only after target is selected/no target selected but
+    -- move was selected". Set before advanceSlotOrResolve runs (the caller
+    -- does that), so the window covers both the first resolving beat and,
+    -- in a multi-battler turn, the next battler's action box.
+    self.inputLock = INPUT_DELAY
   end
 
   -- Does this picked move hit every enemy at once (needs no target
@@ -4074,6 +5028,113 @@ return function(mod)
       end
     end
     return false
+  end
+
+  -- ROUND 27 (2026-09-10): does this picked move actually need the player
+  -- to choose a recipient? Authoritative answer: g9-battle-engine's
+  -- needsTargetChoice (national_dex's own target archetype). Trusted when
+  -- the engine has it; an OLD engine predating that export falls back to
+  -- the move def's own `target` field. Used to SKIP the target picker for
+  -- self/field/side moves (Protect, Swords Dance, Reflect, Rain Dance,
+  -- Spikes, Trick Room, ...) in doubles/triples, where two or more live
+  -- foes used to make the picker open for a move that has no recipient to
+  -- pick -- the reported regression. Single-target and ally-directed moves
+  -- still pick exactly as before; unknown/absent data defaults to needing
+  -- a pick (conservative). The queued placeholder is the first live foe,
+  -- still correct for field-side moves (Spikes) that need the right side.
+  function Screen:needsTargetChoice(picked)
+    if not picked then return true end
+    local id = picked.slot and picked.slot.id
+    local eng = self.g9dex and self.g9dex.exports and self.g9dex.exports.needsTargetChoice
+    if eng then
+      local ok, res = pcall(eng, id)
+      if ok then return res == true end
+    end
+    local tgt = picked.def and picked.def.target
+    if tgt then return NO_CHOICE_TARGET_ARCHETYPES[tgt] ~= true end
+    return true
+  end
+
+  ------------------------------------------------------------------
+  -- ROUND 83 (2026-09-10): real triple-battle reach, the picker's half of
+  -- the same rule the g9.request_adjacency wrap enforces at resolution
+  -- time. A boss fight, a horde fight, or a move whose own id can strike
+  -- across a slot, opens the whole board; otherwise a candidate is only
+  -- offered when it is genuinely adjacent to the acting slot -- same side,
+  -- |i - slot| == 1
+  -- (slot 1 and slot 3 are NOT adjacent); across sides, |slot - j| <= 1
+  -- (a wing reaches two foe columns, the centre all three). Doubles and
+  -- singles are unaffected: every index is within 1.
+  function Screen:isBossFight()
+    local b = self.battle
+    if not b then return false end
+    local ok, res = pcall(function()
+      return b.bossFightFlags ~= nil and next(b.bossFightFlags) ~= nil
+    end)
+    return ok and res == true
+  end
+
+  -- HORDE (2026-09-10 user directive): the picker's half of the horde rule
+  -- the g9.request_adjacency wrap enforces at resolution time -- from the
+  -- player's mon every enemy is adjacent, so a horde's whole row is always
+  -- on offer. Reads the same active-layout `horde` flag (self.isHorde) that
+  -- also fixes the swarm's e2..e6 grid, so it is never mistaken for an
+  -- ordinary multi-enemy fight.
+  function Screen:isHordeFight()
+    return self.isHorde == true
+  end
+
+  -- Can this picked move legally be aimed at a NON-adjacent foe (or ally)?
+  -- Keyed on the move's own id, never its current type (the user's explicit
+  -- Aerilate/Normalize clause) -- see the module-level NONADJACENT_MOVE_IDS
+  -- and national_dex's `distance` flag.
+  function Screen:canReachNonAdjacent(picked)
+    if not picked then return false end
+    local id = picked.slot and picked.slot.id
+    local eng = self.g9dex and self.g9dex.exports
+    local flagsFn = (eng and type(eng.moveFlags) == "function")
+      and eng.moveFlags or moveFlagsFn()
+    return canReachNonAdjacent(id, flagsFn)
+  end
+
+  -- Neither proximity rule applies: offer the whole live board.
+  function Screen:reachAllSlots(picked)
+    return self:isBossFight() or self:isHordeFight() or self:canReachNonAdjacent(picked)
+  end
+
+  -- The acting player slot index (1-based), defaulting to the lead.
+  function Screen:actingIndex()
+    return self.actingSlotIdx or 1
+  end
+
+  -- The live ENEMIES this picked move may be aimed at.
+  function Screen:reachableEnemies(picked)
+    local out = {}
+    local all = self:reachAllSlots(picked)
+    local idx = self:actingIndex()
+    for j, e in ipairs(self.enemyBattlers or {}) do
+      if self.combat and self.combat.isAlive(e) and (all or math.abs(j - idx) <= 1) then
+        out[#out + 1] = e
+      end
+    end
+    return out
+  end
+
+  -- The live ALLIES (excluding the acting mon) this picked move may be
+  -- aimed at -- Heal Pulse and friends; only the acting mon's own literal
+  -- neighbours unless the move can reach any distance.
+  function Screen:reachableAllies(picked)
+    local out = {}
+    local all = self:reachAllSlots(picked)
+    local idx = self:actingIndex()
+    local caster = (self.playerBattlers or {})[idx]
+    for i, a in ipairs(self.playerBattlers or {}) do
+      if a ~= caster and self.combat and self.combat.isAlive(a)
+          and (all or math.abs(i - idx) == 1) then
+        out[#out + 1] = a
+      end
+    end
+    return out
   end
 
   function Screen:updateMoveSelect(input)
@@ -4140,26 +5201,35 @@ return function(mod)
         self.message = picked.invalidReason or MOVE_NO_PP_TEXT
         return
       end
+      -- ROUND 83 (2026-09-10): the picker offers only what the move can
+      -- actually reach from THIS slot -- the picker's half of the same
+      -- rule the g9.request_adjacency wrap enforces at resolution time
+      -- (see the module-level comment above it). A triple-battle Surf no
+      -- longer lets you aim past a non-adjacent mon, and (via
+      -- isAllyTargetable) no longer lists non-adjacent allies either.
+      -- `aliveEnemies` stays the FULL live-foe list purely as the
+      -- spread/field placeholder below -- the engine re-resolves the real
+      -- roster at resolution time, so a placeholder never limits who is
+      -- actually hit.
       local aliveEnemies = {}
       for _, e in ipairs(self.enemyBattlers) do
         if self.combat.isAlive(e) then aliveEnemies[#aliveEnemies + 1] = e end
       end
+      local offeredEnemies = self:reachableEnemies(picked)
       -- ROUND 26: a move that can legally be aimed at an ally (Heal Pulse,
       -- Helping Hand, Aromatherapy-shaped support -- the engine's own
       -- isAllyTargetable is the authority) also offers the acting
       -- battler's OWN living teammates in the picker, listed first, so the
       -- player can choose who to heal/support. Every other move keeps the
-      -- enemy-only picker exactly as before.
-      local candidates = aliveEnemies
+      -- enemy-only picker exactly as before. ROUND 83 restricts those
+      -- teammates to the ones this move can genuinely reach from this slot.
+      local candidates = offeredEnemies
       if self:isAllyTargetable(picked) then
         candidates = {}
-        local caster = self.playerBattlers[self.actingSlotIdx]
-        for _, a in ipairs(self.playerBattlers) do
-          if a ~= caster and self.combat.isAlive(a) then
-            candidates[#candidates + 1] = a
-          end
+        for _, a in ipairs(self:reachableAllies(picked)) do
+          candidates[#candidates + 1] = a
         end
-        for _, e in ipairs(aliveEnemies) do
+        for _, e in ipairs(offeredEnemies) do
           candidates[#candidates + 1] = e
         end
       end
@@ -4171,6 +5241,15 @@ return function(mod)
         -- re-resolves the full roster (resolveMoveTargets) at resolution
         -- time, so the placeholder never limits who actually gets hit.
         if self:isSpreadMove(picked) then
+          self:queueAction(picked, aliveEnemies[1] or candidates[1])
+          self:advanceSlotOrResolve()
+        elseif not self:needsTargetChoice(picked) then
+          -- ROUND 27: a self/field/side move (Protect, Reflect, Spikes,
+          -- Rain Dance, Trick Room, ...) has no recipient to choose --
+          -- skip the picker and queue the first live foe as the
+          -- placeholder (field-side moves need the defending side to be
+          -- right). The engine re-resolves at resolution time, so the
+          -- placeholder never limits who is actually affected.
           self:queueAction(picked, aliveEnemies[1] or candidates[1])
           self:advanceSlotOrResolve()
         else
@@ -4292,6 +5371,14 @@ return function(mod)
     local target = self.targetCandidates and self.targetCandidates[self.targetCursor]
     local mark = target and self.hudMark and self.hudMark[target]
     if not mark then return end
+    -- FANTASY COMBAT: the modern pointer (fantasy_combat.lua), drawn from
+    -- the same hudMark anchor the tile glyph used.  On the ally side that
+    -- anchor is now the sprite itself -- the option removed the ally HUD
+    -- boxes -- so the pointer rides just above the mon either way.
+    if self.fantasyCombat and Fantasy and Fantasy.drawTargetArrow then
+      Fantasy.drawTargetArrow({ x = mark.x, top = mark.top }, DS)
+      return
+    end
     local bob = math.floor(love.timer.getTime() * 4) % 2
     local cx = math.floor(mark.x + 0.5)
     local top = math.max(0, math.floor(mark.top) - 8 - bob)
@@ -4366,6 +5453,9 @@ return function(mod)
     -- Kept so the field keeps showing WHO owns the swap after the target
     -- is picked (drawSwapMark) -- dropped again as the swap resolves.
     if owner then self.swapOwnerMarks[#self.swapOwnerMarks + 1] = owner end
+    -- A positional swap is a committed action too, so it arms the same
+    -- window a queued move does (see Screen:queueAction).
+    self.inputLock = INPUT_DELAY
   end
 
   function Screen:clearSwapOwnerMark(battler)
@@ -4388,6 +5478,12 @@ return function(mod)
     local function markFor(battler, outline)
       local m = battler and self.hudMark[battler]
       if not m then return end
+      -- FANTASY COMBAT: the same modern pointer, hollow for the swap's
+      -- OWNER (the cue's outline form) exactly as the tile glyph was.
+      if self.fantasyCombat and Fantasy and Fantasy.drawTargetArrow then
+        Fantasy.drawTargetArrow({ x = m.x, top = m.top }, DS, { hollow = outline })
+        return
+      end
       local cx = math.floor(m.x + 0.5)
       local top = math.max(0, math.floor(m.top) - 8 - bob)
       drawArrowGlyph(cx, top, outline)
@@ -4523,6 +5619,7 @@ return function(mod)
   -- centre, so one invocation washes over the side instead of snapping to
   -- a single victim -- see sideSpriteCentre above.
   function Screen:startMoveAnim(def, actor, target)
+    if not self.moveAnimations then return end
     -- Gen 2 drives AnimRunner/BattleAnimView; when those are absent this is
     -- a Gen 1 boot, whose own AnimPlayer arm plays the move instead.
     if not (AnimRunner and BattleAnimView) then
@@ -5080,6 +6177,7 @@ return function(mod)
   -- from the actor's real on-screen position (spread moves still aim at the
   -- opposing side's centre, exactly as the Gen 2 arm does).
   function Screen:startMoveAnimGen1(def, actor, target)
+    if not self.moveAnimations then return end
     if not (AnimPlayer and def and def.id) then return end
     local animsData = N.gen1AnimData(self.data)
     if not (animsData and animsData.moveAnims) then return end
@@ -5173,6 +6271,139 @@ return function(mod)
     return true
   end
 
+  -- ------------------------------------------------------------------
+  -- EXP SHARE ACTIVE-SET TRACKING (exp_share.lua / the EXP SHARE option)
+  --
+  -- The option's "active" rule is per enemy: a player mon counts for an
+  -- enemy's exp if it stood on the field at ANY point during that enemy's
+  -- presence, and an enemy SWITCHING OUT -- not fainting -- is what resets
+  -- the set (a replacement enemy starts fresh).  self.expActive, keyed by the
+  -- enemy mon table, holds that set; it is seeded at Screen.new, extended
+  -- here as player mons switch in, reset at Screen:advanceEnemyReplacement,
+  -- and handed to the exp seam in Screen:awardFaintExp.  Nothing else reads
+  -- it, and it is empty/inert while the option is OFF.
+  ------------------------------------------------------------------
+
+  -- The currently-fielded, still-alive player mons, as a set keyed by the mon
+  -- table (mon tables survive a switch; battler wrappers do not).
+  function Screen:expFieldSet()
+    local set = {}
+    for _, battler in ipairs(self.playerBattlers) do
+      if battler.mon and self.combat.isAlive(battler) then
+        set[battler.mon] = true
+      end
+    end
+    return set
+  end
+
+  -- A player mon has come onto the field: mark it active for every enemy
+  -- present (fainted enemies included -- their award still reads the set).
+  function Screen:expMarkActive(mon)
+    if not mon or not self.expActive then return end
+    for _, enemy in ipairs(self.enemyBattlers) do
+      local set = self.expActive[enemy.mon]
+      if set then set[mon] = true end
+    end
+  end
+
+  -- EXP for each enemy newly fainted by the actions just resolved, plus any
+  -- events that awarding itself queued (appended in place to `events`).
+  -- Used by BOTH resolution paths -- the stepwise Gen 1 arm and the
+  -- whole-turn batch fallback -- so the two never drift. `.fainted` doubles
+  -- as an "already awarded" guard here (Combat.isAlive checks mon.hp
+  -- directly too, so this repurposing doesn't affect aliveness checks
+  -- elsewhere). awardExperience splits across battle.participants, rebuilt
+  -- from the real roster every time, right before awarding, so EXP splits
+  -- across whichever of OUR playerBattlers fought this battle. The KEY SHAPE
+  -- is generation-specific (Gen 2 indexes the roster by party slot, Gen 1 by
+  -- the mon table itself), so the backend builds it -- see native.lua.
+  --
+  -- The EXP SHARE option needs more than the engine's participant list: it
+  -- reads the CUMULATIVE per-enemy active set above, so each award is handed
+  -- battle.expSharePending.active right before it runs (cleared once the
+  -- loop is done).  native.lua's Gen 1 model and the engine's own Gen 2
+  -- awardExperience both expose the same battle.exp_award seam exp_share.lua
+  -- wraps, and both see ctx.battle.expSharePending.
+  --
+  -- MULTI-FAINT (the horde rule).  When MORE THAN ONE enemy was fainted by
+  -- this resolution and an EXP SHARE mode is selected, the enemies' exp is
+  -- summed into ONE pool first and the config splits that pool, so the option
+  -- narrates ONE active line and ONE bench line for the whole turn instead of
+  -- a pair per enemy.  The pool is paid through a single award built from a
+  -- synthetic stand-in loser (native.lua's N.expBatch); the active set handed
+  -- to the seam is the UNION of the fainted enemies' own sets, so a mon that
+  -- stood against any of them counts as active.  A single faint, or EXP SHARE
+  -- = OFF, keeps the ordinary one-award-per-enemy path and its narration.
+  function Screen:awardFaintExp(events)
+    events = events or {}
+    if next(self.enemyBattlers) then
+      N.setParticipants(self.battle, self.playerBattlers, self.game.save,
+        self.combat)
+    end
+    local faints = {}
+    for _, enemy in ipairs(self.enemyBattlers) do
+      if enemy.mon and (enemy.mon.hp or 0) <= 0 and not enemy.fainted then
+        enemy.fainted = true
+        faints[#faints + 1] = enemy.mon
+      end
+    end
+    if self.battle then
+      local party = self.game.save and self.game.save.party
+      local batch = (#faints > 1) and self:expShareMode()
+        and N.expBatch(self.battle, faints) or nil
+      if batch then
+        local active = {}
+        for _, mon in ipairs(faints) do
+          local set = self.expActive[mon]
+          if type(set) == "table" then
+            for member in pairs(set) do active[member] = true end
+          end
+        end
+        self.battle.expSharePending = {
+          loser = faints[#faints], active = active, party = party,
+        }
+        self:payExpBatch(batch)
+      else
+        for _, mon in ipairs(faints) do
+          self.battle.expSharePending = {
+            loser = mon,
+            active = self.expActive[mon],
+            party = party,
+          }
+          N.awardExperience(self.battle, mon)
+        end
+      end
+      self.battle.expSharePending = nil
+    end
+    for _, e in ipairs(N.takeEvents(self.battle)) do events[#events + 1] = e end
+    return events
+  end
+
+  -- The EXP SHARE mode currently selected, or nil for OFF (and nil when the
+  -- module is absent, e.g. a harness).  The multi-faint pool is an EXP SHARE
+  -- behaviour only -- OFF keeps the vanilla per-enemy awards.
+  function Screen:expShareMode()
+    local expShare = mod.exports.expShare
+    if not (expShare and type(expShare.mode) == "function") then return nil end
+    local ok, mode = pcall(expShare.mode)
+    if ok and type(mode) == "string" and mode ~= "off" then return mode end
+    return nil
+  end
+
+  -- Pay a pooled multi-faint award.  The synthetic species def native.lua's
+  -- N.expBatch built is parked in the live registry only for this one award:
+  -- both backends read it at the very top (Gen 2's Battle:speciesDef, the Gen 1
+  -- model's state:awardExperience) and capture the table, so restoring the key
+  -- immediately after cannot affect the recipients the award pays.
+  function Screen:payExpBatch(batch)
+    local pokemon = self.battle.data and self.battle.data.pokemon
+    local previous = pokemon and pokemon[batch.id]
+    if pokemon then pokemon[batch.id] = batch.def end
+    local ok, err = pcall(N.awardExperience, self.battle, batch.loser)
+    if pokemon then pokemon[batch.id] = previous end
+    if not ok then error(err, 0) end
+  end
+
   function Screen:beginResolving()
     -- Switches always resolve before any move (real Gen 2 rule -- not a
     -- speed/priority comparison at all), so they're pulled out of the
@@ -5195,6 +6426,13 @@ return function(mod)
     self.swapQueue = swapActions
     self.moveQueue = moveActions
     self.movesResolved = false
+    -- movesBegun separates "this turn's one-time setup (turn_started /
+    -- gimmick) has run" from "every action has resolved", because the
+    -- stepwise Gen 1 path resolves actions across several passes. stepwise
+    -- records whether the backend offered the stepwise arm at all (Gen 2
+    -- does not) -- false means the whole-turn batch below runs instead.
+    self.movesBegun = false
+    self.stepwise = false
     self.currentMessage = nil
     self.pendingEvents = {}
     self.phase = "resolving"
@@ -5203,6 +6441,26 @@ return function(mod)
     -- moves -- the whole point of the chase. Must come after
     -- phase = "resolving": Screen:shownHpOf only lags in that phase.
     self:syncShownHp()
+    -- A bar an ITEM moved is seeded from the value it showed before the item
+    -- landed, so the fill animates across this pass rather than snapping to
+    -- the already-applied number (the effect itself was applied when the item
+    -- was used -- see Screen:queueItemResult).
+    if self.preResolveShownHp then
+      for mon, hp in pairs(self.preResolveShownHp) do
+        if self.shownHp[mon] ~= nil then self.shownHp[mon] = hp end
+      end
+      self.preResolveShownHp = nil
+    end
+    -- Any line the screen itself owes the player ahead of the engine's own
+    -- events (an item's message, when it is not printed by the cart's own
+    -- menu) is queued as a regular text beat in front of them.
+    if self.itemMessages then
+      local snap = self:snapshotHp()
+      for _, m in ipairs(self.itemMessages) do
+        self.pendingEvents[#self.pendingEvents + 1] = { text = m, g9SceneHp = snap }
+      end
+      self.itemMessages = nil
+    end
     self:advanceResolving()
   end
 
@@ -5229,6 +6487,18 @@ return function(mod)
       if event.kind == "move" then self:startMoveAnimFor(event) end
       if event.text then
         self.currentMessage = event.text
+        -- Minimum display time before this line may be acknowledged. A
+        -- move whose animation actually started is paced by the animation
+        -- itself ("used moveX! > animation time"), so it gets no extra
+        -- hold; a move with moveAnimations off gets BEAT_HOLD_MOVE; every
+        -- other line gets BEAT_HOLD_TEXT.
+        if event.kind == "move" and self.moveAnim ~= nil then
+          self.beatHold = 0
+        elseif event.kind == "move" then
+          self.beatHold = BEAT_HOLD_MOVE
+        else
+          self.beatHold = BEAT_HOLD_TEXT
+        end
         return
       end
       -- No text: whatever is already on screen stays there. Hold only
@@ -5255,6 +6525,7 @@ return function(mod)
         list[a], list[b] = target, owner
         self.currentMessage = displayName(owner.mon) .. " switched places with "
           .. displayName(target.mon) .. "!"
+        self.beatHold = BEAT_HOLD_TEXT
       end
       -- Resolved either way -- this owner's cue is done.
       self:clearSwapOwnerMark(action.actor)
@@ -5266,6 +6537,8 @@ return function(mod)
       local action = table.remove(self.switchQueue, 1)
       local outgoing = self.playerBattlers[action.actorSlot]
       self.playerBattlers[action.actorSlot] = self.combat.newBattler(action.mon, "player")
+      -- EXP SHARE: the incoming mon is now active for every enemy present.
+      self:expMarkActive(action.mon)
       -- The real, shared engine event bus: announce the switch so
       -- engine-side per-battler bookkeeping keyed to a switch-in runs for
       -- a scene-driven battle exactly as it does for a native one. Without
@@ -5296,44 +6569,93 @@ return function(mod)
       -- it rather than from where it was actually drawn.
       self.shownHp[action.mon] = action.mon.hp or 0
       self.currentMessage = "Go, " .. displayName(action.mon) .. "!"
+      self.beatHold = BEAT_HOLD_TEXT
       return
     end
     if not self.movesResolved then
-      self.movesResolved = true
-      -- Real "battle.turn_started" -- matches native's own turn-loop
-      -- timing, right before this turn's actions actually run. This is
-      -- what lets battle_forms's own real battle.turn_started listener
-      -- (src/resolve.lua's M.onTurnStarted) perform whatever's armed
-      -- (Screen:updateGimmickSelect) and mark it spent, respecting the
-      -- once-per-battle limit exactly as it would for a battle native's
-      -- own runTurn drove. Nothing here assumes battle_forms specifically
-      -- -- any mod keying real per-turn work off this real, standard
-      -- event benefits the same way.
-      --
-      -- Focused on the FORM's owner for the activation itself (see the
-      -- GIMMICK SELECT section's FORMS OWNER block): battle_forms' entry
-      -- activate() reads battle.player, so without this a FORM armed from
-      -- any slot but the first would transform slot 1 instead. Restored the
-      -- moment the listener returns.
-      local formsMon = self.gimmickOwnerMon
-      local armedBefore = battleFormsArmedId()
-      focusBattlePlayer(self, formsMon, function()
-        Runtime.emit("battle.turn_started", { battle = self.battle })
-      end)
-      if formsMon and armedBefore ~= nil then
-        -- Consuming clears the armed id; battle_forms only consumes when the
-        -- entry actually activated, so a still-armed id is a refusal.
-        if battleFormsArmedId() == nil then
-          emitFormsEvent(self, "used", { mon = formsMon,
-            slot = self.gimmickOwnerSlot, id = self.gimmickOwnerId,
-            label = self.gimmickOwnerLabel })
-        else
-          emitFormsEvent(self, "cancelled", { mon = formsMon,
-            slot = self.gimmickOwnerSlot, id = self.gimmickOwnerId,
-            label = self.gimmickOwnerLabel, reason = "activation-refused" })
+      if not self.movesBegun then
+        self.movesBegun = true
+        -- Real "battle.turn_started" -- matches native's own turn-loop
+        -- timing, right before this turn's actions actually run. This is
+        -- what lets battle_forms's own real battle.turn_started listener
+        -- (src/resolve.lua's M.onTurnStarted) perform whatever's armed
+        -- (Screen:updateGimmickSelect) and mark it spent, respecting the
+        -- once-per-battle limit exactly as it would for a battle native's
+        -- own runTurn drove. Nothing here assumes battle_forms specifically
+        -- -- any mod keying real per-turn work off this real, standard
+        -- event benefits the same way.
+        --
+        -- Focused on the FORM's owner for the activation itself (see the
+        -- GIMMICK SELECT section's FORMS OWNER block): battle_forms' entry
+        -- activate() reads battle.player, so without this a FORM armed from
+        -- any slot but the first would transform slot 1 instead. Restored the
+        -- moment the listener returns.
+        local formsMon = self.gimmickOwnerMon
+        local armedBefore = battleFormsArmedId()
+        focusBattlePlayer(self, formsMon, function()
+          Runtime.emit("battle.turn_started", { battle = self.battle })
+        end)
+        if formsMon and armedBefore ~= nil then
+          -- Consuming clears the armed id; battle_forms only consumes when the
+          -- entry actually activated, so a still-armed id is a refusal.
+          if battleFormsArmedId() == nil then
+            emitFormsEvent(self, "used", { mon = formsMon,
+              slot = self.gimmickOwnerSlot, id = self.gimmickOwnerId,
+              label = self.gimmickOwnerLabel })
+          else
+            emitFormsEvent(self, "cancelled", { mon = formsMon,
+              slot = self.gimmickOwnerSlot, id = self.gimmickOwnerId,
+              label = self.gimmickOwnerLabel, reason = "activation-refused" })
+          end
         end
+        clearGimmickOwner(self)
+        -- Stepwise Gen 1 resolution: begin this turn's REAL order NOW, then
+        -- resolve ONE actor per pass below, so each actor's own events -- and
+        -- the sprite/stat changes that go with them -- are DISPLAYED before
+        -- the next actor resolves. Previously the whole turn resolved in one
+        -- call, so every state change (a Transform's stat/sprite exchange, a
+        -- faint) landed before the first message for it had been shown, which
+        -- read as the transform "happening" ahead of a higher-priority move
+        -- even though the messages themselves were already in order. Gen 2 --
+        -- and any engine without the stepwise arm -- returns false here and
+        -- falls through to the whole-turn batch below, unchanged.
+        self.stepwise = (type(self.combat.beginTurn) == "function")
+          and self.combat.beginTurn(self.g9dex, self.battle, self.moveQueue)
+          or false
       end
-      clearGimmickOwner(self)
+
+      if self.stepwise then
+        local events = {}
+        local stepEvents, done = self.combat.resolveNextAction(
+          self.g9dex, self.battle)
+        for _, event in ipairs(stepEvents or {}) do
+          events[#events + 1] = event
+        end
+        if not done then
+          -- Only THIS action's events are queued, and the top of this
+          -- function shows them one beat at a time; the next pass resolves
+          -- the next actor, by which point this actor's state changes have
+          -- already been seen.
+          for _, event in ipairs(events) do
+            self.pendingEvents[#self.pendingEvents + 1] = event
+          end
+          return self:advanceResolving()
+        end
+        -- Order exhausted: the last action's batch carries end-of-turn.
+        -- Award EXP (which can queue its own events), then queue the lot.
+        self.movesResolved = true
+        events = self:awardFaintExp(events)
+        -- Queued WHOLE, in emit order -- not flattened to .text any more.
+        -- Screen:installEventProbe has already stamped each one with the
+        -- HP vector as of its own emit, which is the entire reason the
+        -- bars can now lag the math they were spoiling.
+        for _, event in ipairs(events) do
+          self.pendingEvents[#self.pendingEvents + 1] = event
+        end
+        return self:advanceResolving()
+      end
+
+      self.movesResolved = true
       -- The WHOLE remaining turn's moves resolve in ONE call now --
       -- g9-battle-engine's own resolveTurnActions derives priority/
       -- Speed/order/RNG itself and drives battle:useMove per battler
@@ -5351,28 +6673,10 @@ return function(mod)
       -- dequeued, so the animation plays under its own announcement
       -- rather than after the whole turn.
       local events = self.combat.resolveTurn(self.g9dex, self.battle, self.moveQueue)
-      -- EXP: real native Battle:awardExperience, fired for each enemy
-      -- newly fainted by the moves just resolved -- `.fainted` doubles
-      -- as an "already awarded" guard here (Combat.isAlive checks
-      -- mon.hp directly too, so this repurposing doesn't affect
-      -- aliveness checks elsewhere).
-      --
-      -- awardExperience splits across battle.participants, rebuilt from the
-      -- real roster every time, right before awarding, so EXP splits across
-      -- whichever of OUR playerBattlers fought this battle.  The KEY SHAPE is
-      -- generation-specific (Gen 2 indexes the roster by party slot, Gen 1 by
-      -- the mon table itself), so the backend builds it -- see native.lua.
-      if next(self.enemyBattlers) then
-        N.setParticipants(self.battle, self.playerBattlers, self.game.save,
-          self.combat)
-      end
-      for _, enemy in ipairs(self.enemyBattlers) do
-        if enemy.mon and (enemy.mon.hp or 0) <= 0 and not enemy.fainted then
-          enemy.fainted = true
-          N.awardExperience(self.battle, enemy.mon)
-        end
-      end
-      for _, e in ipairs(N.takeEvents(self.battle)) do events[#events + 1] = e end
+      -- EXP for each enemy newly fainted by the moves just resolved, plus
+      -- any events awarding queued -- shared with the stepwise path so the
+      -- two cannot drift (see Screen:awardFaintExp).
+      events = self:awardFaintExp(events)
       -- Queued WHOLE, in emit order -- not flattened to .text any more.
       -- Screen:installEventProbe has already stamped each one with the
       -- HP vector as of its own emit, which is the entire reason the
@@ -5461,6 +6765,11 @@ return function(mod)
         local mon = self:takeNextEnemyBenchMon()
         if not mon then return false end
         self.enemyBattlers[slot] = self.combat.newBattler(mon, "enemy")
+        -- EXP SHARE: a NEW enemy starts a fresh active set from whatever is
+        -- on the player's field right now -- the outgoing enemy's set is
+        -- abandoned, which is the "an enemy switching out resets activity"
+        -- half of the rule (a faint does not reset it; see awardFaintExp).
+        self.expActive[mon] = self:expFieldSet()
         self.shownHp[mon] = mon.hp or 0
         -- Hidden until the ball lands (Screen:update's own throw stepper
         -- reveals it at t >= BALL_FLIGHT), exactly like the intro send.
@@ -5493,6 +6802,7 @@ return function(mod)
         end
         self.currentMessage = (self:trainerDisplayName() or "TRAINER")
           .. " sent out " .. displayName(mon) .. "!"
+        self.beatHold = BEAT_HOLD_TEXT
         self.ballThrow = { side = "enemy", slot = slot, t = 0 }
         return true
       end
@@ -5659,6 +6969,8 @@ return function(mod)
   function Screen:applyForcedSwitch(slot, mon)
     local outgoing = self.playerBattlers[slot]
     self.playerBattlers[slot] = self.combat.newBattler(mon, "player")
+    -- EXP SHARE: the replacement is active for every enemy present.
+    self:expMarkActive(mon)
     -- Same switch-in announcement the voluntary switch and the enemy
     -- replacement raise (see Screen:advanceResolving): the engine's per-mon
     -- switch-in bookkeeping (the arriving mon's Fake Out/First Impression
@@ -5672,6 +6984,7 @@ return function(mod)
     end
     self.shownHp[mon] = mon.hp or 0
     self.currentMessage = "Go, " .. displayName(mon) .. "!"
+    self.beatHold = BEAT_HOLD_TEXT
     self.forcedSwitchOpen = nil
     -- The press that confirmed the pick must not also be read as the press
     -- that acknowledges the "Go, X!" line -- the same one-frame guard every
@@ -5759,20 +7072,32 @@ return function(mod)
   -- hung battle with no way out the moment anything upstream misbehaves.
   -- A press during a hold ends that hold and nothing else; it never also
   -- eats the line underneath, so no message can be skipped unread.
-  function Screen:updateResolving(input)
-    local pressed = input:wasPressed("a") or input:wasPressed("b")
+  function Screen:updateResolving(input, dt)
+    -- A press only counts once BOTH the commit window (0.3s after the
+    -- action was queued -- see INPUT_DELAY) and this beat's own minimum
+    -- display time have elapsed. A bar that is still draining or a move
+    -- animation still playing therefore cannot be cut off by a mash before
+    -- its time is up.
+    local pressed = (self.inputLock or 0) <= 0 and (self.beatHold or 0) <= 0
+      and (input:wasPressed("a") or input:wasPressed("b"))
     -- Screen:update already stepped self.moveAnim this frame and cleared
-    -- it if the runner reported itself finished.
+    -- it if the runner reported itself finished. A move animation owns its
+    -- whole duration now (the user's "used moveX! > animation time >"), so
+    -- a press does NOT skip it -- only the MOVE_ANIM_SAFETY valve, for a
+    -- script that never reports done, may.
     if self.moveAnim then
-      if pressed then self.moveAnim = nil end
+      if pressed and (self.moveAnimTime or 0) >= MOVE_ANIM_SAFETY then
+        self.moveAnim = nil
+      end
       return
     end
     if self.hpAnim then
-      if pressed then
-        self:snapHpAnim()
-      else
-        self:stepHpAnim()
-      end
+      -- The drain runs its own fixed HP_ANIM_DURATION; presses do not snap
+      -- it early for the same reason moves do not skip early. It always
+      -- reaches its target within that window, so it is never held for long
+      -- (Screen:snapHpAnim stays defined as the emergency escape for any
+      -- future caller that sets hpAnim without a clock).
+      self:stepHpAnim(dt)
       if self.hpAnim then return end
       -- The drain has landed. If it was the thing holding the queue --
       -- a textless damage/heal beat, with the line that caused it still
@@ -5834,6 +7159,7 @@ return function(mod)
   -- through Screen:battlerFor. No attacker, no animation: guessing which
   -- sprite to throw a Water Gun from is worse than throwing none.
   function Screen:startMoveAnimFor(event)
+    if not self.moveAnimations then return end
     if not (event and event.move) or event.missed then return end
     local actor = self:battlerFor(event.g9SceneActor)
     if not actor then return end
@@ -6147,6 +7473,12 @@ return function(mod)
     -- has genuinely finished (its own header note).
     if self.moveAnim then
       local anim = self.moveAnim
+      -- How long THIS animation has been playing (see MOVE_ANIM_SAFETY).
+      if anim ~= self.moveAnimTracked then
+        self.moveAnimTracked = anim
+        self.moveAnimTime = 0
+      end
+      self.moveAnimTime = (self.moveAnimTime or 0) + (dt or 0)
       if not anim.done then
         -- Gen 1 drives its own native AnimPlayer (a FIFO of row :starts);
         -- Gen 2 steps its runner.  Both report true here once finished.
@@ -6220,6 +7552,15 @@ return function(mod)
     end
     if self.outroT ~= nil then self.outroT = self.outroT + dt end
 
+    -- The input-pacing clocks (see INPUT_DELAY's own note). Ticked every
+    -- frame regardless of phase, before anything reads them.
+    if (self.inputLock or 0) > 0 then
+      self.inputLock = math.max(0, self.inputLock - (dt or 0))
+    end
+    if (self.beatHold or 0) > 0 then
+      self.beatHold = math.max(0, self.beatHold - (dt or 0))
+    end
+
     local input = self.game.input
     if not input then
       -- No input device at all (a headless boot, a test harness) can
@@ -6250,20 +7591,42 @@ return function(mod)
       return
     end
 
+    -- A commit window still running freezes every SELECTION phase outright
+    -- -- the menu is drawn but reads no input, which is the user's
+    -- "selection is enabled again" after its delay. "resolving" is NOT
+    -- gated here (a running bar/animation still needs its per-frame step);
+    -- it reads the same two clocks itself. "intro" owns its own animation
+    -- snaps and "over" is terminal, so neither is gated.
+    local locked = (self.inputLock or 0) > 0
     if self.phase == "intro" then self:updateIntro(input)
-    elseif self.phase == "actionMenu" then self:updateActionMenu(input)
-    elseif self.phase == "moveSelect" then self:updateMoveSelect(input)
-    elseif self.phase == "targetSelect" then self:updateTargetSelect(input)
-    elseif self.phase == "swapSelect" then self:updateSwapSelect(input)
-    elseif self.phase == "gimmickSelect" then self:updateGimmickSelect(input)
-    elseif self.phase == PROMPT_PHASE then self:updatePrompt(input)
-    elseif self.phase == "resolving" then self:updateResolving(input)
-    elseif self.phase == "over" then self:updateOver(input)
+    elseif self.phase == "actionMenu" then
+      if not locked then self:updateActionMenu(input) end
+    elseif self.phase == "moveSelect" then
+      if not locked then self:updateMoveSelect(input) end
+    elseif self.phase == "targetSelect" then
+      if not locked then self:updateTargetSelect(input) end
+    elseif self.phase == "swapSelect" then
+      if not locked then self:updateSwapSelect(input) end
+    elseif self.phase == "gimmickSelect" then
+      if not locked then self:updateGimmickSelect(input) end
+    elseif self.phase == PROMPT_PHASE then
+      if not locked then self:updatePrompt(input) end
+    elseif self.phase == "resolving" then self:updateResolving(input, dt)
+    elseif self.phase == "over" then
+      if not locked then self:updateOver(input) end
     -- "submenu": Gen2PackMenu/Gen2PartyMenu is on top of the stack and
     -- owns update() entirely (StateStack only updates its top state) --
     -- this branch is never actually reached while that's true, kept
     -- only so an unexpected extra frame here is a no-op, not an error.
     end
+
+    -- The commit window is armed where the commit actually happens now --
+    -- inside Screen:queueAction/queueSwapAction (and a FORMS pick) -- not
+    -- here. A plain A/B that only navigated (FIGHT -> move list, or a B
+    -- cancel back to a previous menu) leaves inputLock at 0, so the next
+    -- frame reads input at once, exactly as the user asked. Only presses
+    -- that pass a combat message during "resolving" still wait, via
+    -- beatHold (Screen:advanceResolving).
 
     -- After the dispatch, never before it -- see Screen:
     -- promotePendingPrompt's own header for why, and for why this is the
@@ -6281,16 +7644,11 @@ return function(mod)
     local bt = self.ballThrow
     if not bt then return end
     local t = bt.t
-    local r
-    if bt.side == "player" then
-      local cols = sideColumns(#self.playerBattlers, "player", false, self.isHorde)
-      r = slotRect(cols, cols[bt.slot] or cols[1], ALLY_FEET_T, ROW_H, "ally")
-    elseif self.isBoss and bt.slot == 1 then
-      r = bossSlot()
-    else
-      local cols = sideColumns(#self.enemyBattlers, "enemy", self.isBoss, false)
-      r = slotRect(cols, cols[bt.slot] or cols[1], ENEMY_FEET_T, ROW_H, "enemy")
-    end
+    -- The landing rect comes from Screen:slotRectFor -- the SAME rect the
+    -- sprite pass anchors this battler to -- so the ball lands on the mon's
+    -- own platform whether the field is the horizontal grid or a FANTASY
+    -- LAYOUT column (it also resolves the boss's own slot).
+    local r = self:slotRectFor(bt.side, bt.slot)
     -- Landing spot = where drawSprite actually bottom-anchored the mon
     -- this frame (self.spriteAnchor, filled by drawContent's sprite pass,
     -- which runs before this) -- the slot's own bottom-center, which is
@@ -6342,6 +7700,35 @@ return function(mod)
   -- is built from these rects, so a pre-warm computed from any other rect
   -- would bake a second, unused sheet.
   function Screen:slotRects()
+    -- FANTASY LAYOUT: the two sides stand in wide, shallow ZIG-ZAG columns, so
+    -- each side's rects come from fantasySlot/fantasySlotX instead of the
+    -- 8-column grid. Slot i still maps 1:1 to self.<side>Battlers[i], so every
+    -- index-aligned consumer (targets, turns, bench replacement, the adjacency
+    -- hook) is untouched -- only the x/y each slot anchors to changes. Slot 1
+    -- (the lead) keeps the bottom line on BOTH sides; later slots rise by
+    -- FANTASY.step, and odd/even slots alternate about the column centre by
+    -- FANTASY.zig (fantasySlotX: player outward = left, enemy outward = right).
+    -- A boss is still just enemy slot 1 (its BOSS_MUL scale is applied at draw
+    -- time). The per-slot ground line comes from Screen.fantasyGroundY so the
+    -- hand-tuned enemy overrides (slot 4/5 raised, horde slot 2 lowered --
+    -- see the ROUND TWO HUNDRED AND TWENTY-FIVE note on Screen.FANTASY) apply
+    -- here, on the ONE grid every consumer reads, rather than in the draw
+    -- pass alone.
+    if self.fantasyLayout then
+      local F = Screen.FANTASY
+      local enemyRects, playerRects = {}, {}
+      for i = 1, #self.enemyBattlers do
+        enemyRects[i] = Screen.fantasySlot(
+          Screen.fantasySlotX(F.enemyX, i, 1),
+          Screen.fantasyGroundY("enemy", i, self.isHorde))
+      end
+      for i = 1, #self.playerBattlers do
+        playerRects[i] = Screen.fantasySlot(
+          Screen.fantasySlotX(F.playerX, i, -1),
+          Screen.fantasyGroundY("player", i, false))
+      end
+      return enemyRects, playerRects
+    end
     local enemyCols = sideColumns(#self.enemyBattlers, "enemy", self.isBoss, false)
     local playerCols = sideColumns(#self.playerBattlers, "player", false, self.isHorde)
     local enemyRects, playerRects = {}, {}
@@ -6354,6 +7741,18 @@ return function(mod)
       playerRects[i] = slotRect(playerCols, playerCols[i], ALLY_FEET_T, ROW_H, "ally")
     end
     return enemyRects, playerRects
+  end
+
+  -- One side's slot `slot` for the CURRENT frame -- the same rect
+  -- Screen:slotRects hands the draw pass, so a caller that only knows a side
+  -- and an index (the pokeball's fallback landing spot) lands on exactly the
+  -- anchor the sprite stands on, fantasy or not. Falls back to slot 1 when
+  -- the index is out of range (an empty side), matching the old
+  -- `cols[bt.slot] or cols[1]` guard.
+  function Screen:slotRectFor(side, slot)
+    local enemyRects, playerRects = self:slotRects()
+    if side == "enemy" then return enemyRects[slot] or enemyRects[1] end
+    return playerRects[slot] or playerRects[1]
   end
 
   -- Start a battler's sheet BAKING during its pokeball's flight, instead of on
@@ -6379,13 +7778,46 @@ return function(mod)
     else
       local battler, r = self.playerBattlers[slot], playerRects[slot]
       if battler and r then
-        resolveSprite(r, false, battler, "spriteBack",
+        -- FANTASY LAYOUT draws the player's side from the FRONT sheets (see
+        -- drawContent), so the bake must be requested for the same sheet the
+        -- draw pass will ask for -- otherwise the pre-warm bakes the back
+        -- sheet and the send-out flashes its vanilla pic while the real one
+        -- builds (the exact native flash this pre-warm exists to prevent).
+        local field = self.fantasyLayout and "spriteFront" or "spriteBack"
+        resolveSprite(r, false, battler, field,
           self.data, self.spriteScaleBack)
       end
     end
   end
 
+  -- Optional ground plane behind the sprites, drawn FIRST by drawContent so
+  -- every sprite/readout/box paints on top of it exactly as the white field
+  -- used to.  The seam, the encounter tagging and the drop-in folder live in
+  -- background.lua (the BACKGROUND option; default AUTO picks a file from
+  -- assets/backgrounds/ by the fight's tag, OFF draws nothing, and a contact
+  -- shadow is drawn under each sprite).  pcall'd because a missing or corrupt
+  -- backdrop must degrade to the white field, never abort a turn.
+  function Screen:drawBattleBackground()
+    local api = mod.exports.battleSceneBackground
+    if api and type(api.draw) == "function" then
+      pcall(api.draw, api, self)
+    end
+  end
+
+  -- The near half of any life rings (see background.lua's LIFE BUOYS): drawn
+  -- after the sprite pass so a ring's front rim crosses the mon it holds up.
+  -- pcall'd for the same reason as above -- a missing sibling must never abort
+  -- a frame.
+  function Screen:drawBattleBackgroundFront()
+    local api = mod.exports.battleSceneBackground
+    if api and type(api.drawFront) == "function" then
+      pcall(api.drawFront, api, self)
+    end
+  end
+
   function Screen:drawContent()
+    -- Field art first (no-op unless the BACKGROUND option is on).
+    self:drawBattleBackground()
     -- Sprite positions come from the shared 8-column grid (sideColumns/
     -- slotRect) -- standardized, not per-preset; HUD and F/E positions still
     -- go through self:pos(id, defaultTx, defaultTy) so a preset may nudge
@@ -6409,8 +7841,10 @@ return function(mod)
 
     -- Where each mon's head actually lands THIS frame, in design px, keyed by
     -- battler -- filled as the sprite pass below draws each one, then read by
-    -- the HUD pass to set each side's readout column down on its own mons'
-    -- heads. The line is taken from the sprite's FULL-SIZE height (`fullH`)
+    -- the HUD pass: the horizontal layout averages them into one head line per
+    -- side (sideHeadY), the FANTASY LAYOUT reads each mon's own line so its
+    -- box can ride that mon's head (Screen.fantasyHeadY). The line is taken
+    -- from the sprite's FULL-SIZE height (`fullH`)
     -- with the ground line it currently stands on (top + height), NOT from
     -- its drawn box this frame: the send-out materialize scales the sprite
     -- about its feet, so using the drawn height would let the readout ride
@@ -6425,7 +7859,21 @@ return function(mod)
       end
     end
 
-    for i, battler in ipairs(self.enemyBattlers) do
+    -- FANTASY LAYOUT paint order: a fantasy column stacks its battlers, and
+    -- the concept requires the LEAD mon (slot 1, at the bottom) to end up ON
+    -- TOP -- every mon above it is a layer further BACK. So the two sprite
+    -- loops below walk the slots through Screen:paintOrder (REVERSE when
+    -- fantasy is on, slot N painted first ... slot 1 last); the normal
+    -- horizontal layout keeps its original 1..N order exactly as it was.
+    --
+    -- FANTASY LAYOUT player art: Screen:spriteArt picks the FRONT sheet,
+    -- mirrored horizontally to face the enemy side (drawSprite's flipX)
+    -- instead of the usual back sprite; the enemy side is unchanged.
+    local playerSpriteField, playerFlip = self:spriteArt("player")
+    local enemySpriteField = self:spriteArt("enemy")
+
+    for _, i in ipairs(self:paintOrder(self.enemyBattlers)) do
+      local battler = self.enemyBattlers[i]
       local r = enemyRects[i]
       local boss = self.isBoss and i == 1
       -- Trainer-battle intro: the enemy trainer's class front-pic stands
@@ -6446,9 +7894,9 @@ return function(mod)
         -- the one that simply materializes. HUD + sprite are revealed only
         -- once the fade ends, exactly as the old drop gated them on landing.
         local p = math.min(1, self.wildFade.t / WILD_FADE_DURATION)
-        local ax, ay, dty, dth, dfull = drawSprite(r, boss, battler, "spriteFront", self.data, true, 0, 0, nil, self.spriteScaleFront, p)
+        local ax, ay, dty, dth, dfull, ddw = drawSprite(r, boss, battler, enemySpriteField, self.data, true, 0, 0, nil, self.spriteScaleFront, p)
         if ax then
-          self.spriteAnchor[battler] = { x = ax, y = ay, top = dty, h = dth }
+          self.spriteAnchor[battler] = { x = ax, y = ay, top = dty, h = dth, w = ddw }
           noteHead(battler, dty, dth, dfull)
         end
       elseif self.enemyRevealed[i] and (self:shownHpOf(battler.mon) or 0) > 0
@@ -6460,15 +7908,16 @@ return function(mod)
         -- sprite vanishes exactly when its bar drains to zero under the
         -- fainted narration, not the frame the whole turn's math commits.
         local appear = ballAppearFor(self, "enemy", i)
-        local ax, ay, dty, dth, dfull = drawSprite(r, boss, battler, "spriteFront", self.data, true, 0, 0, appear, self.spriteScaleFront)
+        local ax, ay, dty, dth, dfull, ddw = drawSprite(r, boss, battler, enemySpriteField, self.data, true, 0, 0, appear, self.spriteScaleFront)
         if ax then
-          self.spriteAnchor[battler] = { x = ax, y = ay, top = dty, h = dth }
+          self.spriteAnchor[battler] = { x = ax, y = ay, top = dty, h = dth, w = ddw }
           noteHead(battler, dty, dth, dfull)
         end
       end
     end
 
-    for i, battler in ipairs(self.playerBattlers) do
+    for _, i in ipairs(self:paintOrder(self.playerBattlers)) do
+      local battler = self.playerBattlers[i]
       local r = playerRects[i]
       -- Intro lead-in: the player trainer's back-pic stands in the player
       -- slot (native's GetTrainerBackpic) until the very end of the
@@ -6484,13 +7933,16 @@ return function(mod)
         -- ball itself is drawn by drawBallThrow) -- scaled in from the
         -- ground via ballAppearFor while its own "Go! P!" line reads.
         local appear = ballAppearFor(self, "player", i)
-        local ax, ay, dty, dth, dfull = drawSprite(r, false, battler, "spriteBack", self.data, false, 0, 0, appear, self.spriteScaleBack)
+        local ax, ay, dty, dth, dfull, ddw = drawSprite(r, false, battler, playerSpriteField, self.data, false, 0, 0, appear, self.spriteScaleBack, nil, playerFlip)
         if ax then
-          self.spriteAnchor[battler] = { x = ax, y = ay, top = dty, h = dth }
+          self.spriteAnchor[battler] = { x = ax, y = ay, top = dty, h = dth, w = ddw }
           noteHead(battler, dty, dth, dfull)
         end
       end
     end
+
+    -- -- life-ring fronts (over the mons, under the HUD boxes) ---------
+    self:drawBattleBackgroundFront()
 
     -- -- HUD boxes (over the field, under the ball/move anim) ----------
     -- ONE READOUT PER SLOT, in a single row per side, all at the side's one
@@ -6509,8 +7961,15 @@ return function(mod)
     for i = 1, #self.playerBattlers do
       playerCentres[i] = playerRects[i].x + playerRects[i].w / 2
     end
-    local enemyRow = spreadBoxCentres(enemyCentres)
-    local playerRow = spreadBoxCentres(playerCentres)
+    -- FANTASY LAYOUT puts each team in a wide, shallow ZIG-ZAG, so its
+    -- readouts are placed BY HAND, one per slot: the row-spread (which exists
+    -- only to keep a HORIZONTAL row's boxes off one another) is bypassed and
+    -- every box is centred on its OWN slot's centre-x with its bottom edge on
+    -- that mon's own head line (see Screen.fantasyHeadY) -- a hat on the mon it
+    -- reports on, wherever the zig-zag puts it. The normal horizontal layout
+    -- is untouched.
+    local enemyRow = self.fantasyLayout and enemyCentres or spreadBoxCentres(enemyCentres)
+    local playerRow = self.fantasyLayout and playerCentres or spreadBoxCentres(playerCentres)
     -- One head line per side -- the mean of the heads of the sprites DRAWN
     -- for it this frame (sideHeadY/headLines) -- so every box on the side
     -- keeps the same height. Each box puts its BOTTOM edge on that line
@@ -6532,7 +7991,21 @@ return function(mod)
     -- over a readout the HUD is deliberately hiding.
     self.hudMark = {}
     for i, battler in ipairs(self.enemyBattlers) do
-      local gx, gy = self:pos("enemyGui" .. i, guiTxOn(enemyRow[i]), GUI_TOP_ENEMY / 8)
+      local gx, gy
+      if self.fantasyLayout then
+        -- Fantasy: this box is a HAT on its own mon -- centred on its slot's
+        -- own centre-x, its BOTTOM edge on that mon's own head line -- so the
+        -- readout rides the sprite it reports on wherever the wide zig-zag
+        -- puts it (and never needs the horizontal row-spread). Both still go
+        -- through Screen:pos so a preset could nudge one box, exactly as the
+        -- horizontal path.
+        local groundY = enemyRects[i].y + enemyRects[i].h
+        local headY = Screen.fantasyHeadY(headLines, battler, groundY)
+        gx, gy = self:pos("enemyGui" .. i, guiTxOn(enemyCentres[i]),
+          (headY - GUI_BOX_H_ENEMY * BOX_SCALE * 8) / 8)
+      else
+        gx, gy = self:pos("enemyGui" .. i, guiTxOn(enemyRow[i]), GUI_TOP_ENEMY / 8)
+      end
       local gs = self:sizeMul("enemyGui" .. i)
       self.hudMark[battler] = { x = gx * 8 + GUI_BOX_HALF_W * gs, top = gy * 8,
         left = gx * 8, gs = gs, h = GUI_BOX_H_ENEMY * 8,
@@ -6546,14 +8019,45 @@ return function(mod)
       end
     end
     for i, battler in ipairs(self.playerBattlers) do
-      local gx, gy = self:pos("playerGui" .. i, guiTxOn(playerRow[i]), GUI_TOP_ALLY / 8)
-      local gs = self:sizeMul("playerGui" .. i)
-      self.hudMark[battler] = { x = gx * 8 + GUI_BOX_HALF_W * gs, top = gy * 8,
-        left = gx * 8, gs = gs, h = GUI_BOX_H_PLAYER * 8,
-        visible = self.playerRevealed[i] and true or false }
-      if self.playerRevealed[i] then
-        drawGuiBox(gx, gy, GUI_TW, GUI_BOX_H_PLAYER, battler, self.data, true,
-          false, gs, self:shownHpOf(battler.mon), self.hud)
+      if self.fantasyCombat then
+        -- FANTASY COMBAT: no ally over-the-head readout at all -- the
+        -- party status list (fantasy_combat.lua) now carries the name, HP
+        -- bar with its current/max, level, exp bar and status effect.  The
+        -- enemy readouts above keep their native boxes (the option removes
+        -- only the ALLY ones).  hudMark is still filled for this battler so
+        -- the target/swap arrows (drawTargetMark/drawSwapMark) and the
+        -- floating damage numbers keep landing on the mon: anchored on its
+        -- own sprite (spriteAnchor's centre-x and top edge) instead of the
+        -- removed box.  `left` is offset by the same 48*BOX_SCALE term
+        -- drawDmgNumbers reads, so its centred HP-change label still lands
+        -- on the sprite's own centre.
+        local anchor = self.spriteAnchor[battler]
+        if anchor then
+          self.hudMark[battler] = { x = anchor.x, top = anchor.top,
+            left = anchor.x - 48 * BOX_SCALE, gs = 1, h = anchor.h or 32,
+            visible = self.playerRevealed[i] and true or false }
+        end
+      else
+        local gx, gy
+        if self.fantasyLayout then
+          -- Fantasy: the player's readout, the same hat on the same mon as
+          -- the enemy loop above -- centred on its own slot's centre-x with
+          -- its bottom edge on that mon's own head line.
+          local groundY = playerRects[i].y + playerRects[i].h
+          local headY = Screen.fantasyHeadY(headLines, battler, groundY)
+          gx, gy = self:pos("playerGui" .. i, guiTxOn(playerCentres[i]),
+            (headY - GUI_BOX_H_PLAYER * BOX_SCALE * 8) / 8)
+        else
+          gx, gy = self:pos("playerGui" .. i, guiTxOn(playerRow[i]), GUI_TOP_ALLY / 8)
+        end
+        local gs = self:sizeMul("playerGui" .. i)
+        self.hudMark[battler] = { x = gx * 8 + GUI_BOX_HALF_W * gs, top = gy * 8,
+          left = gx * 8, gs = gs, h = GUI_BOX_H_PLAYER * 8,
+          visible = self.playerRevealed[i] and true or false }
+        if self.playerRevealed[i] then
+          drawGuiBox(gx, gy, GUI_TW, GUI_BOX_H_PLAYER, battler, self.data, true,
+            false, gs, self:shownHpOf(battler.mon), self.hud)
+        end
       end
     end
 
@@ -6633,52 +8137,189 @@ return function(mod)
     self.eTextX, self.eTextY = (ex + 1) * 8 + 2, (ey + 1) * 8 + 2
     self.fChars = fw - 4
 
-    self:withScale("fBox", fx, fy, function()
-      love.graphics.setColor(1, 1, 1, 1)
-      if joined then
-        drawNativeFrame(fx, fy, fw + E_TW, BOTTOM_H)
-        drawNativeDivider(ex, fy, BOTTOM_H)
-      else
-        drawNativeFrame(fx, fy, fw, BOTTOM_H)
-      end
-      love.graphics.setColor(0, 0, 0, 1)
-      if self.phase == "intro" then
-        drawWrapped(self.currentMessage or "", self.fTextX, self.fTextY, self.fChars)
-      elseif self.phase == "actionMenu" then
-        self:drawActionMenuF()
-      elseif self.phase == "moveSelect" then
-        self:drawMoveSelect()
-      elseif self.phase == "targetSelect" then
-        self:drawTargetSelect()
-      elseif self.phase == "swapSelect" then
-        self:drawSwapSelect()
-      elseif self.phase == "gimmickSelect" then
-        self:drawGimmickSelect()
-      elseif self.phase == PROMPT_PHASE then
-        self:drawPromptF()
-      elseif self.phase == "resolving" then
-        drawWrapped(self.currentMessage or "", self.fTextX, self.fTextY, self.fChars)
-      elseif self.phase == "over" then
-        drawWrapped(self.overMessage or "", self.fTextX, self.fTextY, self.fChars)
-      end
-    end)
-
-    if not narrationW then
-      self:withScale("eBox", ex, ey, function()
-        if not joined then
-          love.graphics.setColor(1, 1, 1, 1)
-          drawNativeFrame(ex, ey, E_TW, BOTTOM_H)
+    if self.fantasyCombat then
+      -- FANTASY COMBAT (options.lua's row): the whole bottom band is the
+      -- modernized GUI -- see fantasy_combat.lua's own header for the full
+      -- picture.  F and E are no longer a permanent framed pair: the party
+      -- status list is the one persistent surface, E shows the current menu
+      -- only while there is one, and F is a floating message panel drawn
+      -- over E when a message needs it.  Every native frame/divider and
+      -- tile-font draw below is skipped; the fantasy module owns the band.
+      self:drawFantasyBottom(narrationW)
+    else
+      self:withScale("fBox", fx, fy, function()
+        love.graphics.setColor(1, 1, 1, 1)
+        if joined then
+          drawNativeFrame(fx, fy, fw + E_TW, BOTTOM_H)
+          drawNativeDivider(ex, fy, BOTTOM_H)
+        else
+          drawNativeFrame(fx, fy, fw, BOTTOM_H)
         end
         love.graphics.setColor(0, 0, 0, 1)
-        -- The prompt's two labels go where FIGHT/BAG/PKMN/RUN normally sit
-        -- -- the same vanilla text-box-plus-menu split this box exists for
-        -- (see drawContent's own note above), so a question reads as the
-        -- action menu temporarily offering two different actions rather
-        -- than as a foreign box dropped on the field.
-        if self.phase == "actionMenu" then self:drawActionMenuE()
-        elseif self.phase == PROMPT_PHASE then self:drawPromptE() end
+        if self.phase == "intro" then
+          drawWrapped(self.currentMessage or "", self.fTextX, self.fTextY, self.fChars)
+        elseif self.phase == "actionMenu" then
+          self:drawActionMenuF()
+        elseif self.phase == "moveSelect" then
+          self:drawMoveSelect()
+        elseif self.phase == "targetSelect" then
+          self:drawTargetSelect()
+        elseif self.phase == "swapSelect" then
+          self:drawSwapSelect()
+        elseif self.phase == "gimmickSelect" then
+          self:drawGimmickSelect()
+        elseif self.phase == PROMPT_PHASE then
+          self:drawPromptF()
+        elseif self.phase == "resolving" then
+          drawWrapped(self.currentMessage or "", self.fTextX, self.fTextY, self.fChars)
+        elseif self.phase == "over" then
+          drawWrapped(self.overMessage or "", self.fTextX, self.fTextY, self.fChars)
+        end
       end)
+
+      if not narrationW then
+        self:withScale("eBox", ex, ey, function()
+          if not joined then
+            love.graphics.setColor(1, 1, 1, 1)
+            drawNativeFrame(ex, ey, E_TW, BOTTOM_H)
+          end
+          love.graphics.setColor(0, 0, 0, 1)
+          -- The prompt's two labels go where FIGHT/BAG/PKMN/RUN normally sit
+          -- -- the same vanilla text-box-plus-menu split this box exists for
+          -- (see drawContent's own note above), so a question reads as the
+          -- action menu temporarily offering two different actions rather
+          -- than as a foreign box dropped on the field.
+          if self.phase == "actionMenu" then self:drawActionMenuE()
+          elseif self.phase == PROMPT_PHASE then self:drawPromptE() end
+        end)
+      end
     end
+  end
+
+  ------------------------------------------------------------------
+  -- FANTASY COMBAT -- the modernized combat GUI (fantasy_combat.lua).
+  --
+  -- Two methods, both only ever called while self.fantasyCombat is true:
+  --
+  --   fantasyData(narrationW)  reads THIS frame's screen state into the
+  --                            plain data table fantasy_combat.lua draws
+  --                            from, so that module owns the look while
+  --                            this one keeps owning what is on screen and
+  --                            when -- the same split this file already
+  --                            keeps with combat.lua.
+  --   drawFantasyBottom(narrationW)  hands that table to Fantasy.draw.
+  --
+  -- Everything the module needs is read from the live screen: the party
+  -- roster (self.playerBattlers, by SLOT, so party order is preserved and
+  -- an empty slot simply draws no row), the current phase's own cursor and
+  -- list state, and the SAME displayName/maxHpOf/expFraction/statusTag
+  -- helpers the native readouts use -- so the fantasy surfaces can never
+  -- disagree with what the rest of the screen shows.
+  ------------------------------------------------------------------
+
+  function Screen:fantasyData(narrationW)
+    local combat = self.combat
+    local data = { ds = DS, phase = self.phase, narration = narrationW and true or false }
+
+    -- Which on-field slot is being commanded right now (the panel lights that
+    -- row up).  self.turnSlots/slotPtr are the turn loop's own cursor, so this
+    -- is the same battler the action menu belongs to.
+    local activeSlot = self.turnSlots and self.turnSlots[self.slotPtr]
+    data.activeSlot = activeSlot
+
+    -- ---- the party status list (old box F's space) ----
+    -- One entry per PARTY SLOT that actually holds a Pokemon on the field;
+    -- an empty slot leaves a nil hole, which fantasy_combat.lua renders as
+    -- no row at all (the option's own rule: don't show a stat row for a
+    -- spot nobody is standing in).
+    local party = {}
+    for slot, battler in ipairs(self.playerBattlers) do
+      local mon = battler and battler.mon
+      if mon and self.playerRevealed[slot] then
+        party[slot] = {
+          name = displayName(mon),
+          hp = self:shownHpOf(mon) or mon.hp or 0,
+          maxHp = maxHpOf(mon),
+          level = mon.level or 1,
+          expFrac = expFraction(mon, self.data),
+          eff = statusTag(mon, self.data),
+          alive = combat.isAlive(battler),
+        }
+      end
+    end
+    data.party = party
+
+    -- The move readout's data for one picked entry (the moveListCache /
+    -- pendingPick shape: { slot = { id, pp, ppUps }, def = <record> }).
+    local function infoFor(entry)
+      if not (entry and entry.def) then return nil end
+      local def = entry.def
+      return {
+        name = def.name or def.id or "???",
+        pp = (entry.slot and entry.slot.pp) or 0,
+        maxPp = combat.maxPpOf(entry.slot, def),
+        power = def.power or def.basePower,
+        accuracy = def.accuracy,
+        eff = Fantasy and Fantasy.moveEffect and Fantasy.moveEffect(def) or nil,
+      }
+    end
+
+    -- ---- the current phase's own message / menu / cursor state ----
+    if self.phase == "intro" or self.phase == "resolving" then
+      data.message = self.currentMessage
+    elseif self.phase == "over" then
+      data.message = self.overMessage
+    elseif self.phase == "actionMenu" then
+      data.message = self.message
+      data.menu = {
+        layout = self.menuLayout,
+        order = self.menuOrder,
+        rows = self.gridRows,
+        labels = MENU_LABELS,
+        customLabel = self.customButtonLabel,
+        cursor = self.menuCursor,
+      }
+    elseif self.phase == "moveSelect" then
+      data.message = self.message
+      local moves = {}
+      for i, entry in ipairs(self.moveListCache or {}) do
+        moves[i] = {
+          name = entry.def.name or entry.def.id,
+          pp = entry.slot.pp or 0,
+          maxPp = combat.maxPpOf(entry.slot, entry.def),
+          usable = entry.usable,
+          swap = (self.moveSwapIndex == entry.index),
+        }
+      end
+      data.moves = moves
+      data.moveCursor = self.moveCursor
+      data.moveInfo = infoFor(self.moveListCache and self.moveListCache[self.moveCursor])
+    elseif self.phase == "targetSelect" then
+      data.message = "Choose a target:"
+      data.moveInfo = infoFor(self.pendingPick)
+    elseif self.phase == "swapSelect" then
+      data.message = "Switch with whom?"
+    elseif self.phase == "gimmickSelect" then
+      local gimmick = {}
+      for i, entry in ipairs(self.gimmickCandidates or {}) do
+        gimmick[i] = { label = entry.label, selected = (i == self.gimmickCursor) }
+      end
+      data.gimmick = gimmick
+    elseif self.phase == PROMPT_PHASE and self.prompt then
+      data.phase = "prompt"
+      data.prompt = {
+        text = self.prompt.text,
+        choices = self.prompt.choices,
+        index = self.prompt.index,
+      }
+    end
+
+    return data
+  end
+
+  function Screen:drawFantasyBottom(narrationW)
+    if not Fantasy then return end
+    Fantasy.draw(self:fantasyData(narrationW))
   end
 
   function Screen:draw()
@@ -6865,9 +8506,24 @@ return function(mod)
   -- full team for a doubles subset) rather than trusting whatever the
   -- real trainer table's own `party` field says.
   local function buildBattle(game, data)
+    -- `Battle.party` is the WHOLE player party, not the mons this layout
+    -- fields.  src/battle/gen2/Battle.lua's own contract is "party -- the
+    -- player's party (array of Mon)" and Battle.party IS save.party: the
+    -- engine resolves the EXP.SHARE holder scan, awardExperience's
+    -- applyShare lookup, the item-target party list
+    -- (Screen:openItemTargetPicker) and the bench the switch primitives read
+    -- through it.  Passing data.players -- the FIELD roster, e.g. the 2 mons a
+    -- doubles layout sends out -- truncated it to just those, so any lookup
+    -- for a BENCHED mon found nothing: giveExperiencePass pays self.party[index]
+    -- and awardExperience's applyShare searches self.party by identity, so a
+    -- benched mon was silently dropped.  That is why the EXP SHARE option's
+    -- party-wide modes paid no bench mon (tested gen 6).  The field roster
+    -- stays data.players -- Screen.new builds self.playerBattlers from it --
+    -- so nothing about the layout or rendering changes.
+    local party = (game.save and game.save.party) or data.players
     local opts = {
       data = game.data,
-      party = data.players,
+      party = party,
       save = game.save,
     }
     if #data.enemies <= 1 and not data.trainer then
@@ -6946,6 +8602,13 @@ return function(mod)
     combat.engine = g9dex and g9dex.exports or nil
     combat.battle = battle
     local inst = Screen.new(game, world, data, combat, game.data, battle, g9dex)
+    -- Carry a wild raid boss's declared gimmick from the battle onto the boss
+    -- battler (see resolveSprite's pctx for why).  applyWildBoss above stamped
+    -- it as battle.g9BossKind; the sprite mod has no other way to see it,
+    -- because a wild boss never has the gimmick activated.  Visual only.
+    if inst.isBoss and battle.g9BossKind and inst.enemyBattlers[1] then
+      inst.enemyBattlers[1].g9RaidGimmick = battle.g9BossKind
+    end
     -- Also what mod.exports.askBattleChoice resolves against -- see
     -- resolvePromptTarget, which reads this same reference rather than
     -- keeping a second one of its own.

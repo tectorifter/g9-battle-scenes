@@ -4,6 +4,15 @@
 -- tool's own SELECT>SAVE export (g2-Battle-Scene-Dev/dev_layout.lua's
 -- EXPORT_KEY): { enemyCount, allyCount, layout }.
 --
+-- Optional per-side SPRITE SIZE overrides may also appear at the top level
+-- (read by battle_screen.lua's Screen:battleSpriteScale): `spriteScale`
+-- sets both sides, `spriteScaleFront`/`spriteScaleBack` set one side each.
+-- A preset may additionally carry FANTASY-LAYOUT-EXCLUSIVE versions of the
+-- same three -- `spriteScaleFantasy`, `spriteScaleFantasyFront`,
+-- `spriteScaleFantasyBack` -- which are read ONLY when the FANTASY LAYOUT
+-- option is on, and multiplied into the side's normal scale (all
+-- multipliers, so leaving them out changes nothing).
+--
 -- The NAME is the whole point: another mod that owns its own encounter-
 -- trigger logic (wild grass, a boss tile, a horde spawn...) picks which
 -- visual preset a battle uses by name, one call --
