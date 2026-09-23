@@ -1,10 +1,9 @@
 # assets/backgrounds
 
 The ground plane behind the battle sprites (the Mod Manager's **BACKGROUND**
-row — `background.lua` reads it). **One example ships with the mod:
-`cave.png`** (an original, AI-generated backdrop — see "The bundled example"
-below). Nothing third-party or ROM-derived is redistributed; drop in your own
-PNGs alongside it and name them by the fight they are for. **AUTO** (the
+row — `background.lua` reads it). **No art ships with the mod** — drop in your
+own PNGs here and name them by the fight they are for. Nothing third-party or
+ROM-derived is redistributed. **AUTO** (the
 default) reads each battle and draws the matching file; **OFF** draws none of
 this and the field stays the plain white it has always been.
 
@@ -17,6 +16,7 @@ A file's name (before its extension) is the **tag** — the fight it plays for:
 | `grass` | a wild encounter in grass |
 | `water` | a wild encounter on water (surfing or fishing) |
 | `cave` | a wild encounter in a cave / an indoor encounter |
+| `gym` | the **generic gym ground** — a fallback (see "Fallbacks" below) |
 | `gym1` … `gym16` | gyms 1 through 16, in badge order (see below) |
 | `elitefour1` … `elitefour4` | the four Elite Four members, in league order |
 | `champion` | the Champion |
@@ -48,6 +48,7 @@ with `gym1-2.png` is the same 50/50.
 ```
 assets/backgrounds/grass.png        -> grass, the only one
 assets/backgrounds/grass-2.png      -> grass, second of two (50/50)
+assets/backgrounds/gym.png          -> the generic gym ground (fallback)
 assets/backgrounds/gym1.png         -> gym 1
 assets/backgrounds/gym1-2.png       -> gym 1, second file
 assets/backgrounds/gym10-3.png      -> gym 10 (longest tag name wins)
@@ -91,9 +92,25 @@ Badge order, per generation.
    tile underfoot — `cave` for `CAVERN`/`CAVE` tilesets or a cave/dungeon/
    indoor map environment, else `grass`).
 
-**A tag with no art falls back to the map's terrain tag** when it is not
-itself a terrain tag — so a missing `gym1.png` still shows the gym's ground
-rather than white.
+## Fallbacks
+
+A **gym**, **Elite Four** or **Champion** fight whose own numbered file is
+missing walks its own chain instead of going white:
+
+1. its own tag — `gym1`..`gym16`, `elitefour1`..`elitefour4` or `champion`;
+2. **`gym.png`** — the generic gym ground, if you have one;
+3. **`grass.png`** — the grass ground, the last fallback.
+
+So with only `grass.png` dropped in, every gym / Elite Four / Champion fight
+shows your grass; add a `gym.png` and those fights prefer it; add a numbered
+file (e.g. `gym3.png`) and that one fight prefers it over both. Because the
+chain is explicit, an indoor gym or league battle never borrows the map's
+`cave` ground just because it is indoors.
+
+Every **other** tag keeps the older single fallback: a non-terrain tag with no
+art of its own borrows the **map's terrain tag** (`grass` / `water` / `cave`)
+that the battle is happening on. `cave.png` is no longer bundled, so a cave
+fight with no `cave.png` of your own draws the white field.
 
 ## How it is drawn
 
@@ -124,20 +141,6 @@ ground.
 
 **A missing or corrupt file is never fatal** — `background.lua` logs one
 warning and the field falls back to white.
-
-## The bundled example (`cave.png`)
-
-`cave.png` is an original, AI-generated 960x540 (16:9) cave backdrop, bundled
-so a fresh install draws a cave backdrop for cave / indoor fights instead of
-white. It is painted in the same **soft, richly-shaded style** as the drop-in
-`grass` / `water` art this project is used with — mottled, gently-lit rock with
-blended brushwork, muted grey-brown and cool blue-green tones, and no hard
-cartoon outlines. It is authored to the composition above: the cave **wall and
-ceiling are a thin band across the top ~15%** of the PNG, fading softly into
-the floor, and the rocky **ground fills the bottom ~85%**, so the ground reaches
-well past the enemy's feet line (design y=64) and up to four combatants a side
-stand on solid rock. It is a normal tag file — delete it, swap it, or add
-`cave-2.png` / `cave-3.png` for cave variants exactly like any other.
 
 ## Adding your own backdrop
 

@@ -28,13 +28,36 @@
 --                            the chest with a slight overshoot, a two-strand
 --                            helix turning inside it, lavender-to-teal body,
 --                            white rim and a 4-point sparkle.
---   0.95 - 2.12  BEAMS       four pale wedges radiate in an X out of the orb.
+--   0.95 - 2.12  STAR        eight pointed rays breathe out of the orb -- four
+--                            CARDINAL (up/down/left/right) and four SUBCARDINAL
+--                            (the diagonals) -- with the two families OUT OF
+--                            PHASE: the cardinals extend while the diagonals
+--                            retract, and then the reverse.  Each ray is a
+--                            SHARP spike (a waist just off the orb, then a true
+--                            point), and behind them a soft WASH of colour --
+--                            near-solid at the sphere, fading with no straight
+--                            edges to a true transparent 0 past the longest the
+--                            points reach -- light propagating outward and
+--                            dimming with distance.
 --   0.80 - 3.10  PIXELS      square pixel sparkles (the cart's own chunky
 --                            scale) drift and twinkle around everything.
---   1.70 - 2.45  FLASH       a full-screen white bloom, peaking exactly on the
---   1.95  REVEAL             REVEAL beat.  This is the frame battle_screen
---                            performs the transformation on, so the old
---                            sprite and the new one are separated by white.
+--   1.70 - 2.45  FLASH       a full-screen white bloom.  It peaks at FLASH_IN
+--                            (1.86) and HOLDS to 2.06, so the
+--   1.95  REVEAL             REVEAL beat sits INSIDE the white window.  The
+--                            peak is capped at FLASH_ALPHA (0.30) -- a white
+--                            screen at 30% opacity rather than a solid one --
+--                            so the sequence never flash-bangs the viewer;
+--                            battle_screen performs the form change there,
+--                            with the sprite itself held as a solid white
+--                            silhouette (E.whiten), which is what keeps the
+--                            old art and the new art from being told apart.
+--                            battle_screen also FREEZES this clip on
+--                            that beat (E.step's `hold`) until the new form's
+--                            own art is ready to draw, so a sheet that is still
+--                            baking cannot pop in after the flash has gone --
+--                            the screen stays in the window until the
+--                            replacement can actually be made, and only then
+--                            blooms open on the new sprite.
 --   2.12 - 3.20  SHATTER     the glass sphere breaks: every facet flies
 --                            outward along its own normal, tumbling and
 --                            spreading, white-edged and iridescent.
@@ -56,15 +79,36 @@ return function(mod)
 
   -- The timeline.  REVEAL_T is load-bearing: battle_screen.lua performs the
   -- actual form change the frame this clip reports `revealed`, which is where
-  -- the flash is at full white.
+  -- the flash is at its peak.
   local REVEAL_T = 1.95
   local SHATTER_T = 2.12
   local SHOCK_T = 2.30
   local SETTLE_T = 2.95
   local END_T = 3.60
 
+  -- The full-screen flash's own beats (see E.flashAlpha).  FLASH_IN/FLASH_OUT
+  -- bound the white window the reveal is hidden inside, and REVEAL_T is between
+  -- them by construction -- that is the whole property this sequence exists to
+  -- keep (a swap the player can see is a swap that reads as a glitch), so both
+  -- are published and asserted by the harness rather than left implicit.
+  local FLASH_START, FLASH_IN, FLASH_OUT, FLASH_END = 1.70, 1.86, 2.06, 2.45
+
+  -- How opaque the full-screen flash may get at its peak.  It used to reach a
+  -- SOLID white (1.0), a flash-bang on a large screen; it is fixed at 0.30
+  -- (70% transparent) so the sequence is easy on the eyes.  The whole curve --
+  -- the ramp in, the white window, the fade -- scales by this, so the beat is
+  -- dimmer throughout, never just at its peak.  The swap stays hidden because
+  -- the sprite is held as a solid white silhouette (E.whiten) across the
+  -- reveal, not because the screen is opaque.
+  local FLASH_ALPHA = 0.30
+
   E.REVEAL_T = REVEAL_T
   E.END_T = END_T
+  E.FLASH_START = FLASH_START
+  E.FLASH_IN = FLASH_IN
+  E.FLASH_OUT = FLASH_OUT
+  E.FLASH_END = FLASH_END
+  E.FLASH_ALPHA = FLASH_ALPHA
 
   ----------------------------------------------------------------------
   -- small math / colour helpers
@@ -170,8 +214,13 @@ return function(mod)
   ----------------------------------------------------------------------
   -- clip construction
   ----------------------------------------------------------------------
-  -- opts:  x (sprite centre-x, design px)  top  feet  w  h  side
-  --        seed (optional)  vw/vh (optional canvas size, default 320x180)
+  -- opts:  x (the sprite's anchor: its centre-x, design px)
+  --        cx (optional: where to DRAW the sequence.  battle_screen passes
+  --            the centre of the pixels the sprite really paints, which is the
+  --            same as `x` unless the art sits off-centre inside the frame it
+  --            was baked into -- see that file's Ev.artShiftX)
+  --        top  feet  w  h  side  seed (optional)  vw/vh (optional canvas
+  --        size, default 320x180)
   local function newClip(opts)
     opts = opts or {}
     local rnd = rng(opts.seed or 20260919)
@@ -187,7 +236,13 @@ return function(mod)
       shards = buildShards(rnd),
       wisps = {}, pixels = {}, stars = {},
     }
-    clip.cx = clip.x
+    -- `x` is the anchor the sprite itself is drawn on; `cx` is where the show
+    -- is drawn.  They are the same number unless the caller measured the art
+    -- and found it off-centre in its own frame, in which case every spherical
+    -- element here -- orb, ring, shell, aura, beams, shockwave, stars -- moves
+    -- with `cx` and lands on the creature rather than on the frame's edge.
+    clip.cx = opts.cx or clip.x
+    clip.artShift = clip.cx - clip.x
     -- The orb sits at the chest, a little above the sprite's own centre, which
     -- is where the clip puts it (and where "in front of the heart" reads).
     clip.cy = clip.top + clip.h * 0.42
@@ -218,12 +273,21 @@ return function(mod)
   ----------------------------------------------------------------------
   -- driving
   ----------------------------------------------------------------------
-  function E.step(clip, dt)
+  -- One tick.  `hold` FREEZES the clock -- battle_screen raises it while the
+  -- screen is being held solid white (see FLASH above), which is how a frame
+  -- the player must not see can be kept off the screen for as long as the art
+  -- behind it needs.  The reveal beat SNAPS the clock to REVEAL_T, so the white
+  -- the form change hides under is the same on every machine whatever frame
+  -- time got there (and so a hold that starts on that beat starts from the
+  -- flash's own solid window rather than a frame past it).
+  function E.step(clip, dt, hold)
     if clip.done then return end
+    if hold then return end
     dt = dt or 0
     clip.t = clip.t + dt
     clip.shellRot = clip.shellRot + dt * 0.85
     if not clip.revealed and clip.t >= REVEAL_T then
+      clip.t = REVEAL_T
       clip.revealed = true
       local cb = clip.onReveal
       if cb then cb(clip) end
@@ -231,19 +295,43 @@ return function(mod)
     if clip.t >= END_T then clip.done = true end
   end
 
-  -- 0..1 "how white is the sprite right now".  battle_screen.lua multiplies
-  -- its sprite draw's colour by this: 0 is the ordinary art, 1 is a solid
-  -- white silhouette.  The shape is the clip's own: a shimmer from 0.45s, a
-  -- hard ramp into the reveal, held through the shatter, released over the
-  -- new form so its colour blooms back in.
+  -- 0..1: "how white the sprite is right now", which battle_screen multiplies
+  -- its sprite draw's colour by (0 is the ordinary art, 1 a solid white
+  -- silhouette).  The shape is the clip's own: a shimmer from 0.45s, a hard
+  -- ramp into the reveal, held through the shatter, released over the new form
+  -- so its colour blooms back in.  It is already at 1 by FLASH_IN -- i.e.
+  -- before the reveal beat -- so the frame the form changes on is both a solid
+  -- silhouette and under a solid flash.
   function E.whiten(clip)
     local t = clip.t
     if t < 0.45 then return 0 end
     if t < 1.35 then return 0.30 * ((t - 0.45) / 0.90) end
-    if t < REVEAL_T then return lerp(0.30, 1.0, (t - 1.35) / (REVEAL_T - 1.35)) end
+    if t < FLASH_IN then return lerp(0.30, 1.0, (t - 1.35) / (FLASH_IN - 1.35)) end
     if t < SHATTER_T then return 1.0 end
     if t < 2.62 then return 1.0 - ((t - SHATTER_T) / (2.62 - SHATTER_T)) end
     return 0
+  end
+
+  -- 0..FLASH_ALPHA: how opaque the FULL-SCREEN flash is right now.  It peaks
+  -- across FLASH_IN..FLASH_OUT -- the window the reveal beat sits inside -- with
+  -- a quadratic ramp in and a linear fade out, and the whole curve is scaled by
+  -- FLASH_ALPHA so the peak is a 30%-opaque white rather than a solid one.
+  -- Published (rather than buried in the draw) because the one property this
+  -- sequence must keep is "the swap is under the flash window", and a harness
+  -- can only assert that if the number is askable.
+  function E.flashAlpha(clip)
+    local t = clip.t
+    if t < FLASH_START or t >= FLASH_END then return 0 end
+    local a
+    if t < FLASH_IN then
+      local u = (t - FLASH_START) / (FLASH_IN - FLASH_START)
+      a = u * u
+    elseif t <= FLASH_OUT then
+      a = 1
+    else
+      a = 1 - (t - FLASH_OUT) / (FLASH_END - FLASH_OUT)
+    end
+    return a * FLASH_ALPHA
   end
 
   -- A short size pop on the frame the new form lands (the clip's "power
@@ -561,6 +649,19 @@ return function(mod)
     drawOrbAt(clip, clip.cx, clip.cy, R, 1, t * 1.35)
   end
 
+  -- THE LIGHT STAR.  Eight pointed rays radiate out of the orb -- four
+  -- CARDINAL (up/down/left/right) and four SUBCARDINAL (the diagonals) -- and
+  -- the two families breathe OUT OF PHASE: the cardinals extend while the
+  -- diagonals retract, and then the reverse, so the star pulses like a living
+  -- thing instead of inflating on one waveform.  Each ray is a SHARP spike: it
+  -- swells to a waist just off the orb and then tapers to a true POINT -- a
+  -- flat far edge is what made the old four-beam cross read as truncated.
+  --
+  -- Behind them sits the WASH: a radial glow of colour that is near-solid at
+  -- the sphere and fades, progressively and with NO straight edges, to a true
+  -- transparent 0 by a radius past the longest the points ever get -- the light
+  -- between the bars, reading as light propagating outward and dimming with
+  -- distance.
   local function drawBeams(clip)
     local G = love.graphics
     local t = clip.t
@@ -568,48 +669,86 @@ return function(mod)
     if k <= 0 then return end
     local cx, cy = clip.cx, clip.cy
     local R = clip.sphereR
+
+    local BASE, AMP = 92, 0.24                -- the star's length and its breath
+    local b = math.sin(t * 4.0)               -- the two families share one wave
+    local lenCard = BASE * (1 + AMP * b)
+    local lenSub = BASE * (1 - AMP * b)
+    -- The wash reaches well past the longest the points ever get, and is
+    -- exactly transparent by then, so its outgrowth is visible rather than a
+    -- fade that lands right on the tips.
+    local washR = BASE * (1 + AMP) * 1.38
+
+    local CARD = { 0, math.pi * 0.5, math.pi, math.pi * 1.5 }
+    local SUBC = { math.pi * 0.25, math.pi * 0.75, math.pi * 1.25, math.pi * 1.75 }
+    local function hueOf(i) return i / 8 + t * 0.20 end
+
     G.push("all")
-    for i = 1, 4 do
-      local ang = math.pi / 4 + (i - 1) * math.pi / 2
+
+    -- The wash: light propagating outward from the sphere and dimming with
+    -- distance.  Concentric discs whose alphas are SOLVED so the composited
+    -- result is exactly A(r) = WASH_A * (1 - r/washR)^1.5 -- solid colour at
+    -- the sphere, fading progressively to a true 0 at washR.  The gentle
+    -- exponent (rather than a squared one) keeps a visible trace of light out
+    -- past the longest points before it dies, so the glow is seen to outgrow
+    -- them.  Discs rather than wedges or a ray-shaped lobe: a radial glow has
+    -- no straight edges anywhere, so none of it can read as a rectangular band,
+    -- and it is the light seen between the bars.  (Many rings: each disc is a
+    -- single flat colour, so the composited alpha is a step function, and too
+    -- few steps read as visible concentric rings -- 64 keeps the steps finer
+    -- than the eye picks out.)
+    local WASH_A = 0.60 * k
+    local NR = 64
+    local function profile(r) return WASH_A * (1 - r / washR) ^ 1.5 end
+    local function wash()
+      G.setBlendMode("alpha")
+      for i = NR, 1, -1 do
+        local r0 = washR * ((i - 1) / NR)
+        local r1 = washR * (i / NR)
+        local aa = 1 - (1 - profile(r0)) / (1 - profile(r1))
+        if aa > 0.004 then
+          local s = i / NR
+          local rr, gg, bb = hsv(0.58 + s * 0.30 + t * 0.16, 0.60, 1)
+          G.setColor(rr, gg, bb, aa)
+          G.circle("fill", cx, cy, r1)
+        end
+      end
+    end
+
+    -- The ray itself: every layer is the SAME pointed spike, NESTED one inside
+    -- another with the longest giving the silhouette.  Because each layer ends
+    -- in a single vertex and the longest is the outline, the ray's tip is one
+    -- clean point -- no stroke cap (flat) and no miter join at that acute apex
+    -- (which a clipped miter turns into a blunt end) ever sits there.  A
+    -- coloured body, a warmer mid spike, and an additive white core, all sharing
+    -- the same waist fraction and tapering together to the point.
+    local function spike(ang, far, hue)
       local ux, uy = math.cos(ang), math.sin(ang)
       local px, py = -uy, ux
-      local far = 104 * (0.86 + 0.14 * math.sin(t * 13 + i))
-      local w1, w2 = R * 0.5, R * 2.1
-      local pts = {
-        cx + px * w1, cy + py * w1,
-        cx - px * w1, cy - py * w1,
-        cx + ux * far - px * w2, cy + uy * far - py * w2,
-        cx + ux * far + px * w2, cy + uy * far + py * w2,
-      }
-      local w3 = w1 * 0.44
-      local core = {
-        cx + px * w3, cy + py * w3,
-        cx - px * w3, cy - py * w3,
-        cx + ux * far - px * w3, cy + uy * far - py * w3,
-        cx + ux * far + px * w3, cy + uy * far + py * w3,
-      }
-      -- ALPHA for the wedge: an additive wedge over a bright field just raises
-      -- the exposure (the first cut of this read as four pale panels).  Only
-      -- the hot core and the fringe lines stay additive.
+      local rr, gg, bb = hsv(hue, 0.72, 1)
+      local W0, WM = R * 0.16, R * 0.60
+      local function layer(len, w0, wm, r, g, bl, a)
+        local wx, wy = cx + ux * len * 0.34, cy + uy * len * 0.34
+        G.setColor(r, g, bl, a)
+        G.polygon("fill", {
+          cx + px * w0, cy + py * w0,
+          wx + px * wm, wy + py * wm,
+          cx + ux * len, cy + uy * len,
+          wx - px * wm, wy - py * wm,
+          cx - px * w0, cy - py * w0,
+        })
+      end
       G.setBlendMode("alpha")
-      G.setColor(0.86, 0.94, 1.0, 0.24 * k)
-      G.polygon("fill", pts)
+      layer(far, W0, WM, rr, gg, bb, 0.34 * k)
+      layer(far * 0.90, W0 * 0.80, WM * 0.66,
+        0.42 + rr * 0.58, 0.42 + gg * 0.58, 0.42 + bb * 0.58, 0.30 * k)
       G.setBlendMode("add")
-      G.setColor(1, 1, 1, 0.34 * k)
-      G.polygon("fill", core)
-      G.setColor(1, 1, 1, 0.62 * k)
-      G.setLineWidth(1.5)
-      G.line(cx, cy, cx + ux * far, cy + uy * far)
-      -- rainbow fringe along each beam
-      local rr, gg, bb = hsv(i / 4 + t * 0.30, 0.85, 1)
-      G.setBlendMode("alpha")
-      G.setColor(rr, gg, bb, 0.55 * k)
-      G.setLineWidth(1.0)
-      G.line(cx + px * w2, cy + py * w2,
-        cx + ux * far + px * w2, cy + uy * far + py * w2)
-      G.line(cx - px * w2, cy - py * w2,
-        cx + ux * far - px * w2, cy + uy * far - py * w2)
+      layer(far * 0.78, W0 * 0.34, WM * 0.20, 1, 1, 1, 0.45 * k)
     end
+
+    wash()
+    for i = 1, 4 do spike(CARD[i], lenCard, hueOf(i - 1)) end
+    for i = 1, 4 do spike(SUBC[i], lenSub, hueOf(i + 3)) end
     G.pop()
   end
 
@@ -649,15 +788,12 @@ return function(mod)
     G.pop()
   end
 
+  -- The FULL-SCREEN white.  Its curve lives in E.flashAlpha (see there): a
+  -- quadratic ramp in from FLASH_START, the white peak across the reveal
+  -- window, and a linear fade out -- scaled throughout by FLASH_ALPHA, so the
+  -- beat the form changes on is a 30%-opaque white rather than a solid one.
   local function drawFlash(clip)
-    local t = clip.t
-    local a = 0
-    if t >= 1.70 and t < 2.45 then
-      local up = clamp((t - 1.70) / (REVEAL_T - 1.70), 0, 1)
-      local dn = 1 - clamp((t - REVEAL_T) / (2.45 - REVEAL_T), 0, 1)
-      a = math.min(up, dn)
-      a = a * a * 0.92
-    end
+    local a = E.flashAlpha(clip)
     if a <= 0 then return end
     local G = love.graphics
     G.push("all")

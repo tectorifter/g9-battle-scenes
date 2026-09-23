@@ -102,6 +102,22 @@ return function(mod)
   -- at load time and stages the sequence from its own resolve pass.  See
   -- evolution_anim.lua's header and battle_screen.lua's MEGA EVOLUTION block.
   loadSibling(mod, "evolution_anim.lua")(mod)
+  -- The DYNAMAX / GIGANTAMAX animation, same contract one line up: loaded before
+  -- battle_screen.lua, which captures mod.exports.battleSceneDynamaxAnim at its
+  -- own load time and stages the sequence from its resolve pass.  See
+  -- dynamax_anim.lua's header and battle_screen.lua's DYNAMAX block.
+  loadSibling(mod, "dynamax_anim.lua")(mod)
+  -- The persistent DYNAMAX FIELD FX -- the darkened field, the red aura around
+  -- a transformed battler, and the burst a fainted Dynamaxed mon leaves.  Same
+  -- contract one line up: loaded before battle_screen.lua, which captures its
+  -- export and draws through it from its own DYNAMAX FIELD block.  See
+  -- dynamax_field.lua's own header.
+  loadSibling(mod, "dynamax_field.lua")(mod)
+  -- The TERASTALLIZATION animation.  Same contract: loaded before
+  -- battle_screen.lua, which captures mod.exports.battleSceneTeraAnim at its
+  -- own load time and stages the sequence from its own resolve pass.  See
+  -- tera_anim.lua's header and battle_screen.lua's TERA block.
+  loadSibling(mod, "tera_anim.lua")(mod)
   loadSibling(mod, "battle_screen.lua")(mod)
   -- Wild-boss options LAST, so battle_screen.lua's own install has already
   -- run when this registers its battle.damage 1-HP wrap and its exports.

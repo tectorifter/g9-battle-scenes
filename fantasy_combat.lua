@@ -91,6 +91,21 @@ return function(mod)
     return false
   end
 
+  -- WHITE ROW (options.lua's own row): when on, each party row's own
+  -- BACKGROUND panel is drawn as a translucent white panel (white at 40%
+  -- opacity) instead of the usual dark surface, so the field reads through
+  -- the row.  Only the row's background changes -- the name, HP bar, level,
+  -- exp bar and status tag inside it all keep their own colours.  Read per
+  -- draw, defensively, so a harness (or a disabled mod) keeps the dark row.
+  function F.whiteRow()
+    local options = mod and mod.options
+    if options and type(options.get) == "function" then
+      local ok, value = pcall(function() return options:get("white_row") end)
+      if ok and type(value) == "string" then return value == "on" end
+    end
+    return false
+  end
+
   -- ------------------------------------------------------------------ palette
 
   -- The g9-gui palette, unchanged, so a screen from either mod reads as the
@@ -117,11 +132,20 @@ return function(mod)
     accentDim = { 0.210, 0.400, 0.560, 1.00 },
     gold      = { 0.960, 0.800, 0.360, 1.00 },
     goldDim   = { 0.480, 0.400, 0.200, 1.00 },
-    good      = { 0.380, 0.880, 0.480, 1.00 },
-    warn      = { 0.960, 0.790, 0.270, 1.00 },
-    bad       = { 0.950, 0.380, 0.360, 1.00 },
+    -- The HP bar's three state colours (v4.0.8).  The old trio were bright
+    -- pastels (a neon green / yellow / red stoplight); these are the same
+    -- three states carried at ONE shared depth, anchored on the user's
+    -- #00A36D -- the yellow and red are darkened to that same saturation and
+    -- value, so the bar reads as a single muted family instead of a bright
+    -- one, without losing the state the colour is there to show.
+    good      = { 0.000, 0.639, 0.427, 1.00 },  -- #00A36D
+    warn      = { 0.639, 0.561, 0.000, 1.00 },  -- #A38F00
+    bad       = { 0.639, 0.000, 0.000, 1.00 },  -- #A30000
     shadow    = { 0.000, 0.000, 0.000, 0.55 },
     white     = { 1.000, 1.000, 1.000, 1.00 },
+    -- The WHITE ROW option's fill: white, 40% transparent (60% opaque), in
+    -- place of a party row's usual dark background panel.
+    whiteRow  = { 1.000, 1.000, 1.000, 0.60 },
   }
   F.col = COL
 
@@ -578,9 +602,14 @@ return function(mod)
   local function drawPartyRow(row, index, lit)
     local ry = ROW_TOP + (index - 1) * (ROW_H + ROW_GAP)
     local f = F.fonts()
+    -- WHITE ROW (options.lua's row): when on, the row's own BACKGROUND is a
+    -- translucent white panel instead of the usual dark surface.  Nothing
+    -- inside the row changes -- the name, HP bar (below), level, exp bar and
+    -- status tag all keep their colours.  The lit row keeps its brighter
+    -- border so the active mon is still readable.
     panel(PARTY.x, ry, PARTY.w, ROW_H, {
       shadow = 0, radius = 4,
-      color = lit and COL.panelLit or COL.panel,
+      color = F.whiteRow() and COL.whiteRow or (lit and COL.panelLit or COL.panel),
       border = lit and COL.borderLit or COL.border,
     })
     local midY = ry + ROW_H * 0.5
@@ -592,6 +621,10 @@ return function(mod)
     local hx = PARTY.x + C_HP
     local hy = midY - H_HP * 0.5
     local hpFrac = (row.maxHp and row.maxHp > 0) and (row.hp / row.maxHp) or 0
+    -- The HP bar's state colour, always on (v4.0.8).  COL.good/warn/bad are
+    -- the one shared depth described at the palette above -- NOT affected by
+    -- the WHITE ROW option, which repaints only the row background behind
+    -- this bar.  The exp bar below keeps its own colour either way.
     local hpCol = hpFrac > 0.5 and COL.good or (hpFrac > 0.2 and COL.warn or COL.bad)
     bar(hx, hy, W_HP, H_HP, hpFrac, hpCol, { radius = 4 })
     local hpText = string.format("%d/%d", math.max(0, row.hp or 0), math.max(0, row.maxHp or 0))

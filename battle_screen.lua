@@ -43,6 +43,146 @@
 --     answers that same wide-battle contract and Screen:draw renders the
 --     960x540 canvas 1:1 into the surface the engine allocated.  See the
 --     WIDESCREEN CONTRACT block by Screen:drawWidescreen.
+
+-- ==================================================================
+-- SESSION-SCOPE STATE + RUN POLICY CONSTANTS
+-- ------------------------------------------------------------------
+-- Declared at CHUNK scope (outside the installer closure) on purpose: the
+-- installer already sits at Lua 5.1's 200-local ceiling, and -- more to the
+-- point -- these values are meant to live for the whole session.  The chunk
+-- is loaded once, its returned closure captures these as upvalues, and they
+-- die with the Lua state: no save file, no reload, "just clears up at game
+-- quit/close", exactly as the move-cursor memory was specified.
+-- ==================================================================
+
+-- RUN policy (user spec): a fight may only be escaped from a WILD battle.
+-- A trainer battle refuses the run outright -- the exact line the engine's
+-- own Gen 2 Battle:tryRun prints (src/battle/gen2/Battle.lua, "No! There's
+-- no running from a trainer battle!").  A wild BOSS fight asks first, with
+-- the cursor parked on NO, so a stray A on RUN can never throw the fight
+-- away by accident.  See Screen:attemptRun / Screen:confirmBossRun.
+local RUN_TRAINER_REFUSAL = "No! There's no running from a trainer battle!"
+local RUN_BOSS_QUESTION = "Are you sure you want to run away?"
+local RUN_YES_LABEL = "YES"
+local RUN_NO_LABEL = "NO"
+
+-- MOVE-LIST CURSOR MEMORY (session only -- the user's own spec: "move window
+-- in battle pos memory ... per session ... per battle field slot on player
+-- side ... cursor memory must survive battles, just clears up at game
+-- quit/close").
+--
+-- Keyed by the MON TABLE rather than by a slot index: the user's own rule is
+-- that "if pokemon switches, we switch the cursor memory values with them",
+-- so the remembered move slot travels with the Pokemon across a positional
+-- SWITCH (Screen:queueSwapAction -> the swapQueue pass) and across an
+-- ordinary PKMN switch-in alike.  A player mon IS its save-party entry, so
+-- the same table (and so this memory) rides from one fight into the next.
+--
+-- SAFEGUARDS (the user's own "prevent stack overflow, specially sensible for
+-- game speed up scenarios"): weak keys with integer-only values, and this
+-- table is reachable from nowhere the save writer walks, so it can neither
+-- leak a battle into a save (the round-275 SaveSerializer `stack overflow`
+-- class) nor grow past the handful of party mons.  The read is one hash
+-- lookup plus a bounded scan of the move list, the write is a single
+-- assignment, and nothing here calls back into the screen -- so a sped-up
+-- frame can hoard no nested passes through this code.
+local moveCursorMemory = setmetatable({}, { __mode = "k" })
+
+-- The move-slot index this mon last COMMITTED from its move list, or nil.
+local function rememberedMoveSlot(mon)
+  if type(mon) ~= "table" then return nil end
+  local slot = moveCursorMemory[mon]
+  return type(slot) == "number" and slot or nil
+end
+
+-- Record the move slot a committed action came from.  Only player field
+-- battlers reach here (Screen:queueAction reads self.playerBattlers), so the
+-- memory is player-side by construction.
+local function rememberMoveSlot(mon, slotIndex)
+  if type(mon) ~= "table" or type(slotIndex) ~= "number" then return end
+  moveCursorMemory[mon] = slotIndex
+end
+
+-- ACTION-MENU + BAG CURSOR MEMORY (session only -- the same "survives
+-- battles, just clears up at game quit/close" contract as the move memory
+-- above).  The user's own spec: "keep memory for (first pos only, the other
+-- pos start at FIGHT action position) for action menu, add cursor memory to
+-- each bag slot".
+--
+-- Two caches, both plain chunk-scope tables:
+--
+--   * actionMenuMemory -- keyed by the player FIELD SLOT index.  Only the
+--     FIRST field slot ("first pos") is ever written or read; every other
+--     slot answers nil and so can only ever open on FIGHT, exactly as asked.
+--     The value is the action id last COMMITTED there ("FIGHT", "PKMN", ...).
+--   * bagCursorMemory -- keyed by BAG SLOT: on Gen 2 a pocket id
+--     ("ITEM" / "BALL" / "KEY_ITEM" / "TM_HM") and on Gen 1 the single bag
+--     ("BAG").  The value is { index, scroll }: the row the player last left
+--     the battle bag on.  Screen:openBag refills the engine's own WRAM
+--     cursor bytes from here when a battle boundary has wiped them, so the
+--     bag reopens on the item it was left on instead of at the top.
+--
+-- SAFEGUARDS (the user's own "add safeguards to prevent overflow", the same
+-- class as the move memory's): both tables live at chunk scope -- reachable
+-- from nowhere the save writer walks, so they can neither leak a battle into
+-- a save (the round-275 SaveSerializer `stack overflow` class) nor outlive
+-- the Lua state -- hold only scalar values, and are bounded in size: the
+-- action cache has one used key, the bag cache one per pocket.  Every read
+-- is one hash lookup plus an integer clamp, every write is one assignment,
+-- and nothing here calls back into the screen, so a sped-up frame can hoard
+-- no nested passes through this code.
+local FIRST_FIELD_SLOT = 1
+local actionMenuMemory = {}
+local bagCursorMemory = {}
+
+-- The action the FIRST field slot last committed, or nil.  Any other slot
+-- deliberately answers nil, so its menu can only ever open on FIGHT.
+local function rememberedAction(slotIdx)
+  if slotIdx ~= FIRST_FIELD_SLOT then return nil end
+  local id = actionMenuMemory[slotIdx]
+  return type(id) == "string" and id or nil
+end
+
+-- Record the action the first field slot committed.  Other slots are
+-- deliberately not remembered ("the other pos start at FIGHT").
+local function rememberAction(slotIdx, id)
+  if slotIdx ~= FIRST_FIELD_SLOT then return end
+  if type(id) ~= "string" then return end
+  actionMenuMemory[slotIdx] = id
+end
+
+-- A finite, in-range integer, or nil.  Guards the remembered values against a
+-- NaN/inf sneaking in through a hand-written save or a broken caller.
+local function boundedInt(v, min, max)
+  if type(v) ~= "number" or v ~= v or v == math.huge or v == -math.huge then
+    return nil
+  end
+  v = math.floor(v)
+  if v < min then v = min end
+  if v > max then v = max end
+  return v
+end
+
+-- The remembered row of one bag slot, clamped to a list that may have shrunk
+-- since (an item sold or used up).  Returns (index, scroll) or nothing.
+local function rememberedBagCursor(slotId, count)
+  if type(slotId) ~= "string" then return nil end
+  local memo = bagCursorMemory[slotId]
+  if type(memo) ~= "table" then return nil end
+  local index = boundedInt(memo.index, 1, 100000)
+  local scroll = boundedInt(memo.scroll, 0, 100000)
+  if not index then return nil end
+  if count then index = math.min(index, math.max(1, count)) end
+  return index, scroll or 0
+end
+
+local function rememberBagCursor(slotId, index, scroll)
+  if type(slotId) ~= "string" then return end
+  index = boundedInt(index, 1, 100000)
+  if not index then return end
+  bagCursorMemory[slotId] = { index = index, scroll = boundedInt(scroll, 0, 100000) or 0 }
+end
+
 return function(mod)
   local Font = require("src.render.Font")
   local Screens = require("src.ui.Screens")
@@ -79,6 +219,12 @@ return function(mod)
   -- animation can only ever make a mega change silently -- never break the
   -- turn.  See this file's MEGA EVOLUTION block for the staging contract.
   local Evolution = mod.exports.battleSceneEvolutionAnim
+  -- The DYNAMAX / GIGANTAMAX animation module (dynamax_anim.lua, loaded just
+  -- before this file) is picked up inside the DYNAMAX block far below, and hung
+  -- off the `Ev` table rather than a `local` of its own: this file's enclosing
+  -- function already sits at Lua's 200-local ceiling, and one more name up here
+  -- would stop the whole scene compiling.  Same contract as Evolution:
+  -- nil-safe, guarded at every use, and pure costuming.
   -- Real native Battle, constructed here so battle:useMove (driven
   -- through g9-battle-engine's mod.exports.resolveTurnActions) has
   -- the type chart/stats/RNG/event-queue machinery it needs -- see
@@ -158,6 +304,11 @@ return function(mod)
   -- the art is already full-colour and must NOT be remapped -- reaches the
   -- draw exactly as it does on the native screen.  The module is shared.
   local Sprites = require("src.pokemon.Sprites")
+  -- The merged species registry, for one thing only: displayName reads a
+  -- record's own `name` so a form names itself the way the dex does (see
+  -- displayName).  This is the same table Game.data is (src/core/Game.lua
+  -- assigns it), so a species record this file sees is the live one.
+  local Data = require("src.core.Data")
 
   ------------------------------------------------------------------
   -- Real N-way adjacency, the one contribution combat/
@@ -184,7 +335,8 @@ return function(mod)
   -- answer.
   local lastScreen = nil
 
-  local function battlerArraysFor(screen, mon)
+  local FN = {}
+  FN.battlerArraysFor = function(screen, mon)
     for i, b in ipairs(screen.playerBattlers) do
       if b.mon == mon then return screen.playerBattlers, screen.enemyBattlers, i end
     end
@@ -251,7 +403,7 @@ return function(mod)
   -- Uppercased with every separator removed, the one spelling the curated
   -- sets are keyed on. "AIR SLASH", "Air-Slash" and "AIRSLASH" all collapse
   -- to the same key.
-  local function normaliseMoveId(id)
+  FN.normaliseMoveId = function(id)
     return (tostring(id or ""):upper():gsub("[^A-Z0-9]", ""))
   end
 
@@ -261,7 +413,7 @@ return function(mod)
   -- directly. Its generated table spells ids inconsistently (AERIALACE but
   -- DRILL_PECK), so the caller below tries both spellings.
   local nationalMoveFlags
-  local function moveFlagsFn()
+  FN.moveFlagsFn = function()
     if nationalMoveFlags then return nationalMoveFlags end
     local nat = mod.find and mod:find("national_dex")
     local fn = nat and nat.exports and nat.exports.moveFlags
@@ -273,9 +425,9 @@ return function(mod)
   -- a move use" and answers true (full roster), matching the hook's own
   -- nil rule. flagsFn is optional (the engine's/national_dex's moveFlags);
   -- the curated set alone already covers the user's list.
-  local function canReachNonAdjacent(moveId, flagsFn)
+  FN.canReachNonAdjacent = function(moveId, flagsFn)
     if moveId == nil then return true end
-    local key = normaliseMoveId(moveId)
+    local key = FN.normaliseMoveId(moveId)
     if NONADJACENT_MOVE_IDS[key] then return true end
     if flagsFn then
       for _, cand in ipairs({ moveId, key }) do
@@ -293,7 +445,7 @@ return function(mod)
     if not (screen and screen.battle == battle) then
       return nextFn(battle, caster, moveId)
     end
-    local ownArr, oppArr, casterIndex = battlerArraysFor(screen, caster)
+    local ownArr, oppArr, casterIndex = FN.battlerArraysFor(screen, caster)
     if not ownArr then return nextFn(battle, caster, moveId) end
     -- combat.isAlive looked up lazily (not hoisted): this hook is
     -- registered at install time, well before mod.exports.combat exists
@@ -324,7 +476,7 @@ return function(mod)
     -- The one switch for "report the whole roster": a boss fight, a horde
     -- fight, a non-move roster query (nil moveId), or a move whose own id
     -- can reach across a slot. Otherwise real positional adjacency applies.
-    local full = isBossFight or isHorde or canReachNonAdjacent(moveId, moveFlagsFn())
+    local full = isBossFight or isHorde or FN.canReachNonAdjacent(moveId, FN.moveFlagsFn())
     local allies, enemies = {}, {}
     for i, b in ipairs(ownArr) do
       if i ~= casterIndex and (not isAlive or isAlive(b)) then
@@ -367,6 +519,157 @@ return function(mod)
       if b.mon then b.mon.multiSide = nil end
     end
   end)
+
+  ------------------------------------------------------------------
+  -- SAVE SANITIZER -- a battle must never leave a cycle in the save
+  ------------------------------------------------------------------
+  -- The engine's save writer (src/core/SaveSerializer.lua) is a plain
+  -- recursive table walk with NO cycle detection and NO depth cap on the
+  -- write side (its 128-depth cap is in the READER). A save file is meant
+  -- to be a tree, and the writer has always been safe on one.
+  --
+  -- A party mon IS the save file (`battle.party` is `save.party` on Gen 2),
+  -- so ANY field a battle writes onto a mon is serialized verbatim on the
+  -- next save. Two of g9-battle-engine's battle-scoped fields hold an
+  -- OBJECT rather than a scalar:
+  --
+  --   * `mon.__g9AbilityBaselineBattle` -- the live battle, stored so the
+  --     snapshot can be scoped to one battle (abilities/ability_dispatch.lua,
+  --     round 186). That battle's `party` is `save.party`, so
+  --     save.party[i] -> battle -> battle.party -> save.party[i] is a cycle.
+  --   * `mon.__g9TransformPre` -- the pre-transform snapshot, whose
+  --     `.battler` is the live engine battler and whose `.mon` is this same
+  --     mon (combat/modern_transform.lua).
+  --
+  -- Both are supposed to be cleared when the battle ends (the engine's own
+  -- whole-roster `battle.ended` sweeps), and normally are. But the sweep can
+  -- be missed -- a battle that ends through a path that never reaches it, a
+  -- snapshot taken and then a battle boundary the mon is not visited by --
+  -- and when it is, the NEXT save of that playthrough dies with
+  -- `src/core/SaveSerializer.lua:13: stack overflow` the moment the write
+  -- recurses forever. The player loses the save, not just the fight.
+  --
+  -- This is the backstop, wired to the engine's own `save.writing` event
+  -- (emitted by Game/Game2/Game3 immediately after the world snapshot is
+  -- folded in and immediately before the serializer runs, on every write
+  -- the player can trigger). It does two things:
+  --
+  --   1. Runs g9-battle-engine's own documented reverts for the two
+  --      object-holding fields (restoreNaturalAbility / revertTransform),
+  --      so a stale snapshot is put back correctly rather than just
+  --      dropped. Falls through to clearing the raw ability-snapshot triple
+  --      if the engine's export is absent.
+  --   2. Drops any mon field that is unserializable by construction -- a
+  --      table that reaches the mon again (a true cycle), or a
+  --      function/userdata/thread (which the writer errors on). A field
+  --      that is merely a shared reference (a DAG edge) is left alone, so
+  --      legitimate fields -- a persistent `mon.form`, `mon.item`, the
+  --      modern `ivs`/`evs`/`stats` blocks -- are never touched.
+  --
+  -- A save cannot be taken mid-battle (the battle owns input), so a mon
+  -- still carrying battle-scoped state at this point has already left the
+  -- fight; putting it back is the correct post-battle shape. Everything is
+  -- pcall'd: a sanitizer bug can never stop a save.
+  -- Wrapped in one installer function so this whole block costs the file's
+  -- local budget a single name (the chunk is already near Lua 5.1's 200-local
+  -- ceiling).
+  FN.installSaveSanitizer = function()
+    local UNSERIALIZABLE = { ["function"] = true, userdata = true, thread = true }
+
+    -- Does `node` reach `target` through `depth` levels of table fields?
+    -- Depth-limited on purpose: the two real cycles are 2-3 hops
+    -- (battle -> party -> mon, snapshot -> battler -> mon), and a bound keeps
+    -- this from ever walking an arbitrary live object graph.
+    local function reachesTable(node, target, depth)
+      if node == target then return true end
+      if depth <= 0 then return false end
+      for _, value in pairs(node) do
+        if type(value) == "table" then
+          if value == target then return true end
+          if reachesTable(value, target, depth - 1) then return true end
+        end
+      end
+      return false
+    end
+
+    -- The engine's own revert surfaces, found lazily (the engine may load
+    -- before or after this mod).
+    local function revertBattleScopedMon(mon)
+      if type(mon) ~= "table" then return false end
+      local changed = false
+      local engine = mod.find and mod:find("g9-battle-engine")
+      local api = engine and engine.exports
+      if api then
+        if type(api.restoreNaturalAbility) == "function" then
+          pcall(api.restoreNaturalAbility, mon)
+        end
+        if type(api.revertTransform) == "function" then
+          pcall(api.revertTransform, nil, mon)
+        end
+      end
+      -- Belt and braces: if the engine's revert did not clear the battle
+      -- pointer (no export, or it errored), drop the snapshot whole rather
+      -- than leave the mon pointing at the battle.
+      if type(mon.__g9AbilityBaselineBattle) == "table" then
+        mon.__g9AbilityBaseline = nil
+        mon.__g9AbilityBaselineSet = nil
+        mon.__g9AbilityBaselineBattle = nil
+        changed = true
+      end
+      -- The generic pass: any field that cycles back to this mon, or holds a
+      -- value the writer cannot encode, goes. Scoped to the mon's own fields
+      -- so a shared reference (a DAG edge) is never mistaken for a cycle.
+      for key, value in pairs(mon) do
+        local vt = type(value)
+        if UNSERIALIZABLE[vt] or (vt == "table" and reachesTable(value, mon, 4)) then
+          mon[key] = nil
+          changed = true
+        end
+      end
+      return changed
+    end
+
+    local function sanitizeSave(save)
+      if type(save) ~= "table" then return 0 end
+      local fixed = 0
+      for _, mon in ipairs(save.party or {}) do
+        if revertBattleScopedMon(mon) then fixed = fixed + 1 end
+      end
+      for _, box in pairs(save.boxes or {}) do
+        if type(box) == "table" then
+          for _, mon in ipairs(box) do
+            if revertBattleScopedMon(mon) then fixed = fixed + 1 end
+          end
+        end
+      end
+      local daycare = save.daycare
+      if type(daycare) == "table" then
+        if revertBattleScopedMon(daycare.mon) then fixed = fixed + 1 end
+        -- Gen 2's daycare is { man = { mon = ... }, lady = { mon = ... } };
+        -- Gen 1's is a flat { mon = ... }. Cover both shapes.
+        for _, side in pairs(daycare) do
+          if type(side) == "table" and side.mon ~= nil then
+            if revertBattleScopedMon(side.mon) then fixed = fixed + 1 end
+          end
+        end
+      end
+      return fixed
+    end
+
+    mod.events:on("save.writing", function(ev)
+      local save = ev and ev.save
+      if type(save) ~= "table" then return end
+      local ok, fixed = pcall(sanitizeSave, save)
+      if not ok then
+        mod.log:warn("g9_Battle_Scene: save sanitizer failed: %s", tostring(fixed))
+      elseif fixed and fixed > 0 then
+        mod.log:info("g9_Battle_Scene: cleared battle-scoped state from %d "
+          .. "party mon(s) before saving", fixed)
+      end
+    end)
+  end
+
+  FN.installSaveSanitizer()
 
   local Screen = {}
   Screen.__index = Screen
@@ -441,7 +744,7 @@ return function(mod)
   -- `time` (seconds) into a `duration`-long slide -> the cumulative 8px
   -- tile offset at that instant, matching native's per-frame step
   -- (px += floor(frameCount/2)*8). nil time (no slide) is 0.
-  local function slideStepPx(time, duration, steps)
+  FN.slideStepPx = function(time, duration, steps)
     if not time then return 0 end
     local p = math.min(1, time / duration)
     return math.floor(p * steps) * 8
@@ -643,7 +946,7 @@ return function(mod)
   -- is a worse bug than a cheap, once-per-battle re-parse). Missing/
   -- broken file degrades to the original list layout with no custom
   -- button, never a crash.
-  local function loadSettingsFile()
+  FN.loadSettingsFile = function()
     local defaults = { menuLayout = "list", customButtonLabel = "", moveAnimations = false }
     local body = mod:read("settings.lua")
     if not body then return defaults end
@@ -934,7 +1237,7 @@ return function(mod)
   -- `fallback` (that side's ground line) covers a side with nothing drawn
   -- yet -- its trainer pic still stands in the slot, or its mons have not
   -- landed -- and the HUD is hidden until those mons are revealed anyway.
-  local function sideHeadY(battlers, headLines, fallback)
+  FN.sideHeadY = function(battlers, headLines, fallback)
     local n, sum = 0, 0
     for _, b in ipairs(battlers) do
       local hy = headLines[b]
@@ -982,7 +1285,7 @@ return function(mod)
   -- steps away from its own anchor (e6 for the enemy, a1 for the ally) by one
   -- COL_W per column, so an under-strength side keeps its anchor column and
   -- leaves the columns behind it empty -- see sideColumns.
-  local function colCentre(side, col)
+  FN.colCentre = function(side, col)
     if side == "enemy" then return ENEMY_RIGHT_X - (6 - col) * COL_W end
     return ALLY_LEFT_X + (col - 1) * COL_W
   end
@@ -992,7 +1295,7 @@ return function(mod)
   -- (cols 6,5,4,3,2), so a side under its maximum keeps its innermost
   -- column and leaves its outer ones empty. Two exceptions: a boss enemy
   -- always takes column 5 (e5), and a horde's lone ally takes column 2 (a2).
-  local function sideColumns(count, side, boss, horde)
+  FN.sideColumns = function(count, side, boss, horde)
     count = math.max(1, count)
     if side == "enemy" then
       -- A boss enemy always stands at e5 (column 5).
@@ -1333,7 +1636,7 @@ return function(mod)
   -- back exactly on its own slot; order is preserved, so entry i is always
   -- battler i's box. (At most eight entries; the widest shipped row -- a
   -- five-mon horde -- is 4*58.4 + 56.4 = 290px, inside a 320px canvas.)
-  local function spreadBoxCentres(centres)
+  FN.spreadBoxCentres = function(centres)
     local n = #centres
     local out = {}
     if n == 0 then return out end
@@ -1372,7 +1675,7 @@ return function(mod)
   -- The tile-space tx that puts a BOX_SCALE-sized readout (GUI_BOX_W wide,
   -- drawn from its LEFT edge) centred on canvas x `cx`, clamped so the box
   -- can never hang off either side of the canvas.
-  local function guiTxOn(cx)
+  FN.guiTxOn = function(cx)
     local tx = (cx - GUI_BOX_HALF_W) / 8
     return math.max(0, math.min((VW - GUI_BOX_W) / 8, tx))
   end
@@ -1393,13 +1696,13 @@ return function(mod)
   -- from -- each side anchors its own columns (see colCentre). The other
   -- bounds are shared: the clamp to the physical field edges (SPRITE_FIELD_L/
   -- R) bounds the free half-field a lone mon's slot may take.
-  local function slotRect(cols, col, feetT, rowH, side)
-    local center = colCentre(side, col)
+  FN.slotRect = function(cols, col, feetT, rowH, side)
+    local center = FN.colCentre(side, col)
     local left, right = SPRITE_FIELD_L, SPRITE_FIELD_R
     for i, cc in ipairs(cols) do
       if cc == col then
-        if cols[i - 1] then left = (center + colCentre(side, cols[i - 1])) / 2 end
-        if cols[i + 1] then right = (center + colCentre(side, cols[i + 1])) / 2 end
+        if cols[i - 1] then left = (center + FN.colCentre(side, cols[i - 1])) / 2 end
+        if cols[i + 1] then right = (center + FN.colCentre(side, cols[i + 1])) / 2 end
         break
       end
     end
@@ -1423,8 +1726,8 @@ return function(mod)
   -- so the boss stands in e5. It is BOSS_MUL enemy bands tall with its TOP
   -- on the field's own top edge (y=0), so it towers over the upper half
   -- instead of standing on the allies' line, and it is never clipped.
-  local function bossSlot()
-    local center = colCentre("enemy", 5)
+  FN.bossSlot = function()
+    local center = FN.colCentre("enemy", 5)
     local h = math.max(8, math.floor(BOSS_MUL * ROW_H * 8) - 1)
     local w = math.max(8, 2 * math.floor(math.min(center - SPRITE_FIELD_L,
       SPRITE_FIELD_R - center)) - 1)
@@ -1452,24 +1755,49 @@ return function(mod)
   -- pixels no longer always land on whole screen pixels off the exact
   -- multiples (960x540 / 1920x1080 / 4K / 8K); on those it is still a
   -- clean whole number.
-  local function fitScale(winW, winH)
+  FN.fitScale = function(winW, winH)
     local raw = math.min((winW or 0) / CANVAS_W, (winH or 0) / CANVAS_H)
     return raw > 0 and raw or 1
   end
 
   -- Top-left of the centred canvas, in window px.
-  local function fitOrigin(winW, winH, scale)
+  FN.fitOrigin = function(winW, winH, scale)
     return math.floor((winW - CANVAS_W * scale) / 2),
       math.floor((winH - CANVAS_H * scale) / 2)
   end
 
-  local function displayName(mon)
+  FN.displayName = function(mon)
     -- __g9DisplayName is recorded by combat/modern_transform.lua when a
     -- Transform / Imposter / Illusion tells the ENGINE to present this battler
     -- as another species (round 181). This screen reads the HUD name straight
     -- off the mon, so without this the engine's rename landed on the battler
     -- only and the name replacement was invisible here.
-    return mon.__g9DisplayName or mon.nickname or mon.name or mon.species or "???"
+    if type(mon) ~= "table" then return "???" end
+    if type(mon.__g9DisplayName) == "string" and mon.__g9DisplayName ~= "" then
+      return mon.__g9DisplayName
+    end
+    if type(mon.nickname) == "string" and mon.nickname ~= "" then
+      return mon.nickname
+    end
+    -- The Pokemon's own DISPLAY NAME, from its species record.  A non-nicknamed
+    -- mon used to fall straight through to the raw species id, which for an
+    -- alternate form is a slug ("PONYTA_GALAR" here, "ponyta-galar" on the dex
+    -- page).  The record's `name` is the player-facing name, and the record
+    -- lookup follows the SAME forms the sprite path does: a Transform's shown
+    -- species, then the form the mon is wearing (mon.form, or the key
+    -- battle_forms published), then the mon's own species.
+    local shown = mon.__g9DisplaySpecies or mon.__g9FormSpecies
+    if not shown and type(mon.form) == "string" and mon.form ~= ""
+        and type(mon.species) == "string" then
+      shown = mon.species .. "_" .. mon.form
+    end
+    shown = shown or mon.species
+    local def = type(shown) == "string" and Data.pokemon
+      and Data.pokemon[shown] or nil
+    if type(def) == "table" and type(def.name) == "string" and def.name ~= "" then
+      return def.name
+    end
+    return mon.name or mon.species or "???"
   end
 
   -- The mon's maximum hit points, whichever field this generation keeps it in.
@@ -1485,7 +1813,7 @@ return function(mod)
   -- lowering when a Pokemon takes damage".  Same `or` fallback the engine
   -- itself uses (e.g. src/battle/gen2/Battle.lua:1397), so Gen 2 is
   -- byte-for-byte unchanged and Gen 1 draws the bar it always should have.
-  local function maxHpOf(mon)
+  FN.maxHpOf = function(mon)
     return (mon and mon.maxHp) or (mon and mon.stats and mon.stats.hp) or 0
   end
 
@@ -1498,7 +1826,7 @@ return function(mod)
   -- them as one unwrapped line is exactly what let text run past the
   -- box border. F has 6 lines of real vertical room (its interior is 6
   -- tiles tall), far more than any single message here needs.
-  local function drawWrapped(text, x, y, maxChars, lineHeight)
+  FN.drawWrapped = function(text, x, y, maxChars, lineHeight)
     lineHeight = lineHeight or 9
     -- ROUND 107: the F box must never draw a control token or the word
     -- "prompt". Battle text coming out of the engine/ROM keeps trailing
@@ -1539,7 +1867,7 @@ return function(mod)
   -- vanilla's naming assumptions (GOTHITELLE, SIZZLIPEDE...), so without
   -- this a long name combined with "Lv##" + gender is exactly what ran
   -- text past the GUI box's own border before this pass.
-  local function fitName(name, maxWidth, suffixWidth)
+  FN.fitName = function(name, maxWidth, suffixWidth)
     local avail = maxWidth - suffixWidth
     while #name > 0 and Font.width(name) > avail do
       name = name:sub(1, #name - 1)
@@ -1552,7 +1880,7 @@ return function(mod)
   -- for exactly the same reason: a missing/bad file must degrade to "no
   -- sprite drawn," never crash the frame it's asked for in.
   local spriteCache = {}
-  local function loadSprite(path)
+  FN.loadSprite = function(path)
     if not path then return nil end
     local cached = spriteCache[path]
     if cached ~= nil then return cached or nil end
@@ -1566,6 +1894,74 @@ return function(mod)
     return nil
   end
 
+  -- The form-art and evolution-costume helpers live in ONE namespace.  Not
+  -- stylistic: PUC Lua caps a function at 200 active locals and this file's
+  -- outer function sits right at that ceiling, so a helper that can be a table
+  -- field buys room for the next one.  (LOVE runs LuaJIT and does not care, but
+  -- luac -- and the fengari harnesses this file is verified with -- DO, and
+  -- tripping the cap fails the WHOLE scene rather than one helper.)
+  local Ev = {}
+
+  -- THE FORM'S OWN SPECIES KEY.  A form change does NOT move mon.species --
+  -- battle_forms' own header is explicit about it ("mon.species is never
+  -- touched"): the primitives write `mon.form`, the form RECORD's own suffix
+  -- ("MEGA_X", "GMAX", ...), and expect sprite art to be resolved from it.
+  -- national_dex registers every mechanically/sprite-distinct form as its own
+  -- species id (DRAGONITE_MEGA, CHARIZARD_MEGA_X, MEOWSTIC_FEMALE, ...), which
+  -- is the key both art paths below actually read: this file's vanilla path
+  -- (data.pokemon[shown].spriteFront/spriteBack) and a sprite pack's own
+  -- species lookup, which this file feeds by temporarily swapping mon.species
+  -- around the seam.  So a formed mon has to be drawn AS that species, or the
+  -- sprite simply never changes: a mega lands with its stats, its types and its
+  -- announce line, and the picture stays the base form's for the rest of the
+  -- fight.  (That is the bug this helper exists to fix -- user-reported,
+  -- round two-hundred-and-fifty-eight.)
+  --
+  -- The key battle_forms itself published wins: its form_applied payload
+  -- carries `formId`, the National Dex record key the form came from, and it is
+  -- kept on the mon (see the listener below) because not every form's key is
+  -- derivable -- fusion and persistent forms answer through battle_forms' own
+  -- resolver, and only the record key names the record.  Otherwise the key is
+  -- the base species id plus the form suffix, and it is only used when that
+  -- record really exists; a build with no form records answers nil and the base
+  -- art is kept, which is exactly the old behaviour.
+  function Ev.formSpecies(mon, data)
+    if not (mon and type(mon.species) == "string") then return nil end
+    local known = mon.__g9FormSpecies
+    if type(known) == "string" and known ~= "" then return known end
+    local suffix = mon.form
+    if type(suffix) ~= "string" or suffix == "" then return nil end
+    local key = mon.species .. "_" .. suffix
+    if data and data.pokemon and data.pokemon[key] then return key end
+    return nil
+  end
+
+  -- battle_forms' two published form events (src/formapi.lua): form_applied
+  -- says what the Pokemon now is (the record key above), form_reverted says it
+  -- gave the form back.  Recorded on the mon so Ev.formSpecies can answer later
+  -- without re-deriving anything, and cleared on the revert so a reverted mon
+  -- is drawn as its own species again.  The names come from the mod's own
+  -- exports when it is loaded and fall back to its documented constants --
+  -- INSTALL ORDER is not knowable here, so the literal is what keeps this
+  -- working in a build where g9-Battle-Scene loads first.
+  do
+    local bf = mod.find and mod:find("battle_forms")
+    local names = (bf and bf.exports and bf.exports.events) or {}
+    local applied = (type(names.applied) == "string" and names.applied)
+      or "mod.battle_forms.form_applied"
+    local reverted = (type(names.reverted) == "string" and names.reverted)
+      or "mod.battle_forms.form_reverted"
+    mod.events:on(applied, function(ev)
+      local mon, key = ev and ev.mon, ev and ev.formId
+      if type(mon) ~= "table" then return end
+      if type(key) == "string" and key ~= "" then mon.__g9FormSpecies = key end
+    end)
+    mod.events:on(reverted, function(ev)
+      local mon = ev and ev.mon
+      if type(mon) == "table" then mon.__g9FormSpecies = nil end
+    end)
+  end
+
   -- Resolve one battler's sprite exactly the way drawSprite draws it, WITHOUT
   -- drawing it: the art seam (pokemon.sprite) picks the file, it is loaded, and
   -- the frame seam (battle.mon_pic) swaps in the sprite pack's current frame.
@@ -1576,7 +1972,7 @@ return function(mod)
   -- naturalBake); img is nil both when the battler has no art at all and when
   -- the frame seam has asked us to draw NOTHING this frame yet -- a managed
   -- species whose sheet is still baking (see the battle.mon_pic block below).
-  local function resolveSprite(r, boss, battler, spriteField, data, scaleMul)
+  FN.resolveSprite = function(r, boss, battler, spriteField, data, scaleMul)
     local mon = battler and battler.mon
     if not mon then return nil end
     -- DISPLAY SPECIES (round 181). A Transform / Imposter / Illusion asks the
@@ -1588,11 +1984,31 @@ return function(mod)
     -- both the Transform art and the Illusion disguise stayed invisible here.
     -- Prefer the recorded species; mon.__g9DisplaySpecies (same value, written
     -- by the engine for calls with no battler -- e.g. prewarmSlot's) is the
-    -- fallback, then the real species.
+    -- fallback, then the form the mon is WEARING (see Ev.formSpecies: a mega keeps
+    -- its base species id and puts the form in mon.form, so without this the
+    -- sprite would never follow a transformation), then the real species.
+    -- A screen staging a form-change sequence (mega, or any battle_forms form)
+    -- holds `__g9FormHold` on the battler until its clip's reveal beat, so the
+    -- OLD art keeps being drawn while the sequence plays and the new form lands
+    -- exactly on the reveal -- the same contract `__g9TeraHold` keeps for the
+    -- crystal film and `__g9DynHold` for the size ladder.
+    local formHeld = type(battler) == "table" and battler.__g9FormHold == true
     local shown = (battler and battler.__g9DisplaySpecies)
-      or mon.__g9DisplaySpecies or mon.species
+      or mon.__g9DisplaySpecies
+      or (not formHeld and Ev.formSpecies(mon, data))
+      or mon.species
     local def = data and data.pokemon and data.pokemon[shown]
     local path = def and def[spriteField]
+    -- A form the data cannot draw must never take the sprite down with it: when
+    -- the form's own record carries no pic for this side, the BASE species' pic
+    -- stands in.  The seams below still receive the form's key (ctx.species /
+    -- the mon's swapped species), so a sprite pack's own sheet for the form is
+    -- what replaces the art; a build with no such sheet simply keeps the base
+    -- art, which is exactly what it drew before forms were considered at all.
+    if not path and shown ~= mon.species then
+      local base = data and data.pokemon and data.pokemon[mon.species]
+      path = base and base[spriteField]
+    end
     -- A sprite pack keys its sheet off mon.species (g9-battle-sprites'
     -- monStem -> resolveStem(mon.species)), so the two seams below are raised
     -- with mon.species temporarily set to the species being drawn and restored
@@ -1630,7 +2046,7 @@ return function(mod)
       end)
       if type(hooked) == "string" and hooked ~= "" then path = hooked end
     end
-    local img = path and loadSprite(path)
+    local img = path and FN.loadSprite(path)
     if not img then return nil end
     -- Set true only when the sprite pack hands back its own CANVAS-scale
     -- natural bake (see the battle.mon_pic block below); a vanilla pic stays
@@ -1648,12 +2064,24 @@ return function(mod)
     -- resize separately; the boss rides the FRONT scale.
     local sideBack = (spriteField == "spriteBack")
     local fieldScale = scaleMul or (sideBack and SPRITE_SCALE_BACK or SPRITE_SCALE_FRONT)
+    -- LIVE TERA: the type stamped on the battler when its tera activated, else
+    -- the engine's own record while the mon is live.  Forwarded to the sprite
+    -- mod (ctx.liveTeraType) so its crystal film never depends on
+    -- battle_forms' describe() payload -- and a cheap read: a battler field,
+    -- then the engine's type only when `mon.teraActive`.
+    local liveTeraType = nil
+    if type(battler) == "table" then liveTeraType = battler.liveTeraType end
+    if not liveTeraType and type(mon) == "table" and mon.teraActive
+        and Ev.tera and Ev.tera.engineTypeOf then
+      liveTeraType = Ev.tera.engineTypeOf(mon)
+    end
     if Runtime.wantsHook("battle.mon_pic") then
       local pctx = {
         species = shown,
         side = (spriteField == "spriteBack") and "back" or "front",
         mon = mon,
         battler = battler,
+        liveTeraType = liveTeraType,
         -- Only `.data` is read off this (an animator uses it to find the
         -- species' battle-scale fields), and drawSprite is handed that
         -- data already -- so this carries the real table rather than
@@ -1762,15 +2190,28 @@ return function(mod)
   -- same on-screen box, reversed; the returned bottom-center anchor is
   -- unchanged either way, so the HUD, the ball's landing spot and every
   -- move animation still agree with where the art lands.
-  local function drawSprite(r, boss, battler, spriteField, data, anchorRight, offX, offY, appear, scaleMul, alpha, flipX, whiten)
-    local img, naturalBake = resolveSprite(r, boss, battler, spriteField, data, scaleMul)
+  FN.drawSprite = function(r, boss, battler, spriteField, data, anchorRight, offX, offY, appear, scaleMul, alpha, flipX, whiten, darken)
+    local img, naturalBake = FN.resolveSprite(r, boss, battler, spriteField, data, scaleMul)
     if not img then return nil end
     local iw, ih = img:getDimensions()
     -- 1:1 blit in CANVAS pixels for a natural bake (see pctx above), plain
     -- DESIGN-px size for the vanilla pic. Nothing is resampled to fit the
     -- slot, so every species comes out at its own size -- which is the
     -- whole point.
-    local scale = (appear or 1) / (naturalBake and DS or 1)
+    --
+    -- DYNAMAX GROW rides the same multiplier: g9-battle-sprites stamps the
+    -- current size factor for a growing mon on its own battler
+    -- (`battler.__g9DynamaxGrow`, 1 -> 1.5 in phases over ~2s, and back to 1
+    -- when the growth ends), and folding it in here means the mon grows about
+    -- its own feet, in place, at the same time as the materialize animation --
+    -- exactly as if the art had been baked that much larger. 1 for every
+    -- battler that is not growing, so nothing else's draw changes at all.
+    local grow = 1
+    if type(battler) == "table" then
+      local g = tonumber(battler.__g9DynamaxGrow)
+      if g and g > 1.001 then grow = g end
+    end
+    local scale = (appear or 1) * grow / (naturalBake and DS or 1)
     local dw, dh = iw * scale, ih * scale
     local dx = r.x + (r.w - dw) / 2
     local dy = r.y + r.h - dh
@@ -1799,8 +2240,16 @@ return function(mod)
       end
     end
     local wf = whiten or 0
+    -- DYNAMAX: a colour multiplier BELOW 1 drives the art toward a solid black
+    -- silhouette (the transformation's dark-shape beat).  A multiplier of 0 is
+    -- a perfectly black creature, which is exactly what the Furnace behind it
+    -- needs to light.  Values combine with whiten if both are ever set, though
+    -- in practice only one sequence runs at a time.
+    local dk = darken or 0
+    if dk > 0.999 then dk = 1 elseif dk < 0 then dk = 0 end
+    local tone = 1 - dk
     if wf > 0.001 then
-      local mul = 1 + wf * 6
+      local mul = (1 + wf * 6) * tone
       blit(mul, mul, mul, alpha or 1)
       local passes = math.max(1, math.floor(wf * 6 + 0.5))
       local burn = math.min(0.85, 0.28 + wf * 0.60)
@@ -1809,7 +2258,7 @@ return function(mod)
       for _ = 1, passes do blit(1, 1, 1, burn) end
       love.graphics.pop()
     else
-      blit(1, 1, 1, alpha or 1)
+      blit(tone, tone, tone, alpha or 1)
     end
     -- The bottom-center anchor; this sprite's own drawn box (top y and
     -- height, design px); and that height at appear = 1 (see the header
@@ -1843,9 +2292,9 @@ return function(mod)
   -- -- so the guard below is native's own:
   --   colors and not (trueColor and GbcPalette.mode == "gbc")
   -- Returns the bottom-center position, or nil if nothing drew.
-  local function drawRawImage(pathOrImg, r, offX, anchorRight, colors, trueColor)
+  FN.drawRawImage = function(pathOrImg, r, offX, anchorRight, colors, trueColor)
     local img = pathOrImg
-    if type(img) == "string" then img = loadSprite(img) end
+    if type(img) == "string" then img = FN.loadSprite(img) end
     if not img then return nil end
     local iw, ih = img:getDimensions()
     local scale = (TRAINER_PIC_T * 8) / math.max(iw, ih)
@@ -1872,7 +2321,7 @@ return function(mod)
   -- drawNativeBall below draws the game's own ball art -- kept for the
   -- case where the cached battle_anims data or that sprite sheet is
   -- missing, so a send-out still reads as a ball rather than nothing.
-  local function drawPokeball(cx, cy, r, spin)
+  FN.drawPokeball = function(cx, cy, r, spin)
     love.graphics.push()
     love.graphics.translate(cx, cy)
     love.graphics.rotate((spin or 0) * 2 * math.pi * 1.5)
@@ -1932,7 +2381,7 @@ return function(mod)
   -- origin of (8,16) centres the ball on the draw origin the caller sets.
   local BALL_LOCAL_X, BALL_LOCAL_Y = 8, 16
 
-  local function s8(value)
+  FN.s8 = function(value)
     value = (value or 0) % 256
     return value < 0x80 and value or value - 256
   end
@@ -1940,7 +2389,7 @@ return function(mod)
   -- A frameset's drawable rows with their per-frame duration (60fps frames)
   -- and flip flags, dropping the restart/end/delete pseudo-rows -- the same
   -- walk AnimObjects.lua's Pool:getFrame does.
-  local function ballFramesetPlan(anims, framesetName)
+  FN.ballFramesetPlan = function(anims, framesetName)
     local frames = anims.framesets and anims.framesets[framesetName]
     if not frames then return nil end
     local list, total = {}, 0
@@ -1959,7 +2408,7 @@ return function(mod)
     return { list = list, total = total }
   end
 
-  local function ballFrameAt(plan, elapsed)
+  FN.ballFrameAt = function(plan, elapsed)
     local at = (math.floor(elapsed * 60) % plan.total) + 1
     for _, frame in ipairs(plan.list) do
       if at <= frame.duration then return frame end
@@ -1991,7 +2440,7 @@ return function(mod)
   -- translate of the block following the caller's own arc.  Returns false
   -- when the data or its sheet is unavailable, so the caller keeps
   -- drawPokeball's primitive and a send-out still reads as a ball.
-  local function drawGen1NativeBall(screen, cx, cy)
+  FN.drawGen1NativeBall = function(screen, cx, cy)
     if not AnimPlayer then return false end
     local anims = N.gen1AnimData(screen.data)
     local toss = anims and anims.moveAnims and anims.moveAnims["TOSS_ANIM"]
@@ -2041,20 +2490,20 @@ return function(mod)
   -- it falls back to the in-flight frameset if that data is absent.
   -- Returns false when the cache/sheet is unavailable, so the caller can
   -- draw the primitive fallback instead.
-  local function drawNativeBall(screen, cx, cy, elapsed, open)
+  FN.drawNativeBall = function(screen, cx, cy, elapsed, open)
     -- Gen 2's object/frameset contract only.  A Gen 1 boot draws its OWN
     -- native ball instead (drawGen1NativeBall above) -- never Gen 2's
     -- asset (user rule) -- and only falls through to drawPokeball's
     -- primitive when even the Gen 1 data is missing.
-    if not N.isGen2 then return drawGen1NativeBall(screen, cx, cy) end
+    if not N.isGen2 then return FN.drawGen1NativeBall(screen, cx, cy) end
     if not BattleAnimView then return false end
     local anims = N.animData(screen.data)
     local object = anims and anims.objects and
       anims.objects["BATTLE_ANIM_OBJ_POKE_BALL"]
     if not object then return false end
     local function oamsetAt(framesetName)
-      local plan = ballFramesetPlan(anims, framesetName)
-      local frame = plan and ballFrameAt(plan, elapsed)
+      local plan = FN.ballFramesetPlan(anims, framesetName)
+      local frame = plan and FN.ballFrameAt(plan, elapsed)
       return frame and frame.oamset and anims.oamsets and
         anims.oamsets[frame.oamset], frame
     end
@@ -2074,7 +2523,7 @@ return function(mod)
     local yFlip = bit.band(frameFlip, BALL_OAM_YFLIP) ~= 0
     local entries = {}
     for _, sprite in ipairs(oamset.sprites or {}) do
-      local ex, ey = s8(sprite.x), s8(sprite.y)
+      local ex, ey = FN.s8(sprite.x), FN.s8(sprite.y)
       if xFlip then ex = -(ex + 8) end
       if yFlip then ey = -(ey + 8) end
       entries[#entries + 1] = {
@@ -2107,7 +2556,7 @@ return function(mod)
   -- A revealed slot draws through this so the mon grows out of the
   -- ground exactly where the ball landed, over BALL_APPEAR seconds after
   -- the poof.
-  local function ballAppearFor(screen, side, slot)
+  FN.ballAppearFor = function(screen, side, slot)
     local bt = screen.ballThrow
     if not bt or bt.side ~= side or bt.slot ~= slot then return nil end
     if bt.t < BALL_FLIGHT + BALL_POOF then return 0 end
@@ -2120,7 +2569,7 @@ return function(mod)
   -- this mod's own longer species names (GOTHITELLE, SIZZLIPEDE...)
   -- alongside "LvNN" + gender without truncating them, now that the box
   -- itself is shorter and can't just grow to make room.
-  local function drawScaledText(text, x, y, scale)
+  FN.drawScaledText = function(text, x, y, scale)
     love.graphics.push()
     love.graphics.translate(x, y)
     love.graphics.scale(scale, scale)
@@ -2132,7 +2581,7 @@ return function(mod)
   -- cursor arrow) -- Font.drawCode has no scale parameter of its own
   -- and always draws at native (~8px) size, which swallowed adjacent
   -- 0.5-scale cross-mode text almost entirely (screenshot-reported).
-  local function drawScaledCode(code, x, y, scale)
+  FN.drawScaledCode = function(code, x, y, scale)
     love.graphics.push()
     love.graphics.translate(x, y)
     love.graphics.scale(scale, scale)
@@ -2181,7 +2630,7 @@ return function(mod)
   -- 6.5 tiles to stop the side border breaking with a gap; at pixel level
   -- 6.5 tiles is simply 52px and nothing needs rounding.  Takes TILE coords
   -- (like Font.drawBox, and like Screen:pos's own return), converts once.
-  local function drawNativeFrame(tx, ty, tw, th)
+  FN.drawNativeFrame = function(tx, ty, tw, th)
     local r, g, b, a = love.graphics.getColor()
     local x0, y0 = tx * 8, ty * 8
     local w, h = tw * 8, th * 8
@@ -2229,7 +2678,7 @@ return function(mod)
   -- cart shows where the window edge meets the border.
   --
   -- Takes TILE coords, like drawNativeFrame above.
-  local function drawNativeDivider(tx, ty, th)
+  FN.drawNativeDivider = function(tx, ty, th)
     local r, g, b, a = love.graphics.getColor()
     local x0, y0 = tx * 8, ty * 8
     local h = th * 8
@@ -2256,7 +2705,7 @@ return function(mod)
   -- restored immediately. pcall-guarded and only when keyedWith is actually
   -- present, so an engine build without the keyed shader keeps the old
   -- opaque behaviour rather than erroring mid-battle.
-  local function drawHudKeyed(fn)
+  FN.drawHudKeyed = function(fn)
     local G = GbcPalette
     if not (G and G.keyedWith) or G.with == G.keyedWith then return fn() end
     local plain = G.with
@@ -2272,7 +2721,7 @@ return function(mod)
   -- HpBar.pixels/.palette/.colors for the real green/yellow/red state
   -- and RGB (ratio-based thresholds, so they're correct at any width),
   -- but draws just the coloured rectangle itself.
-  local function drawHpFill(palettes, hp, maxHp, x, y, width, height)
+  FN.drawHpFill = function(palettes, hp, maxHp, x, y, width, height)
     local canonicalPixels = HpBar.pixels(hp, maxHp)
     local _, fillColor = HpBar.colors(palettes, HpBar.palette(canonicalPixels))
     local hpVal, maxVal = math.max(0, hp or 0), math.max(0, maxHp or 0)
@@ -2288,6 +2737,165 @@ return function(mod)
     end
     love.graphics.rectangle("fill", x, y, fillW, height)
     love.graphics.setColor(0, 0, 0, 1)
+  end
+
+  -- -- ENEMY STAT WHITE + the enemy bar's muted colours (v4.2.0) -------------
+  --
+  -- The over-the-head readout is the one stat surface with nothing behind it:
+  -- the black rule square that used to frame it was removed so the mon shows
+  -- through it, and options.lua's ENEMY STAT WHITE now puts a ROUNDED,
+  -- translucent panel back behind the ENEMY side only.  ON (the default, and
+  -- the READABLE state) is white at 40% transparency -- 60% solid -- so the
+  -- name, the level and the bar stay readable over a busy field while the
+  -- sprite still reads through.  OFF matches that panel to the FANTASY COMBAT
+  -- party rows' own dark surface (fantasy_combat.lua's COL.panel), so an enemy
+  -- readout and an ally row read as the same material -- and because the cart's
+  -- font pages are BLACK glyphs that love.graphics.setColor cannot lighten,
+  -- that dark state draws its name / level / gender through FN.whiteInkShader
+  -- (see its own note), or the ink would stay black on black.
+  --
+  -- Both states also carry the enemy's HP bar over to the party list's muted
+  -- colour family (COL.good/warn/bad, anchored on #00A36D): the native bar is
+  -- drawn first -- the cart's own tiles, keyed so the mon shows through -- and
+  -- the FILL is then repainted in the muted colour.  That keeps BOTH
+  -- generations on the same green / yellow / red the ally rows use without
+  -- touching the native tile path at all (which is why a per-draw palette swap
+  -- could not do it: a Gen 1 boot draws the bar from the SGB GREENBAR /
+  -- YELLOWBAR / REDBAR data, not from the hud's own palette table).  The
+  -- player's readout and the ally party list are untouched.
+  FN.enemyStatWhite = function()
+    local options = mod and mod.options
+    if options and type(options.get) == "function" then
+      local ok, value = pcall(function() return options:get("enemy_stat_white") end)
+      if ok and value ~= nil then return value == "on" end
+    end
+    return true
+  end
+
+  -- The muted state colour for an HP fraction, off the party list's own
+  -- palette (so the two screens can never drift apart) with the values inlined
+  -- as a last resort, so an enemy bar is never left uncoloured if
+  -- fantasy_combat is unavailable.
+  FN.mutedHpColor = function(frac)
+    local col = Fantasy and Fantasy.col
+    frac = frac or 0
+    if frac > 0.5 then return (col and col.good) or { 0.000, 0.639, 0.427, 1 } end
+    if frac > 0.2 then return (col and col.warn) or { 0.639, 0.561, 0.000, 1 } end
+    return (col and col.bad) or { 0.639, 0.000, 0.000, 1 }
+  end
+
+  -- The panel's own fill and border: white at 60% solid when the option is on,
+  -- else the party rows' dark surface.  A rounded border always sits on top,
+  -- in the same steel blue fantasy_combat's own panels use.
+  FN.enemyPanelColors = function()
+    local col = Fantasy and Fantasy.col
+    local border = (col and col.border) or { 0.290, 0.380, 0.520, 0.75 }
+    -- 2026-09-25 (user): the white panel was 20% solid and read as barely
+    -- there over a busy field; the user asked for 60% solid (40% transparent),
+    -- so the name/level/bar sit on a solid-enough surface.  0.60 alpha is that
+    -- fill.  The dark variant is unchanged.
+    if FN.enemyStatWhite() then return { 1, 1, 1, 0.60 }, border end
+    return (col and col.panel) or { 0.070, 0.092, 0.133, 0.62 }, border
+  end
+
+  -- The DARK enemy panel's ink: WHITE, and it has to be drawn differently from
+  -- every other readout.
+  --
+  -- The cart's font pages are BLACK glyphs on transparent (Font.drawBox's own
+  -- header says so: "the tile pages are black glyphs on transparent, so they
+  -- come out black whatever the color is").  love.graphics.setColor therefore
+  -- CANNOT lighten them -- black tinted any colour is still black -- which is
+  -- exactly the reported bug: with ENEMY STAT WHITE off, the name/level/gender
+  -- stayed black on the dark panel and could not be read.  TTF text would
+  -- honour setColor, but the shipped readout uses the cart's tile font.
+  --
+  -- The fix is a one-line fragment shader that emits WHITE with the glyph's
+  -- own alpha, so the tile glyphs are recoloured rather than tinted.  Created
+  -- once, pcall-guarded, and used ONLY while the dark panel is up (the ON state
+  -- keeps plain black ink on the white panel, and the player's readout is
+  -- untouched).  A build without shader support falls back to the plain draw
+  -- exactly as before, so nothing can error mid-battle.
+  FN.WHITE_INK_SHADER = [[
+vec4 effect(vec4 color, Image tex, vec2 tc, vec2 sc) {
+  return vec4(1.0, 1.0, 1.0, Texel(tex, tc).a);
+}
+]]
+  local whiteInkShader, whiteInkTried = nil, false
+  FN.whiteInkShader = function()
+    if whiteInkTried then return whiteInkShader end
+    whiteInkTried = true
+    if not (love and love.graphics and love.graphics.newShader) then return nil end
+    local ok, shader = pcall(love.graphics.newShader, FN.WHITE_INK_SHADER)
+    whiteInkShader = ok and shader or nil
+    return whiteInkShader
+  end
+
+  -- A rounded rectangle, rounded corners only where LOVE supports them
+  -- (mirrors fantasy_combat.lua's own `rect`): the rounded call is tried and a
+  -- square one is the fallback, so an older build degrades instead of
+  -- erroring.
+  FN.roundedRect = function(mode, x, y, w, h, r)
+    w = w < 0 and 0 or w
+    h = h < 0 and 0 or h
+    if r and r > 0 then
+      local ok = pcall(love.graphics.rectangle, mode, x, y, w, h, r, r)
+      if ok then return end
+    end
+    love.graphics.rectangle(mode, x, y, w, h)
+  end
+
+  -- The enemy readout's panel, drawn inside drawGuiBox's own scaled space so
+  -- its tile units line up with the readout's assets: just inside the box's
+  -- own (tx,ty)..(tx+tw,ty+th) rectangle, leaving the same breathing room the
+  -- old frame had.
+  FN.drawEnemyStatPanel = function(tx, ty, tw, th)
+    local fill, border = FN.enemyPanelColors()
+    local x, y = (tx + 0.55) * 8, (ty + 0.5) * 8
+    local w, h = (tw - 1.1) * 8, (th - 1) * 8
+    if fill then
+      love.graphics.setColor(fill[1], fill[2], fill[3], fill[4] or 1)
+      FN.roundedRect("fill", x, y, w, h, 4)
+    end
+    if border then
+      love.graphics.setColor(border[1], border[2], border[3], border[4] or 1)
+      FN.roundedRect("line", x + 0.5, y + 0.5, w - 1, h - 1, 3)
+    end
+    love.graphics.setColor(0, 0, 0, 1)
+  end
+
+  -- Repaint the enemy HP bar's FILL in the party list's muted colour.  Only
+  -- the filled span is covered -- exactly where the cart's own channel sits,
+  -- three tiles on from the box's left edge at the bar's own row (the "HP:"
+  -- badge takes tx+1 and tx+2, then the six cells run from tx+3) and two
+  -- pixels down inside that tile row, matching HpBar.drawWithLabel's own
+  -- channel -- so the EMPTY part keeps its keyed native tiles and the mon
+  -- still shows through it.
+  FN.drawMutedHpFill = function(shownHp, maxHp, tx, ty)
+    local pixels = HpBar.pixels(shownHp, maxHp)
+    if pixels <= 0 then return end
+    local frac = (maxHp and maxHp > 0) and (shownHp / maxHp) or 0
+    local c = FN.mutedHpColor(frac)
+    if not c then return end
+    love.graphics.setColor(c[1], c[2], c[3], 1)
+    love.graphics.rectangle("fill", (tx + 3) * 8, (ty + 2) * 8 + 2, pixels, 3)
+    love.graphics.setColor(0, 0, 0, 1)
+  end
+
+  -- The FALLBACK path's muted palettes (used when BattleHud cannot supply the
+  -- cart's tiles): the same tiny hpBar table FN.drawHpFill reads, keyed to the
+  -- muted family.
+  FN.mutedPalettes = function()
+    local function rgb(c)
+      return { math.floor(c[1] * 255 + 0.5), math.floor(c[2] * 255 + 0.5),
+        math.floor(c[3] * 255 + 0.5) }
+    end
+    local col = Fantasy and Fantasy.col
+    local white = { 255, 255, 255 }
+    return { hpBar = {
+      green = { white, rgb((col and col.good) or { 0.000, 0.639, 0.427, 1 }) },
+      yellow = { white, rgb((col and col.warn) or { 0.639, 0.561, 0.000, 1 }) },
+      red = { white, rgb((col and col.bad) or { 0.639, 0.000, 0.000, 1 }) },
+    } }
   end
 
   -- The cart's <LV> level glyph: tile $6E of the battle-extra font page
@@ -2314,7 +2922,7 @@ return function(mod)
   -- On Gen 1 the backend answers from the native Status registry's own
   -- label (`Status.hudLabelFor(data.statuses, "PSN")`), which is the same
   -- text the Gen 1 HUD prints.
-  local function statusTag(mon, data)
+  FN.statusTag = function(mon, data)
     local status = mon and mon.status
     if not status then return nil end
     if not N.isGen2 then return N.statusLabel(mon, data) end
@@ -2342,7 +2950,7 @@ return function(mod)
   -- 7555). Mirrored from BattleState:expPixels and computed off the same
   -- growth records Mon.gainExperience used, so the bar can never disagree
   -- with the level printed beside it.
-  local function expFraction(mon, data)
+  FN.expFraction = function(mon, data)
     local def = data and data.pokemon and data.pokemon[Mon.partySpecies(mon)]
     local growth = Mon.growthFor(data, def and def.growthRate)
     if not growth then return 0 end
@@ -2426,7 +3034,11 @@ return function(mod)
   -- the caller picks, since the two sides differ); `hud` is the screen's
   -- BattleHud instance, which supplies the native tiles and falls back to
   -- the plain coloured fill when a dataset cannot load them.
-  local function drawGuiBox(tx, ty, tw, th, battler, data, showNumeric, anchorRight, sizeMul, shownHp, hud)
+  -- `enemyStat` (12th arg) marks the readout as the ENEMY's own: only then does
+  -- the readout get the ENEMY STAT WHITE panel and the party list's muted HP
+  -- bar colours (see the helper header above).  Left off, the readout is drawn
+  -- exactly as before.
+  FN.drawGuiBox = function(tx, ty, tw, th, battler, data, showNumeric, anchorRight, sizeMul, shownHp, hud, enemyStat, hpSkin)
     local mon = battler and battler.mon
     if not mon then return end
     -- `battler.caught` is still checked by name (Screen:throwBall sets it
@@ -2437,6 +3049,16 @@ return function(mod)
     -- trusting.
     if battler.caught then return end
     if shownHp == nil then shownHp = mon.hp or 0 end
+    -- THE DYNAMAX HP SKIN (13th arg): a DRAW-ONLY scale over the readout --
+    -- see Screen:dynamaxHpSkinDisplay and the DYNAMAX HP SKIN block.  nil for
+    -- every mon that is not the one being shown scaled, so every other readout
+    -- is byte-identical to before.  The max is scaled with the same record a
+    -- few lines below; scaling both leaves the bar's own fill ratio alone in
+    -- the steady state and makes the ramp's dip/refill read exactly as the
+    -- spec describes.
+    if hpSkin then
+      shownHp = math.floor(shownHp * (hpSkin.hp or 1) + 0.5)
+    end
     if shownHp <= 0 then return end
 
     local effectiveScale = BOX_SCALE * (sizeMul or 1)
@@ -2446,12 +3068,39 @@ return function(mod)
     love.graphics.scale(effectiveScale, effectiveScale)
     love.graphics.translate(-anchorX, -ty * 8)
 
+    -- ENEMY STAT WHITE (v4.2.0): the enemy's own readout sits on a rounded,
+    -- translucent panel -- see the helper's header.  Nothing is drawn for the
+    -- player's readout or for any caller that leaves `enemyStat` off.
+    if enemyStat then FN.drawEnemyStatPanel(tx, ty, tw, th) end
+
     -- No frame at all any more: the readout is just its native assets now.
     -- The black rule square that used to enclose them (drawn border-only,
     -- with Font.drawBox's white fill already skipped) was removed so the
     -- mon shows through completely. The asset offsets below keep the
     -- one-tile inset they had while the frame existed, so nothing moved.
-    love.graphics.setColor(0, 0, 0, 1)
+    --
+    -- The readout's ink: the cart's black (also what the player's readout and
+    -- the bare field have always used), switched to WHITE for the enemy when
+    -- the ENEMY STAT WHITE panel is the DARK variant -- black ink on that dark
+    -- surface was unreadable (user-reported).  Everything drawn after this line
+    -- that has a palette of its own (the native HP badge and bar cells) still
+    -- sets its own colours, so only the name, the level readout and the gender
+    -- glyph take the ink.
+    --
+    -- The white ink cannot be an ordinary setColor: the cart's glyphs are
+    -- black on transparent, so a white tint leaves them black (FN.whiteInkShader
+    -- explains this).  The dark state therefore draws ONLY the name/level/gender
+    -- through that recolour shader and restores the previous shader immediately
+    -- after; the ON state and the player's readout keep the plain black ink.
+    local darkInk = enemyStat and not FN.enemyStatWhite()
+    local ink = darkInk and 1 or 0
+    love.graphics.setColor(ink, ink, ink, 1)
+    local whiteShader = darkInk and FN.whiteInkShader() or nil
+    local prevShader = nil
+    if whiteShader then
+      prevShader = love.graphics.getShader and love.graphics.getShader() or nil
+      love.graphics.setShader(whiteShader)
+    end
 
     -- The cart's stat glyphs -- the <LV> tile and the HP/exp bar cells --
     -- live in the battle-extra font page, so every native draw below happens
@@ -2476,7 +3125,7 @@ return function(mod)
     -- digits + gender) at NAME_SCALE; fitName shrinks the name against
     -- exactly that, so a long name can never strike through the level
     -- readout or the box's right border.
-    local tag = statusTag(mon, data)
+    local tag = FN.statusTag(mon, data)
     local lvText = tag or tostring(mon.level or 0)
     local gender = GENDER_SYMBOL[mon.gender] or ""
     local lvW = (tag and 0 or 8) + Font.width(lvText) + Font.width(gender)
@@ -2484,47 +3133,60 @@ return function(mod)
     -- interior converted back to native px (divide by NAME_SCALE), so the
     -- suffix it subtracts must be native px too -- NOT pre-scaled, or a long
     -- name would look like it fits and then push the level past the border.
-    local name = fitName(displayName(mon), interiorW / NAME_SCALE,
+    local name = FN.fitName(FN.displayName(mon), interiorW / NAME_SCALE,
       lvW + 4)
-    drawScaledText(name, interiorL + 2, rowY + 1, NAME_SCALE)
+    FN.drawScaledText(name, interiorL + 2, rowY + 1, NAME_SCALE)
     local penX = interiorL + 2 + (Font.width(name) + 4) * NAME_SCALE
     if not tag then
-      drawScaledCode(LV_GLYPH, penX, rowY + 1, NAME_SCALE)
+      FN.drawScaledCode(LV_GLYPH, penX, rowY + 1, NAME_SCALE)
       penX = penX + 8 * NAME_SCALE
     end
-    drawScaledText(lvText, penX, rowY + 1, NAME_SCALE)
+    FN.drawScaledText(lvText, penX, rowY + 1, NAME_SCALE)
     penX = penX + Font.width(lvText) * NAME_SCALE
-    drawScaledText(gender, penX, rowY + 1, NAME_SCALE)
+    FN.drawScaledText(gender, penX, rowY + 1, NAME_SCALE)
+    -- Restore before the HP bar / numeric / exp draws: those take native
+    -- palettes of their own and must not be whitened.
+    if whiteShader then love.graphics.setShader(prevShader) end
 
     -- Line 2: the HP bar -- the cart's own assembly, coloured through the
     -- hpBar palette for the displayed HP's green/yellow/red state, so it
     -- matches every native bar exactly. Falls back to the plain coloured
     -- fill only when the menu gfx cannot supply the tiles.
     local palettes = N.paletteData(data)
+    local maxHp = FN.maxHpOf(mon)
+    -- Same DRAW-ONLY skin as `shownHp` above: the max the readout shows while
+    -- a Dynamax is on.  Real FN.maxHpOf is untouched (the catch formula and
+    -- everything else still read the mon's own numbers).
+    if hpSkin then maxHp = math.floor(maxHp * (hpSkin.max or 1) + 0.5) end
+    -- ENEMY STAT WHITE: the enemy's bar is recoloured onto the party list's
+    -- muted family.  The fallback (no tiles) path is handed the muted palette
+    -- table; the tile path repaints the native fill afterwards, just below.
+    local barPalettes = (enemyStat and FN.mutedPalettes()) or palettes
     if hudReady then
       -- Keyed (shade 0 transparent) so the mon behind the readout shows
       -- through the bar's own cell backgrounds -- see drawHudKeyed.
-      drawHudKeyed(function()
-        hud:drawHpBar(shownHp, maxHpOf(mon), tx + 1, ty + 2)
+      FN.drawHudKeyed(function()
+        hud:drawHpBar(shownHp, maxHp, tx + 1, ty + 2)
       end)
-    elseif palettes then
-      drawHpFill(palettes, shownHp, maxHpOf(mon), interiorL, rowY + 10,
+      if enemyStat then FN.drawMutedHpFill(shownHp, maxHp, tx, ty) end
+    elseif barPalettes then
+      FN.drawHpFill(barPalettes, shownHp, maxHp, interiorL, rowY + 10,
         interiorW, 3)
     end
 
     if showNumeric then
       -- Line 3: current/max, right-aligned to the interior's own right edge,
       -- under the bar -- where the cart prints it.
-      local label = string.format("%d/%d", shownHp, maxHpOf(mon))
-      drawScaledText(label, interiorR - 2 - Font.width(label) * 0.75,
+      local label = string.format("%d/%d", shownHp, maxHp)
+      FN.drawScaledText(label, interiorR - 2 - Font.width(label) * 0.75,
         rowY + 16, 0.75)
 
       -- Line 4: the exp bar, grown from the right exactly as FillInExpBar
       -- does. The fraction is this level's share of the span to the next
       -- level (see expFraction), so the bar agrees with the level shown.
       if hudReady then
-        drawHudKeyed(function()
-          hud:drawExpBar(expFraction(mon, data), tx + 1, ty + 4)
+        FN.drawHudKeyed(function()
+          hud:drawExpBar(FN.expFraction(mon, data), tx + 1, ty + 4)
         end)
       end
     end
@@ -2594,6 +3256,11 @@ return function(mod)
     -- constructor's own arguments are assembled.
     self.battle = battle
     self.g9dex = g9dex
+    -- Tell g9-battle-engine this scene can perform a mid-turn self-switch
+    -- (see Screen:beginPivotSwitch and turn_order.lua's PIVOT PAUSE). Without
+    -- the flag the engine keeps its old "round ends at the switch" behaviour,
+    -- so an older scene paired with this engine is unaffected.
+    if battle then battle.__g9SceneHandlesPivotSwitch = true end
     -- FANTASY COMBAT (options.lua's row): read fresh per battle, so a
     -- change in the mod manager takes effect on the next fight.  When ON,
     -- drawContent hands the whole bottom band to fantasy_combat.lua and
@@ -2667,6 +3334,15 @@ return function(mod)
         self.enemyBench[#self.enemyBench + 1] = roster[i]
       end
     end
+    -- POKéDEX SEEN: native stamps `pokedex.seen[species]` while it loads each
+    -- enemy mon (gen1 BattleState.lua:781/912, gen2 BattleState:markSeen), and
+    -- this scene replaces that screen -- so without this a scene battle never
+    -- marked anything seen.  Only the enemies actually standing on the field
+    -- are stamped here; a benched trainer mon is stamped when it is really
+    -- sent out (Screen:advanceEnemyReplacement), matching native's send-in.
+    for _, b in ipairs(self.enemyBattlers) do
+      N.markSeen(self.game, b.mon)
+    end
     self.playerBattlers = Screen.playerFieldRoster(payload.players,
       (self.game and self.game.save and self.game.save.party)
         or (self.battle and self.battle.party),
@@ -2684,6 +3360,14 @@ return function(mod)
     for _, enemy in ipairs(self.enemyBattlers) do
       self.expActive[enemy.mon] = self:expFieldSet()
     end
+    -- The after-battle evolution sweep's Gen 2 half: wEvolvableFlags, the
+    -- party-index set the cart sets the moment a mon levels (engine/battle/
+    -- core.asm, right after LearnLevelMoves).  Filled by Screen:awardFaintExp
+    -- from the model's per-level `level` events and read once, on the way out,
+    -- by native.lua's N.runAfterBattleEvolutions.  Gen 1's equivalent is the
+    -- mon-keyed battle.g9LeveledUp the Gen 1 EXP arm stamps instead; this table
+    -- simply stays empty there.
+    self.g9EvolvableFlags = {}
     self.message = nil
     -- Kept for anything reading it, though the 1.5x trainer EXP bonus
     -- itself now comes free from battle:awardExperience -- it reads the
@@ -2698,11 +3382,21 @@ return function(mod)
     -- The turn's events, whole tables, NOT just their .text -- see
     -- Screen:advanceResolving for why the rest of each event now matters.
     self.pendingEvents = {}
+    -- Set while the game's own move-learn screen is up (see
+    -- Screen:beginMoveLearn): the turn's resolution is parked here until the
+    -- player has either learned the move or given up on it, so the next turn
+    -- cannot start with an unresolved learn.  nil when nothing is being learned.
+    self.learn = nil
     -- The chasing HP the HUD actually draws, keyed by the real mon table
     -- (see Screen:snapshotHp for why the mon and not the battler and not
     -- the side). Screen:shownHpOf reads it; Screen:stepHpAnim walks it.
     self.shownHp = {}
     self.hpAnim = nil
+    -- The DRAW-ONLY Dynamax HP skin (see the DYNAMAX block): which mon is
+    -- shown scaled, by how much, and how far its two ramps have run.  nil
+    -- whenever no Dynamax/Gigantamax is being shown -- it is never written to
+    -- any mon, so nothing here can reach a save.
+    self.dynHpSkin = nil
     -- The input-pacing clocks (see INPUT_DELAY's own note above).
     -- inputLock is armed only when an action is actually committed (a move
     -- or positional swap queued -- Screen:queueAction/queueSwapAction) and
@@ -2726,7 +3420,7 @@ return function(mod)
     -- (loadSettingsFile's own header). menuOrder is the LIST-mode item
     -- order only -- grid/cross modes use GRID2_ROWS/CROSS_SLOTS instead,
     -- both module-level and unaffected by this setting.
-    local settings = loadSettingsFile()
+    local settings = FN.loadSettingsFile()
     self.menuLayout = (settings.menuLayout == "grid") and "grid" or "list"
     self.customButtonLabel = (type(settings.customButtonLabel) == "string"
       and settings.customButtonLabel ~= "") and settings.customButtonLabel or nil
@@ -2782,6 +3476,7 @@ return function(mod)
     self.gimmickOwnerSlot = nil
     self.gimmickOwnerId = nil
     self.gimmickOwnerLabel = nil
+    self.gimmickArmed = {}
     -- The staged MEGA EVOLUTION animation (see the MEGA EVOLUTION block):
     -- { clip, owner, battler, applied } while the sequence is playing, nil
     -- otherwise.  While it is set the resolving loop is held and the
@@ -2835,6 +3530,10 @@ return function(mod)
     self.enemyRevealed = {}
     self.playerRevealed = {}
     self:resolveTrainerArt()
+    -- Bake the two leads' sheets from the first frame the screen exists -- not
+    -- just from the throw beat -- so any intro narration ahead of the ball is
+    -- extra head start too (see Screen:prewarmLeads).
+    self:prewarmLeads()
     -- WILD mons are NOT pre-revealed: their "fade" intro beat leaves each
     -- one in place at its final sprite position and fades its sprite from
     -- invisible to visible (see buildIntroSequence), which is what gates
@@ -2844,6 +3543,12 @@ return function(mod)
     self.ballThrow = nil
     self.wildFade = nil
     self.outroT = nil
+    -- A wild SPECIAL BOSS's declared transformation is played as an intro beat
+    -- (see buildIntroSequence).  Hold the declared gimmick back BEFORE the
+    -- boss fades in, so it appears ordinary and its own beat is what performs
+    -- the transformation -- rather than fading in already wearing its crystal
+    -- film, or already grown, and then snapping back when the clip starts.
+    self:holdBossTransform()
     if #self.introSequence > 0 then
       self.phase = "intro"
       self:advanceIntro()
@@ -2942,6 +3647,12 @@ return function(mod)
     if not battle or self.eventProbeInstalled then return end
     self.eventProbeInstalled = true
     local screen = self
+    -- Publish the screen on the battle so a backend that fills the native
+    -- queue itself can reach this screen's live HP vector.  The Gen 1 model
+    -- (native.lua's drainNativeMove) walks that queue and emits one beat per
+    -- landed hit; it needs Screen:snapshotHp to seed the per-hit vector.  A
+    -- backend that does not read it is unaffected.
+    battle.g9Scene = screen
     local baseEmit = battle.emit
     if type(baseEmit) == "function" then
       battle.emit = function(b, event)
@@ -3029,8 +3740,17 @@ return function(mod)
         -- A bar the chase has already seen is moving: the signed
         -- difference IS this event's HP change, so spawn a floating
         -- number for it (a no-op unless the engine's damage-numbers
-        -- option is on -- see Screen:spawnDmgNumber).
-        self:spawnDmgNumber(mon, hp - self.shownHp[mon])
+        -- option is on -- see Screen:spawnDmgNumber).  A mon wearing the
+        -- Dynamax HP skin shows the RAW hit -- the real damage battle_forms
+        -- let through is dmg/M, so the label is scaled back up by M, exactly
+        -- as the bar's own scaled numbers are (see the DYNAMAX HP SKIN block).
+        local delta = hp - self.shownHp[mon]
+        local skin = self:dynamaxHpSkinFor(mon)
+        if skin then
+          local mag = math.floor(math.abs(delta) * skin.num / skin.den + 0.5)
+          delta = delta < 0 and -mag or mag
+        end
+        self:spawnDmgNumber(mon, delta)
         pending = pending or {}
         pending[mon] = hp
         -- Where this drain starts from, so Screen:stepHpAnim can
@@ -3188,7 +3908,7 @@ return function(mod)
           local y = mark.top + (h - 7) * eff
           local alpha = math.max(0, 1 - e.t / DMG_NUMBER_LIFE)
           love.graphics.setColor(e.color[1], e.color[2], e.color[3], alpha)
-          drawScaledText(e.text, cx - Font.width(e.text) * scale / 2, y, scale)
+          FN.drawScaledText(e.text, cx - Font.width(e.text) * scale / 2, y, scale)
         end
       end
       love.graphics.setColor(1, 1, 1, 1)
@@ -3453,6 +4173,7 @@ return function(mod)
     self.gimmickOwnerSlot = nil
     self.gimmickOwnerId = nil
     self.gimmickOwnerLabel = nil
+    self.gimmickArmed = {}
     self.slotPtr = 1
     if #self.turnSlots == 0 then
       -- Both player battlers already down with no switch made -- still
@@ -3488,7 +4209,7 @@ return function(mod)
     -- path, trueColor, colours.
     local backPath, backTrueColor, backColors =
       N.playerBackArt(self.data, save, self.battle)
-    local backImg = backPath and loadSprite(backPath)
+    local backImg = backPath and FN.loadSprite(backPath)
     if backImg then
       self.playerTrainerImage = backImg
       self.showPlayerTrainer = true
@@ -3498,7 +4219,7 @@ return function(mod)
     if self.isTrainerBattle and type(self.trainerData) == "table" then
       local path, trueColor, colors =
         N.enemyTrainerArt(self.data, self.trainerData)
-      local img = path and loadSprite(path)
+      local img = path and FN.loadSprite(path)
       if img then
         self.enemyTrainerImage = img
         self.showEnemyTrainer = true
@@ -3558,7 +4279,7 @@ return function(mod)
     if specialBoss and specialBoss.bossAnnouncement then
       local first = self.enemyBattlers and self.enemyBattlers[1]
       local ok, line = pcall(specialBoss.bossAnnouncement, self.battle,
-        first and displayName(first.mon) or nil)
+        first and FN.displayName(first.mon) or nil)
       if ok and type(line) == "string" and line ~= "" then bossLine = line end
     end
     local tName = self:trainerDisplayName()
@@ -3569,15 +4290,25 @@ return function(mod)
         seq[#seq + 1] = { kind = "trainerSlide" }
       end
       for i, b in ipairs(self.enemyBattlers) do
-        seq[#seq + 1] = { text = tName .. " sent out " .. displayName(b.mon) .. "!",
+        seq[#seq + 1] = { text = tName .. " sent out " .. FN.displayName(b.mon) .. "!",
           kind = "throw", side = "enemy", slot = i }
       end
     else
       for i, b in ipairs(self.enemyBattlers) do
         -- The raid line takes the first (and, for a boss fight, only) enemy's
         -- own appearing beat: one line, shown while the boss fades in.
-        local text = (i == 1 and bossLine) or ("Wild " .. displayName(b.mon) .. " appeared!")
+        local text = (i == 1 and bossLine) or ("Wild " .. FN.displayName(b.mon) .. " appeared!")
         seq[#seq + 1] = { text = text, kind = "fade", slot = i }
+      end
+      -- A wild SPECIAL BOSS's declared transformation is its own beat, right
+      -- after it has faded in: the boss appears as its ordinary self and THEN
+      -- transforms, rather than fading in already wearing its crystal film or
+      -- already grown (the holds that make that read are raised in Screen.new
+      -- -- see Screen:holdBossTransform).  The beat only exists when there is
+      -- really something to play, so an ordinary wild fight's intro is exactly
+      -- what it was.
+      if self:bossTransformKind() then
+        seq[#seq + 1] = { kind = "bossTransform" }
       end
     end
     if self.showPlayerTrainer then
@@ -3585,7 +4316,7 @@ return function(mod)
     end
     for i, b in ipairs(self.playerBattlers) do
       if self.combat.isAlive(b) then
-        seq[#seq + 1] = { text = "Go! " .. displayName(b.mon) .. "!",
+        seq[#seq + 1] = { text = "Go! " .. FN.displayName(b.mon) .. "!",
           kind = "throw", side = "player", slot = i }
       end
     end
@@ -3637,6 +4368,20 @@ return function(mod)
       self.trainerSlide = 0
     elseif step.kind == "backpicSlide" then
       self.backpicSlide = 0
+    elseif step.kind == "bossTransform" then
+      -- A wild SPECIAL BOSS plays its own transformation here (see
+      -- Screen:startBossTransformAnim); the clip's own end calls
+      -- Screen:finishGimmickAnim, which hands the narration straight back to
+      -- this function for the NEXT beat.  When nothing could be staged (a build
+      -- without the animation module, a battler that is not on the field) the
+      -- beat is simply skipped -- after dropping the holds, so the declared
+      -- look lands now -- exactly as an unknown beat always was.
+      if not self:startBossTransformAnim() then
+        for _, b in ipairs(self.enemyBattlers or {}) do
+          self:releaseGimmickHold(b)
+        end
+        self:advanceIntro()
+      end
     end
   end
 
@@ -3665,6 +4410,13 @@ return function(mod)
     self.showEnemyTrainer = false
     for i in ipairs(self.enemyBattlers) do self.enemyRevealed[i] = true end
     for i in ipairs(self.playerBattlers) do self.playerRevealed[i] = true end
+    -- A boss-appearance transformation never outlives the intro: a beat that
+    -- could not build its clip drops its holds as it is skipped, and a clip
+    -- that did run has already revealed and dropped them.  This is the
+    -- backstop -- a stray hold would keep a declared raid boss drawn ordinary
+    -- for the whole fight.
+    self.bossTransformIntro = nil
+    for _, b in ipairs(self.enemyBattlers or {}) do self:releaseGimmickHold(b) end
     self.currentMessage = nil
     self:beginTurn()
   end
@@ -3692,13 +4444,51 @@ return function(mod)
         self.backpicSlide = BACKPIC_SLIDE_DURATION
         return
       end
+      -- A BOSS APPEARANCE transformation (see Screen:startBossTransformAnim)
+      -- owns the intro until it is over: a once-per-fight set piece is never
+      -- skippable by a press -- the same rule the mid-battle set piece keeps
+      -- (Screen:advanceResolving refuses to step a turn while a clip is live).
+      -- Its own end hands the narration back through Screen:finishGimmickAnim.
+      if self.bossTransformIntro then return end
       self:advanceIntro()
     end
   end
 
+  -- Does the CURRENT action menu (list or grid, this screen's own layout)
+  -- actually offer `id`?  Used to validate a remembered action before parking
+  -- the cursor on it: a remembered SWITCH/CUSTOM that THIS battle cannot offer
+  -- (no second living ally, no FORMS button) must fall through to FIGHT rather
+  -- than leave the cursor on a cell that is not on the menu at all.
+  function Screen:actionMenuHas(id)
+    if type(id) ~= "string" then return false end
+    local grid = self.crossSlots or self.gridRows
+    if grid then
+      for _, row in ipairs(grid) do
+        for _, cell in ipairs(row) do
+          if cell == id then return true end
+        end
+      end
+      return false
+    end
+    for _, cell in ipairs(self.menuOrder or {}) do
+      if cell == id then return true end
+    end
+    return false
+  end
+
   function Screen:enterActionMenu()
     self.actingSlotIdx = self.turnSlots[self.slotPtr]
+    -- ACTION MENU CURSOR MEMORY (see the actionMenuMemory block at the top of
+    -- this file): only the FIRST field slot is remembered -- "keep memory for
+    -- (first pos only, the other pos start at FIGHT action position) for
+    -- action menu".  A remembered action is honoured only while THIS battle's
+    -- own menu actually offers it, so SWITCH/CUSTOM cannot strand the cursor
+    -- on a cell the current layout does not draw.
     self.menuCursor = "FIGHT"
+    local remembered = rememberedAction(self.actingSlotIdx)
+    if remembered and self:actionMenuHas(remembered) then
+      self.menuCursor = remembered
+    end
     self.message = nil
     self.phase = "actionMenu"
     -- No delay here: the action box is SHOWN and immediately selectable.
@@ -3721,9 +4511,7 @@ return function(mod)
   -- rather than deciding for the player.
   function Screen:chooseMenuItem(id)
     if id == "RUN" then
-      self.outcome = "run"
-      self:finishBattleExit()
-      self.game.stack:pop()
+      self:doRun()
     elseif id == "BAG" then
       self:openBag()
     elseif id == "PKMN" then
@@ -3735,6 +4523,89 @@ return function(mod)
     elseif id == "CUSTOM" then
       mod.events:emit(CUSTOM_BUTTON_EVENT, { game = self.game, world = self.world })
       self:enterGimmickSelect()
+    end
+  end
+
+  ------------------------------------------------------------------
+  -- RUN POLICY (user request: "player can run away from trainer battles,
+  -- that's undesired behavior, player should only be able to run away from
+  -- pokemon wild battles, and if player is in a boss fight, run should
+  -- trigger a confirmation (yes/no) to actually run away (cursor starts at
+  -- no)").
+  --
+  -- Three verbs, deliberately split so the PUBLIC primitive keeps its old
+  -- meaning:
+  --   * Screen:doRun()        -- leave now, unconditionally.  This is what
+  --     chooseMenuItem("RUN") does, and so what the two-choice prompt API's
+  --     documented "leave" answer still does.  An external caller that has
+  --     already asked its own question must not be asked a second one.
+  --   * Screen:attemptRun()   -- the PLAYER's own RUN, gated: a trainer
+  --     battle refuses, a wild boss asks, everything else leaves at once.
+  --     updateActionMenu routes the player's A here (and only here).
+  --   * Screen:confirmBossRun() -- the wild-boss yes/no, raised through the
+  --     screen's own prompt primitive so it uses the same F/E box as every
+  --     other question.
+  ------------------------------------------------------------------
+
+  -- The escape itself.  finishBattleExit is already guarded by its own
+  -- `exited` flag; the explicit check here is belt-and-braces so a doubled A
+  -- (or a re-entrant update under game speed-up) can never reach
+  -- `game.stack:pop()` twice.
+  function Screen:doRun()
+    if self.exited then return end
+    self.outcome = "run"
+    self:finishBattleExit()
+    self.game.stack:pop()
+  end
+
+  -- The player's RUN, gated.  A trainer fight never runs -- the exact line
+  -- the engine's own Gen 2 Battle:tryRun prints; a wild BOSS fight asks
+  -- first (the screen's `isBoss` is the bossFight layout's own flag, read
+  -- once in Screen.new); anything else leaves at once.
+  function Screen:attemptRun()
+    if self.exited then return end
+    if self.isTrainerBattle then
+      self.message = RUN_TRAINER_REFUSAL
+      return
+    end
+    if self.isBoss then
+      self:confirmBossRun()
+      return
+    end
+    self:doRun()
+  end
+
+  -- The wild-boss confirmation.  Raised through mod.exports.askBattleChoice
+  -- -- the screen's own two-choice prompt primitive -- so the box is the
+  -- same F/E prompt every other question uses: the question wraps in F, YES
+  -- and NO sit in E, B answers NO, and `default = 2` parks the cursor on NO
+  -- as the user specified.  YES runs Screen:doRun; NO simply restores the
+  -- action menu with the battle untouched.
+  --
+  -- SAFEGUARDS.  A re-entrant call -- a sped-up frame dispatching twice, or
+  -- a double A -- finds the question already pending or up and returns
+  -- without raising a second one; the prompt API itself also refuses to
+  -- stack a prompt.  Neither path recurses, so this can never overflow.  If
+  -- the raise is refused for any reason the player is told in F rather than
+  -- left wondering why A did nothing.
+  function Screen:confirmBossRun()
+    local pending = self.pendingPrompt
+    if pending and pending.id == "g9_boss_run" then return end
+    local ask = self.prompt
+    if ask and ask.id == "g9_boss_run" then return end
+    local ok, err = mod.exports.askBattleChoice(self, {
+      id = "g9_boss_run",
+      text = RUN_BOSS_QUESTION,
+      choices = { RUN_YES_LABEL, RUN_NO_LABEL },
+      default = 2,
+      onAnswer = function(index, screen)
+        if index == 1 then screen:doRun() end
+      end,
+    })
+    if not ok then
+      mod.log:warn("g9_Battle_Scene: the boss run confirmation could not be "
+        .. "raised (%s); the run was not taken", tostring(err))
+      self.message = RUN_BOSS_QUESTION
     end
   end
 
@@ -3799,7 +4670,7 @@ return function(mod)
   -- because the focus is transient: a peer that reads battle.player later
   -- cannot assume it names the FORM's owner, so the announcement carries the
   -- mon explicitly instead.
-  local function nativePlayerFor(self, mon)
+  FN.nativePlayerFor = function(self, mon)
     if not mon then return nil end
     -- Gen 2's battle.player IS the mon; Gen 1's is the native battler the mon
     -- was built into (battle_forms' own battlerof.mon reverses that again).
@@ -3811,9 +4682,9 @@ return function(mod)
   -- Runs `fn` with battle.player pointed at `mon`, restoring the baseline
   -- afterward whether fn returns or raises -- pcall'd so a raising
   -- battle_forms call can never leave the field pointed at the wrong mon.
-  local function focusBattlePlayer(self, mon, fn)
+  FN.focusBattlePlayer = function(self, mon, fn)
     local battle = self.battle
-    local focused = mon and nativePlayerFor(self, mon)
+    local focused = mon and FN.nativePlayerFor(self, mon)
     if not (battle and focused) then return fn() end
     local saved = battle.player
     battle.player = focused
@@ -3827,7 +4698,7 @@ return function(mod)
   -- contract). The armed id disappearing between two reads is also the signal
   -- that battle.turn_started actually consumed it; staying armed means the
   -- entry's activate() refused and the option is deliberately kept.
-  local function battleFormsArmedId()
+  FN.battleFormsArmedId = function()
     local battleForms = mod:find("battle_forms")
     local api = battleForms and battleForms.exports
     if not (api and type(api.armed) == "function") then return nil end
@@ -3835,8 +4706,24 @@ return function(mod)
     return ok and id or nil
   end
 
+  -- formapi's published arm() (a TOGGLE): arms `id` if it is not already the
+  -- armed id, disarms it if it is. The GIMMICK SEQUENCE drives one gimmick per
+  -- acting Pokemon through this, so it always reads the current armed id
+  -- first and only arms when the wanted one is not already standing -- calling
+  -- arm() blindly on the already-armed id would disarm it. Answers true when
+  -- `id` is armed afterwards.
+  FN.battleFormsArm = function(id)
+    if type(id) ~= "string" then return false end
+    if FN.battleFormsArmedId() == id then return true end
+    local battleForms = mod:find("battle_forms")
+    local api = battleForms and battleForms.exports
+    if not (api and type(api.arm) == "function") then return false end
+    local ok = pcall(api.arm, id)
+    return ok and FN.battleFormsArmedId() == id
+  end
+
   -- The phase announcement described on FORMS_EVENT.
-  local function emitFormsEvent(self, phase, fields)
+  FN.emitFormsEvent = function(self, phase, fields)
     fields = fields or {}
     local mon = fields.mon
     local ok, err = pcall(mod.events.emit, mod.events, FORMS_EVENT,
@@ -3852,7 +4739,7 @@ return function(mod)
 
   -- Drops the recorded owner without an announcement -- for the paths that
   -- have already announced something else about it.
-  local function clearGimmickOwner(self)
+  FN.clearGimmickOwner = function(self)
     self.gimmickOwnerMon = nil
     self.gimmickOwnerSlot = nil
     self.gimmickOwnerId = nil
@@ -3898,7 +4785,7 @@ return function(mod)
     -- Focused on the acting mon so eligibility is resolved against it rather
     -- than the engine's pinned slot-1 battler (see FORMS OWNER above).
     local okList, rows = pcall(function()
-      return focusBattlePlayer(self, actorMon, function()
+      return FN.focusBattlePlayer(self, actorMon, function()
         return api.gimmicks(self.battle)
       end)
     end)
@@ -3957,7 +4844,7 @@ return function(mod)
       -- no side effect, same as moveSelect's own B. Announced, so a peer
       -- watching for the FORM this turn picked a mon for knows the pick was
       -- backed out of rather than expecting an activation (FORMS_EVENT).
-      emitFormsEvent(self, "cancelled", { mon = self.gimmickActorMon,
+      FN.emitFormsEvent(self, "cancelled", { mon = self.gimmickActorMon,
         slot = self.gimmickActorSlot, reason = "backed-out" })
       self.gimmickCandidates = nil
       self.gimmickArmState = nil
@@ -3975,19 +4862,25 @@ return function(mod)
       -- (Dynamax's Max Moves, a Z-Move) that hook replaces battle.player's
       -- move array -- so it has to be the right battler.
       local ok, armed = pcall(function()
-        return focusBattlePlayer(self, ownerMon, function()
+        return FN.focusBattlePlayer(self, ownerMon, function()
           return self.gimmickArmState:toggle(chosen.id)
         end)
       end)
       if ok and armed then
-        -- A previous pick this turn (a second mon's FORMS, or a second cell)
-        -- is superseded: announced before the new owner so a peer never sees
-        -- two live "armed" announcements for one battle.
-        if self.gimmickOwnerMon then
-          emitFormsEvent(self, "cancelled", { mon = self.gimmickOwnerMon,
-            slot = self.gimmickOwnerSlot, id = self.gimmickOwnerId,
-            label = self.gimmickOwnerLabel, reason = "replaced" })
+        -- Only THIS acting Pokemon's previous pick is replaced.  A DIFFERENT
+        -- slot's gimmick armed this turn is KEPT: battle_forms holds one armed
+        -- slot, so the scene records each slot's pick here and drives them
+        -- through that slot one at a time at the head of the turn (see the
+        -- GIMMICK SEQUENCE block) -- otherwise a second mon arming would
+        -- supersede the first and only the last would fire.
+        local was = self.gimmickArmed[self.gimmickActorSlot]
+        if was then
+          FN.emitFormsEvent(self, "cancelled", { mon = was.mon,
+            slot = self.gimmickActorSlot, id = was.id, label = was.label,
+            reason = "replaced" })
         end
+        self.gimmickArmed[self.gimmickActorSlot] =
+          { mon = ownerMon, id = chosen.id, label = chosen.label }
         self.gimmickOwnerMon = ownerMon
         self.gimmickOwnerSlot = self.gimmickActorSlot
         self.gimmickOwnerId = chosen.id
@@ -3995,16 +4888,25 @@ return function(mod)
         -- Names the Pokemon that used it, so the player line says the same
         -- thing the FORMS_EVENT payload does.
         self.message = ownerMon
-          and (displayName(ownerMon) .. " armed " .. chosen.label .. "!")
+          and (FN.displayName(ownerMon) .. " armed " .. chosen.label .. "!")
           or (chosen.label .. " armed!")
-        emitFormsEvent(self, "armed", { mon = ownerMon,
+        -- The pick is committed, so the action box comes back parked on
+        -- FIGHT rather than still sitting on the cell that opened FORMS --
+        -- arming is the end of this mon's FORMS detour, and FIGHT is where
+        -- the turn continues. Explicit user request.
+        self.menuCursor = "FIGHT"
+        FN.emitFormsEvent(self, "armed", { mon = ownerMon,
           slot = self.gimmickActorSlot, id = chosen.id, label = chosen.label })
       else
-        -- Toggling the already-armed cell off, or battle_forms refusing it.
-        -- Either way nothing is left armed for an earlier owner to claim.
-        clearGimmickOwner(self)
+        -- Toggling this slot's cell off, or battle_forms refusing it.  Only
+        -- this slot is dropped; another mon's armed gimmick stands.
+        local was = self.gimmickArmed[self.gimmickActorSlot]
+        self.gimmickArmed[self.gimmickActorSlot] = nil
+        if self.gimmickOwnerSlot == self.gimmickActorSlot then
+          FN.clearGimmickOwner(self)
+        end
         self.message = "That FORM couldn't be armed."
-        emitFormsEvent(self, "cancelled", { mon = ownerMon,
+        FN.emitFormsEvent(self, "cancelled", { mon = ownerMon,
           slot = self.gimmickActorSlot, id = chosen.id, label = chosen.label,
           reason = "arm-refused" })
       end
@@ -4083,7 +4985,7 @@ return function(mod)
 
   -- One step forward (delta=1) or backward (delta=-1) through `list`
   -- from `current`, wrapping. Shared by both cross cycles below.
-  local function cycleStep(list, current, delta)
+  FN.cycleStep = function(list, current, delta)
     local idx = 1
     for i, id in ipairs(list) do if id == current then idx = i break end end
     idx = ((idx - 1 + delta) % #list) + 1
@@ -4091,7 +4993,7 @@ return function(mod)
   end
 
   -- Locate an id in a rectangular grid whose rows may contain nil holes.
-  local function findCell(grid, id)
+  FN.findCell = function(grid, id)
     for r = 1, #grid do
       for c = 1, #grid[r] do
         if grid[r][c] == id then return r, c end
@@ -4107,7 +5009,7 @@ return function(mod)
   -- movement -- the original cross could not (a step from any corner lands
   -- on an empty cell and carries straight through to the opposite corner),
   -- which is why that shape needed the explicit cycles below.
-  local function stepCell(grid, r, c, dr, dc)
+  FN.stepCell = function(grid, r, c, dr, dc)
     local rows = #grid
     local cols = 1
     for i = 1, rows do if #grid[i] > cols then cols = #grid[i] end end
@@ -4131,13 +5033,13 @@ return function(mod)
       -- Legacy cross layout: explicit-cycle navigation (a step from any
       -- corner lands on a nil cell; coordinate math skips straight through).
       if input:wasPressed("right") then
-        self.menuCursor = cycleStep(CROSS_RIGHT_CYCLE, self.menuCursor, 1)
+        self.menuCursor = FN.cycleStep(CROSS_RIGHT_CYCLE, self.menuCursor, 1)
       elseif input:wasPressed("left") then
-        self.menuCursor = cycleStep(CROSS_RIGHT_CYCLE, self.menuCursor, -1)
+        self.menuCursor = FN.cycleStep(CROSS_RIGHT_CYCLE, self.menuCursor, -1)
       elseif input:wasPressed("down") then
-        self.menuCursor = cycleStep(CROSS_DOWN_CYCLE, self.menuCursor, 1)
+        self.menuCursor = FN.cycleStep(CROSS_DOWN_CYCLE, self.menuCursor, 1)
       elseif input:wasPressed("up") then
-        self.menuCursor = cycleStep(CROSS_DOWN_CYCLE, self.menuCursor, -1)
+        self.menuCursor = FN.cycleStep(CROSS_DOWN_CYCLE, self.menuCursor, -1)
       else
         return false
       end
@@ -4145,17 +5047,17 @@ return function(mod)
     end
     -- Plain grid (2x2 or 3x2): free four-direction movement via stepCell.
     local grid = self.gridRows
-    local row, col = findCell(grid, self.menuCursor)
+    local row, col = FN.findCell(grid, self.menuCursor)
     if not row then return false end
     local nr, nc
     if input:wasPressed("left") then
-      nr, nc = stepCell(grid, row, col, 0, -1)
+      nr, nc = FN.stepCell(grid, row, col, 0, -1)
     elseif input:wasPressed("right") then
-      nr, nc = stepCell(grid, row, col, 0, 1)
+      nr, nc = FN.stepCell(grid, row, col, 0, 1)
     elseif input:wasPressed("up") then
-      nr, nc = stepCell(grid, row, col, -1, 0)
+      nr, nc = FN.stepCell(grid, row, col, -1, 0)
     elseif input:wasPressed("down") then
-      nr, nc = stepCell(grid, row, col, 1, 0)
+      nr, nc = FN.stepCell(grid, row, col, 1, 0)
     else
       return false
     end
@@ -4183,7 +5085,22 @@ return function(mod)
       return
     end
     if input:wasPressed("a") then
-      self:chooseMenuItem(self.menuCursor)
+      -- ACTION MENU CURSOR MEMORY: the action just COMMITTED is what the
+      -- first field slot's next action menu opens on (see the
+      -- actionMenuMemory block at the top).  Recorded at the A press, not on
+      -- cursor movement -- the same "committed, not merely highlighted" rule
+      -- the move memory uses.  A refused RUN or an empty bag is still a
+      -- commit; the menu simply stays where it is.
+      rememberAction(self.actingSlotIdx, self.menuCursor)
+      -- RUN is the one item with a gate (see the RUN POLICY block): the
+      -- player's own A goes through Screen:attemptRun, while
+      -- chooseMenuItem("RUN") stays the immediate "leave" the two-choice
+      -- prompt API documents its callers to use.
+      if self.menuCursor == "RUN" then
+        self:attemptRun()
+      else
+        self:chooseMenuItem(self.menuCursor)
+      end
       return
     end
     local moved = (self.menuLayout == "grid")
@@ -4233,14 +5150,14 @@ return function(mod)
       local label
       if id == "CUSTOM" then
         label = scale
-          and fitName(self.customButtonLabel, (E_INTERIOR_W - 10) / scale, 0)
-          or fitName(self.customButtonLabel, E_INTERIOR_W - 10, 0)
+          and FN.fitName(self.customButtonLabel, (E_INTERIOR_W - 10) / scale, 0)
+          or FN.fitName(self.customButtonLabel, E_INTERIOR_W - 10, 0)
       else
         label = MENU_LABELS[id]
       end
       local y = self.eTextY + (i - 1) * gap
       if scale then
-        drawScaledText(label, self.eTextX + 10, y, scale)
+        FN.drawScaledText(label, self.eTextX + 10, y, scale)
       else
         Font.draw(label, self.eTextX + 10, y)
       end
@@ -4248,7 +5165,7 @@ return function(mod)
     end
     local cy = self.eTextY + (cursorRow - 1) * gap
     if scale then
-      drawScaledCode(CURSOR_CODE, self.eTextX, cy, scale)
+      FN.drawScaledCode(CURSOR_CODE, self.eTextX, cy, scale)
     else
       Font.drawCode(CURSOR_CODE, self.eTextX, cy)
     end
@@ -4354,14 +5271,14 @@ return function(mod)
           local id = self.crossSlots[r] and self.crossSlots[r][c]
           if id then
             local label = (id == "CUSTOM")
-              and fitName(self.customButtonLabel, centerBudget / CROSS_TEXT_SCALE, 0)
+              and FN.fitName(self.customButtonLabel, centerBudget / CROSS_TEXT_SCALE, 0)
               or MENU_LABELS[id]
             local slotX = self.eTextX + slotColX[c]
             local x = slotX + (slotColW[c] - Font.width(label) * CROSS_TEXT_SCALE) / 2
             local y = self.eTextY + GRID_Y_OFFSET + (r - 1) * GRID_ROW_GAP_3
-            drawScaledText(label, x, y, CROSS_TEXT_SCALE)
+            FN.drawScaledText(label, x, y, CROSS_TEXT_SCALE)
             if id == self.menuCursor then
-              drawScaledCode(CURSOR_CODE, x - CROSS_CURSOR_OFFSET, y, CROSS_TEXT_SCALE)
+              FN.drawScaledCode(CURSOR_CODE, x - CROSS_CURSOR_OFFSET, y, CROSS_TEXT_SCALE)
             end
           end
         end
@@ -4383,10 +5300,10 @@ return function(mod)
           local slotX = self.eTextX + GRID_MARGIN_2 + (c - 1) * GRID_SLOT_2
           local x = slotX + (GRID_SLOT_2 - Font.width(label) * scale) / 2
           local y = self.eTextY + GRID_Y_OFFSET + (r - 1) * gap
-          drawScaledText(label, x, y, scale)
+          FN.drawScaledText(label, x, y, scale)
           if id == self.menuCursor then
             if is3rows then
-              drawScaledCode(CURSOR_CODE, x - CROSS_CURSOR_OFFSET, y, scale)
+              FN.drawScaledCode(CURSOR_CODE, x - CROSS_CURSOR_OFFSET, y, scale)
             else
               Font.drawCode(CURSOR_CODE, x - GRID_CURSOR_OFFSET_2, y)
             end
@@ -4405,7 +5322,7 @@ return function(mod)
     -- invented its own "<name>'s turn:" prompt here -- not vanilla,
     -- replaced on request.
     if self.message then
-      drawWrapped(self.message, self.fTextX, self.fTextY, self.fChars)
+      FN.drawWrapped(self.message, self.fTextX, self.fTextY, self.fChars)
     end
   end
 
@@ -4440,8 +5357,115 @@ return function(mod)
     FULL_HEAL = true, FULL_RESTORE = true, HEAL_POWDER = true,
     MIRACLEBERRY = true,
   }
+  -- BAG CURSOR MEMORY (see the bagCursorMemory block at the top of this
+  -- file).  The engine keeps its own WRAM cursor bytes for both bags -- Gen 2
+  -- game.packCursor (a row+scroll per POCKET, plus wLastPocket) and Gen 1
+  -- game.bagListScrollOffset / game.bagSavedMenuItem -- but a battle boundary
+  -- wipes them (Gen 2's CleanUpBattleRAM clearMenuCursors, Gen 1's
+  -- InitBattleVariables / end_of_battle).  The scene's own session table is
+  -- what makes "add cursor memory to each bag slot" survive that:
+  --
+  --   * captureBagCursor copies whatever the engine bytes hold now into the
+  --     session memory.  Called just BEFORE a bag opens, so it always saves
+  --     the row the LAST battle bag was left on.  Missing bytes are skipped,
+  --     so a battle-boundary wipe cannot erase a good memory.
+  --   * seedBagCursor refills the engine bytes from the session memory, but
+  --     only where the engine has NONE -- so the engine's own, fresher memory
+  --     always wins while it is present, and this can never drag a bag back
+  --     to a stale row the engine itself had already moved on from.
+  --
+  -- Both are pure reads/writes of plain integers -- no allocation, no
+  -- recursion -- so a sped-up frame cannot hoard passes through them.
+  function Screen:captureBagCursor()
+    local game = self.game
+    if not game then return end
+    if N.isGen2 then
+      local store = game.packCursor
+      if type(store) ~= "table" then return end
+      local cursor = (type(store.cursor) == "table") and store.cursor or {}
+      local scroll = (type(store.scroll) == "table") and store.scroll or {}
+      -- wLastPocket, remembered under its own "__" key (never a bag slot).
+      if type(store.pocket) == "string" then
+        bagCursorMemory.__lastPocket = store.pocket
+      end
+      for slotId, index in pairs(cursor) do
+        if type(slotId) == "string" and type(index) == "number" then
+          rememberBagCursor(slotId, index, scroll[slotId] or 0)
+        end
+      end
+      return
+    end
+    local offset, saved = game.bagSavedMenuItem, game.bagListScrollOffset
+    if type(offset) == "number" and type(saved) == "number" then
+      rememberBagCursor("BAG", saved + offset + 1, saved)
+    end
+  end
+
+  function Screen:seedBagCursor()
+    local game = self.game
+    if not game then return end
+    if N.isGen2 then
+      if next(bagCursorMemory) == nil then return end
+      local store = game.packCursor
+      if type(store) ~= "table" then
+        store = { cursor = {}, scroll = {} }
+        game.packCursor = store
+      end
+      local cursor = (type(store.cursor) == "table") and store.cursor or {}
+      local scroll = (type(store.scroll) == "table") and store.scroll or {}
+      store.cursor, store.scroll = cursor, scroll
+      -- wLastPocket: refilled only when the engine has none, and only from a
+      -- pocket this cache actually holds -- never guessed.
+      if store.pocket == nil and type(bagCursorMemory.__lastPocket) == "string" then
+        store.pocket = bagCursorMemory.__lastPocket
+      end
+      if store.pocket == nil then
+        for slotId in pairs(bagCursorMemory) do
+          if type(slotId) == "string" and slotId:sub(1, 2) ~= "__" then
+            store.pocket = slotId
+            break
+          end
+        end
+      end
+      for slotId, row in pairs(bagCursorMemory) do
+        if type(slotId) == "string" and slotId:sub(1, 2) ~= "__"
+            and type(row) == "table" then
+          if cursor[slotId] == nil and type(row.index) == "number" then
+            cursor[slotId] = math.max(1, math.floor(row.index))
+          end
+          if scroll[slotId] == nil and type(row.scroll) == "number" then
+            scroll[slotId] = math.max(0, math.floor(row.scroll))
+          end
+        end
+      end
+      return
+    end
+    local index, scroll = rememberedBagCursor("BAG")
+    if not index then return end
+    if type(game.bagListScrollOffset) ~= "number" then
+      game.bagListScrollOffset = scroll or 0
+    end
+    if type(game.bagSavedMenuItem) ~= "number" then
+      game.bagSavedMenuItem = index - (game.bagListScrollOffset or 0) - 1
+    end
+    if type(game.bagSavedMenuItem) == "number" and game.bagSavedMenuItem < 0 then
+      game.bagSavedMenuItem = 0
+    end
+  end
+
+  -- Capture the bag this screen last left, then refill anything a battle
+  -- boundary wiped -- the pair Screen:openBag runs just before either bag.
+  function Screen:recallBagCursor()
+    self:captureBagCursor()
+    self:seedBagCursor()
+  end
+
   function Screen:openBag()
     self.phase = "submenu"
+    -- BAG CURSOR MEMORY: save where the last battle bag was left, then put
+    -- back whatever the engine's own bytes have lost since (see
+    -- recallBagCursor).  Runs for BOTH generations, before either bag opens.
+    self:recallBagCursor()
     -- Where each party mon's HP stands right now, so a Gen 1 item used out
     -- of the cart's own bag can animate this screen's own HP bar from the
     -- value the player was looking at when the bag opened
@@ -4567,7 +5591,7 @@ return function(mod)
     end
     state.confuseCount = nil
     N.consumeItem(self.game.save, itemId)
-    local name = mon.nickname or mon.name or mon.species
+    local name = FN.displayName(mon)
     self:queueItemResult({ Strings("%s's confused no more!", name) }, nil, nil)
   end
 
@@ -4640,7 +5664,7 @@ return function(mod)
         state.confuseCount = nil
         if not (result and result.used) then
           result = { used = true,
-            text = Strings("%s came to its senses.", displayName(mon)) }
+            text = Strings("%s came to its senses.", FN.displayName(mon)) }
         end
       end
     end
@@ -4774,12 +5798,18 @@ return function(mod)
     local leadMon = lead and lead.mon
     local dex = self.game.save and self.game.save.pokedex
     local caughtDex = dex and (dex.caught or dex.owned)
+    -- The species' own item-evolution target (the Gen II Moon Ball's specialty
+    -- condition); the game's own catch site derives it the same way.
+    local evolveItem
+    for _, entry in ipairs((def and def.evolutions) or {}) do
+      if entry.method == "EVOLVE_ITEM" then evolveItem = entry.item end
+    end
     local caught, shakes, a, chance = N.catchAttempt({
       ball = ballId,
       mon = target.mon,
       def = def,
       hp = target.mon.hp,
-      maxHp = maxHpOf(target.mon),
+      maxHp = FN.maxHpOf(target.mon),
       catchRate = def and def.catchRate,
       status = target.mon.status,
       level = target.mon.level,
@@ -4791,6 +5821,7 @@ return function(mod)
       weightKg = dexEntry and dexEntry.weight
         and (dexEntry.weight * 0.045359237) or nil,
       weight = dexEntry and dexEntry.weight,
+      evolveItem = evolveItem,
       gender = target.mon.gender,
       playerGender = self.game.save and self.game.save.player
         and self.game.save.player.gender,
@@ -4798,7 +5829,15 @@ return function(mod)
       registered = caughtDex and caughtDex[target.mon.species] and true or false,
       turn = self.battle and self.battle.turn,
       battle = self.battle,
-      random = self.battle and self.battle.random,
+      -- The battle's OWN RNG, in the generation-independent 2-argument form.
+      -- `battle.rng` is `love.math.random(a,b)` on the Gen 1 model and
+      -- `loveStyleRng(battle.random)` on the Gen 2 Battle -- both a..b
+      -- inclusive over the SAME stream as `battle.random`, so a 2-argument
+      -- call is correct on either generation and the one-argument/bare-random
+      -- shape can never be mis-called as `rng(0, n)` (which LOVE resolves to a
+      -- constant 1 and turns every throw into a guaranteed catch).  `.random`
+      -- is the fallback for a battle without `.rng`.
+      random = self.battle and (self.battle.rng or self.battle.random),
     })
     -- BOSS CATCH: a wild boss is always caught.  Forced onto the pending
     -- result BEFORE startCatchAnim below, so the native ball plays the
@@ -4834,7 +5873,7 @@ return function(mod)
   -- catch does, only how it is shown.
   function Screen:finishBallThrow(pending)
     local target, caught = pending.target, pending.caught
-    local name = target.mon.nickname or target.mon.name or target.mon.species
+    local name = FN.displayName(target.mon)
     if not caught then
       -- The cart's own line for this wobble count, in the voice of whichever
       -- generation the CATCH FORMULA option selected (the backend owns the
@@ -4851,6 +5890,7 @@ return function(mod)
     -- here rather than needing its own file. Same "added"/"full" shape
     -- g2-Battle-Scene's own catch.lua used.
     self.game.save.party = self.game.save.party or {}
+    local destination = "party"
     if #self.game.save.party < 6 then
       self.game.save.party[#self.game.save.party + 1] = target.mon
       self.overMessage = N.caughtMessage(name)
@@ -4860,6 +5900,7 @@ return function(mod)
       -- The exact storage API is generation-specific and lives in the backend
       -- (native.lua): Gen 2 inserts at the head of gen2 Boxes; Gen 1 uses the
       -- native src/pokemon/Boxes.lua deposit.
+      destination = "box"
       local okBox, where = N.depositCatch(self.game.save, target.mon)
       if okBox then
         self.overMessage = N.caughtMessage(name) .. (where or "")
@@ -4869,6 +5910,25 @@ return function(mod)
           .. " ...but the PC could not be reached."
       end
     end
+    -- POKéDEX REGISTRATION.  The native screens mark the dex inside the very
+    -- method that files the catch (Gen 1's BattleState:storeCaughtMon ->
+    -- markOwned; Gen 2's BattleState:pushCaught -> SetSeenAndCaughtMon), so
+    -- this scene -- which replaces those screens -- owes the same call.  Without
+    -- it the mon reached the party/box but save.pokedex was never touched and
+    -- the caught count never moved.  N.registerCatch also stamps OT (and, on
+    -- Gen 2, the met place/time), and answers whether the row was NEW.
+    local isNew = N.registerCatch(self.game, target.mon, { battle = self.battle })
+    -- Same event and payload the native sites emit, so a mod listening for
+    -- pokemon.caught (wild_forms and friends) sees a scene catch exactly as it
+    -- sees a native one.  pcall'd: a raising listener must never strand the
+    -- battle on the caught screen.
+    pcall(function()
+      Runtime.emit("pokemon.caught", {
+        battle = self.battle, mon = target.mon, species = target.mon.species,
+        isNew = isNew and true or false, ball = pending.ballId,
+        destination = destination, game = self.game,
+      })
+    end)
     self.outcome = "caught"
     self.phase = "over"
   end
@@ -4936,13 +5996,13 @@ return function(mod)
   function Screen:trySwitchIn(mon)
     for _, b in ipairs(self.playerBattlers) do
       if mon == b.mon then
-        self.message = displayName(mon) .. " is already in battle!"
+        self.message = FN.displayName(mon) .. " is already in battle!"
         self.phase = "actionMenu"
         return
       end
     end
     if (mon.hp or 0) <= 0 then
-      self.message = displayName(mon) .. " has no energy left to battle!"
+      self.message = FN.displayName(mon) .. " has no energy left to battle!"
       self.phase = "actionMenu"
       return
     end
@@ -4980,11 +6040,31 @@ return function(mod)
       return
     end
     self.moveListCache = all
-    -- Open the cursor on the first move the engine allows, so a Choice-locked
-    -- mon lands on its locked move instead of a refused row.
+    -- CURSOR MEMORY (see the moveCursorMemory block at the top of this
+    -- file): a mon that has already COMMITTED a move this session re-opens
+    -- the list on that move, so the second turn of a fight does not start
+    -- the cursor back at slot 1.  The remembered value is a move-slot
+    -- index; it is matched against the rows actually on the list, so a slot
+    -- that was forgotten or reordered away simply falls through.  The
+    -- remembered row is only honoured while it is still usable, which keeps
+    -- a Choice-locked mon landing on its locked move rather than on a
+    -- refused row.
     self.moveCursor = 1
-    for i, entry in ipairs(all) do
-      if entry.usable then self.moveCursor = i break end
+    local remembered = rememberedMoveSlot(battler and battler.mon)
+    local rememberedPos
+    if remembered then
+      for i, entry in ipairs(all) do
+        if entry.index == remembered then rememberedPos = i break end
+      end
+    end
+    if rememberedPos and all[rememberedPos] and all[rememberedPos].usable then
+      self.moveCursor = rememberedPos
+    else
+      -- Open on the first move the engine allows, so a Choice-locked mon
+      -- lands on its locked move instead of a refused row.
+      for i, entry in ipairs(all) do
+        if entry.usable then self.moveCursor = i break end
+      end
     end
     self.moveSwapIndex = nil
     self.message = nil
@@ -5000,11 +6080,18 @@ return function(mod)
     end
   end
 
-  function Screen:queueAction(picked, target)
+  function Screen:queueAction(picked, target, fail)
     local battler = self.playerBattlers[self.actingSlotIdx]
+    -- CURSOR MEMORY: the move this slot committed is what the next opening
+    -- of this mon's move list starts on.  Recorded at the commit point (not
+    -- on cursor movement), matching "if battle field pos 1 USES move slot
+    -- 2".  Failure rows are still commits -- a move that was used and
+    -- failed was still used.
+    rememberMoveSlot(battler and battler.mon, picked and picked.index)
     self.queuedActions[#self.queuedActions + 1] = {
       kind = "fight",
-      actor = battler, index = picked.index, slot = picked.slot, def = picked.def, target = target,
+      actor = battler, index = picked.index, slot = picked.slot, def = picked.def,
+      target = target, fail = fail or nil,
     }
     -- The action is now committed -- a move whose target was just picked,
     -- or one that needed no picker -- so this is where the user wants the
@@ -5128,8 +6215,8 @@ return function(mod)
     local id = picked.slot and picked.slot.id
     local eng = self.g9dex and self.g9dex.exports
     local flagsFn = (eng and type(eng.moveFlags) == "function")
-      and eng.moveFlags or moveFlagsFn()
-    return canReachNonAdjacent(id, flagsFn)
+      and eng.moveFlags or FN.moveFlagsFn()
+    return FN.canReachNonAdjacent(id, flagsFn)
   end
 
   -- Neither proximity rule applies: offer the whole live board.
@@ -5297,9 +6384,24 @@ return function(mod)
         self:queueAction(picked, candidates[1])
         self:advanceSlotOrResolve()
       else
-        -- Nobody left to target -- shouldn't reach here (the battle would
-        -- already have ended), kept defensive rather than assumed.
-        self:beginResolving()
+        -- No reachable recipient at all (ROUND 83's positional adjacency
+        -- left every candidate out of range -- a triple-battle wing whose
+        -- only live foes sit in non-adjacent columns).  A move that must aim
+        -- at something is USED and FAILS -- the engine announces it and
+        -- prints "But it failed!", spending the PP -- and that is THIS
+        -- SLOT's outcome alone: queue the failing action and advance so the
+        -- other fielded mons still open their own move menu.  (This branch
+        -- used to call beginResolving, which abandoned the whole per-slot
+        -- selection and left the remaining allies with no menu at all --
+        -- the reported triple-battle bug.)  A self/field/side move has no
+        -- recipient to be missing, so it acts normally, with the first live
+        -- foe as the field-side placeholder the branches above also use.
+        if self:isSpreadMove(picked) or self:needsTargetChoice(picked) then
+          self:queueAction(picked, nil, true)
+        else
+          self:queueAction(picked, aliveEnemies[1])
+        end
+        self:advanceSlotOrResolve()
       end
     end
   end
@@ -5308,7 +6410,7 @@ return function(mod)
     -- A refusal (0-PP pick) takes over F until acknowledged, the way the
     -- native screen's message box replaces the move list.
     if self.message then
-      drawWrapped(self.message, self.fTextX, self.fTextY, self.fChars)
+      FN.drawWrapped(self.message, self.fTextX, self.fTextY, self.fChars)
       return
     end
     -- No "<name>'s move:" header -- the move list starts right at
@@ -5388,7 +6490,7 @@ return function(mod)
   -- The same arrow shape serves the SWITCH cue below: `outline` draws only
   -- each row's two edge pixels (and the tip) so the OWNER of a swap can be
   -- marked with a hollow frame of exactly the selection arrow's size.
-  local function drawArrowGlyph(cx, top, outline)
+  FN.drawArrowGlyph = function(cx, top, outline)
     love.graphics.setColor(0, 0, 0, 1)
     for row = 0, 4 do
       local half = 4 - row
@@ -5417,7 +6519,7 @@ return function(mod)
     local bob = math.floor(love.timer.getTime() * 4) % 2
     local cx = math.floor(mark.x + 0.5)
     local top = math.max(0, math.floor(mark.top) - 8 - bob)
-    drawArrowGlyph(cx, top, false)
+    FN.drawArrowGlyph(cx, top, false)
   end
 
   ------------------------------------------------------------------
@@ -5441,7 +6543,7 @@ return function(mod)
       if ally and self.combat.isAlive(ally) then candidates[#candidates + 1] = slot end
     end
     if #candidates == 0 then
-      self.message = (owner and displayName(owner.mon) or "That Pokemon")
+      self.message = (owner and FN.displayName(owner.mon) or "That Pokemon")
         .. " has no adjacent ally to switch with."
       self.phase = "actionMenu"
       return
@@ -5521,7 +6623,7 @@ return function(mod)
       end
       local cx = math.floor(m.x + 0.5)
       local top = math.max(0, math.floor(m.top) - 8 - bob)
-      drawArrowGlyph(cx, top, outline)
+      FN.drawArrowGlyph(cx, top, outline)
     end
     if self.phase == "swapSelect" then
       markFor(self.playerBattlers[self.actingSlotIdx], true)
@@ -5564,7 +6666,7 @@ return function(mod)
   -- centres on the mons actually there. Returns nil (caller falls back to
   -- the single-target anchor) when no sprite on that side is drawn yet.
   -- `top`/`h` are stamped into self.spriteAnchor by drawContent's sprite pass.
-  local function sideSpriteCentre(screen, side)
+  FN.sideSpriteCentre = function(screen, side)
     local list = (side == "player") and screen.playerBattlers or screen.enemyBattlers
     local sx, sy, n = 0, 0, 0
     for _, b in ipairs(list or {}) do
@@ -5584,7 +6686,7 @@ return function(mod)
   -- Screen:isSpreadMove (which reads a picked slot). Same authority order as
   -- that method: the engine's exported isSpreadMove first, then the
   -- module-local SPREAD_MOVE_IDS last-resort list.
-  local function isSpreadMoveId(screen, id)
+  FN.isSpreadMoveId = function(screen, id)
     if not id then return false end
     local eng = screen.g9dex and screen.g9dex.exports and screen.g9dex.exports.isSpreadMove
     if eng then
@@ -5604,7 +6706,7 @@ return function(mod)
   -- pics, so it has to honour that flag itself.  Scoped to the BALL throw --
   -- the one animation this file starts expecting it -- so no existing move
   -- animation's look changes.
-  local function animHidesMon(screen, side)
+  FN.animHidesMon = function(screen, side)
     local anim = screen.moveAnim
     if not anim then return false end
     -- Gen 1's arm hides the ENEMY mon itself (the ball's target), driven by
@@ -5683,8 +6785,8 @@ return function(mod)
     -- it at that side's sprite-area centre (ROUND 62 rule above), falling
     -- back to the single target's own anchor if the side isn't drawn yet.
     local targetAnchor
-    if isSpreadMoveId(self, def.id) then
-      targetAnchor = sideSpriteCentre(self, (actor.side == "player") and "enemy" or "player")
+    if FN.isSpreadMoveId(self, def.id) then
+      targetAnchor = FN.sideSpriteCentre(self, (actor.side == "player") and "enemy" or "player")
     end
     targetAnchor = targetAnchor or self.spriteAnchor[target]
     if targetAnchor then
@@ -5894,7 +6996,7 @@ return function(mod)
   -- local helper (:81-89, not exported on the class), copied verbatim
   -- rather than reached into, since drawMoveAnimObjects below needs it
   -- too and there's no public path to it.
-  local function sheetForTile(runner, tile)
+  FN.sheetForTile = function(runner, tile)
     for i = #runner.loaded, 1, -1 do
       local entry = runner.loaded[i]
       if tile >= entry.tile and tile < entry.tile + math.max(entry.tiles, 1) then
@@ -5968,7 +7070,7 @@ return function(mod)
       local deltaY = (anim.anchorY + anim.scaleY * (refScreenY - anim.vanillaAnchorY)) - refScreenY
 
       for _, obj in ipairs(cluster) do
-        local entry, index = sheetForTile(runner, obj.tile)
+        local entry, index = FN.sheetForTile(runner, obj.tile)
         if entry and not entry.battler then
           local sheet = (view.data.gfx or {})[entry.gfx]
           local image = sheet and view:image(sheet.image)
@@ -6034,7 +7136,7 @@ return function(mod)
   -- POOF -> SHOWPIC puts the mon back; a capture ends with the closed ball
   -- held in OAM through the caught text (AnimPlayer:finalSprites, native's
   -- lockedBall).  Each row is a separate :start, walked as a FIFO queue.
-  local function gen1AnimRemap(anchor, landAnchor, vanillaActor, vanillaLand)
+  FN.gen1AnimRemap = function(anchor, landAnchor, vanillaActor, vanillaLand)
     local scaleX, scaleY = 1, 1
     if anchor and landAnchor and vanillaActor and vanillaLand then
       local vdx = vanillaLand.x - vanillaActor.x
@@ -6048,7 +7150,7 @@ return function(mod)
   -- Connected components of a step's on-screen sprites, joined when their
   -- OAM positions are 8px-grid adjacent.  Off-screen (hardware-clipped)
   -- sprites are dropped first, exactly as AnimPlayer:drawSprites hides them.
-  local function gen1AnimGroups(sprites)
+  FN.gen1AnimGroups = function(sprites)
     local live = {}
     for i = 1, #sprites do
       local s = sprites[i]
@@ -6185,7 +7287,7 @@ return function(mod)
     if not sprites then return end
     local G = love.graphics
     G.setColor(1, 1, 1, 1)
-    for _, group in ipairs(gen1AnimGroups(sprites)) do
+    for _, group in ipairs(FN.gen1AnimGroups(sprites)) do
       local ref = group[1]
       local refX = ref.x - MOVE_ANIM_OAM_X_BIAS
       local refY = ref.y - MOVE_ANIM_OAM_Y_BIAS
@@ -6221,11 +7323,11 @@ return function(mod)
     local vanillaActor = (actor.side == "player") and VANILLA_PLAYER_ANCHOR or VANILLA_ENEMY_ANCHOR
     local vanillaTarget = (actor.side == "player") and VANILLA_ENEMY_ANCHOR or VANILLA_PLAYER_ANCHOR
     local targetAnchor
-    if isSpreadMoveId(self, def.id) then
-      targetAnchor = sideSpriteCentre(self, (actor.side == "player") and "enemy" or "player")
+    if FN.isSpreadMoveId(self, def.id) then
+      targetAnchor = FN.sideSpriteCentre(self, (actor.side == "player") and "enemy" or "player")
     end
     targetAnchor = targetAnchor or self.spriteAnchor[target]
-    local scaleX, scaleY = gen1AnimRemap(anchor, targetAnchor, vanillaActor, vanillaTarget)
+    local scaleX, scaleY = FN.gen1AnimRemap(anchor, targetAnchor, vanillaActor, vanillaTarget)
     local anim = {
       gen1 = true,
       player = AnimPlayer.new(animsData),
@@ -6260,7 +7362,7 @@ return function(mod)
       or self.playerBattlers[1]
     local throwerAnchor = thrower and self.spriteAnchor[thrower]
     local actorAnchor = throwerAnchor or VANILLA_PLAYER_ANCHOR
-    local scaleX, scaleY = gen1AnimRemap(actorAnchor, targetAnchor,
+    local scaleX, scaleY = FN.gen1AnimRemap(actorAnchor, targetAnchor,
       VANILLA_PLAYER_ANCHOR, VANILLA_ENEMY_ANCHOR)
     local ball = pending.ballId or "POKE_BALL"
     -- The modern formula's own wobble count (its four shake checks), which
@@ -6410,7 +7512,16 @@ return function(mod)
       end
       self.battle.expSharePending = nil
     end
-    for _, e in ipairs(N.takeEvents(self.battle)) do events[#events + 1] = e end
+    for _, e in ipairs(N.takeEvents(self.battle)) do
+      -- wEvolvableFlags, set from the model's own per-level event -- the exact
+      -- moment the cart sets the slot's bit (see self.g9EvolvableFlags' note in
+      -- Screen.new).  `index` is the party slot; a Gen 1 model emits no such
+      -- event, so this is the Gen 2 half only.
+      if e.kind == "level" and e.index then
+        self.g9EvolvableFlags[e.index] = true
+      end
+      events[#events + 1] = e
+    end
     return events
   end
 
@@ -6468,6 +7579,7 @@ return function(mod)
     -- does not) -- false means the whole-turn batch below runs instead.
     self.movesBegun = false
     self.stepwise = false
+    self.stepwiseBegun = false
     self.currentMessage = nil
     self.pendingEvents = {}
     self.phase = "resolving"
@@ -6504,29 +7616,65 @@ return function(mod)
   --
   -- battle_forms performs the real change from `battle.turn_started`
   -- (src/mega.lua's activate -> Forms.becomeForm), which this screen raises
-  -- at the head of a resolve pass.  The animation has to play BEFORE that, so
-  -- the charge, the aura, the orb and the whitening all play over the OLD
-  -- sprite and the swap itself is hidden inside the clip's white flash.
-  -- So the pass no longer raises the event itself: it hands the turn to
-  -- evolution_anim.lua (startEvolutionAnim), which raises it on its own
-  -- reveal beat (revealEvolution -> applyGimmickActivation).  Everything else
-  -- about the activation is UNCHANGED by the split: the same owner focus, the
-  -- same armed/consumed refusal detection, the same FORMS_EVENT
-  -- announcements, the same once-per-battle limit (which lives in
-  -- battle_forms, not here), and the same stepwise beginTurn right after.
+  -- ONCE at the head of a resolve pass, for BOTH sides -- see the GIMMICK
+  -- SEQUENCE block below, which then stages every transformation that landed
+  -- (the player's and the enemy trainer's, in the turn's own action order) by
+  -- playing each clip now over the OLD sprite, with the swap hidden inside the
+  -- clip's own white flash.
   --
-  -- Only MEGA is staged.  Dynamax/Terastal/Z-Moves share battle_forms' one
-  -- activation seam but their own visual language is not this clip's, so they
-  -- keep the old immediate activation -- as does a build with no animation
-  -- sibling, or a mega this screen cannot place on the field.
+  -- WHY ONE RAISE FOR EVERYTHING: mega, Tera, Dynamax and Z-Moves all resolve
+  -- from the same `battle.turn_started` listener, so raising it once lets all
+  -- of them fire on the same turn and lets the ENEMY trainer transform on the
+  -- same turn the player does.  The activation is deliberately split from the
+  -- show: the mechanic lands first, then the clips costume it, and the turn is
+  -- held until the whole set piece -- including each sprite swap and the Tera
+  -- crystal film -- is really drawable, so no move's damage is delivered early.
   --
-  -- The clip is held for its whole duration: Screen:updateResolving returns
-  -- early while self.evolve is set and Screen:update steps the clip (so a
-  -- mashed button can never skip a once-per-battle transformation), with an
-  -- 8-second safety valve that abandons the costume and still performs the
-  -- change -- a broken animation must never cost the player the mechanic.
+  -- MEGA is staged by this block's clip; DYNAMAX and TERA have their own
+  -- blocks further down.  Z-Moves have no clip of their own (battle_forms
+  -- announces and spends them at the same raise) but share the seam, so a
+  -- Z-Move turn costs nothing extra here.
+  --
+  -- Every staged clip holds the turn for its whole duration: Screen:update
+  -- steps the clip phase-independently (so a mashed button can never skip a
+  -- once-per-battle transformation), Screen:advanceResolving refuses to step
+  -- the turn while any clip is live, and each clip carries a long SAFETY
+  -- valve (Ev.SAFETY) that abandons the costume and still performs the change
+  -- -- a broken animation must never cost the player the mechanic.
+  --
+  -- TWO THINGS THE COSTUME OWES THE CHANGE (both user-reported, round
+  -- two-hundred-and-fifty-eight):
+  --
+  --   * THE SWAP HIDES UNDER THE WHITE.  The reveal beat sits deliberately
+  --     inside the clip's SOLID-white window (evolution_anim's FLASH_IN to
+  --     FLASH_OUT), so the frame the old sprite becomes the new one has
+  --     nothing but white on it.  That is what keeps the substitution itself
+  --     off the player's screen.
+  --
+  --   * AND THE WHITE WAITS FOR THE NEW ART.  A sprite pack bakes a form's
+  --     sheet lazily, so the pixels for the NEW form may not exist for a few
+  --     frames after the change.  If the clip simply ran on, the white would
+  --     lift on a still-baking (blank) sprite and the new art would pop in
+  --     after -- the swap the flash exists to hide, shown a beat too late.  So
+  --     once the change has landed the clip is FROZEN on the reveal beat --
+  --     the solid-white window -- until Ev.artReady reports the new art can
+  --     actually be drawn, or Ev.HOLD_MAX gives up.  The cap keeps
+  --     a pack that never answers to a couple of seconds, and the safety valve
+  --     keeps running throughout, so a hold can still never cost the turn.
+  --
+  -- The sequence is also CENTRED ON THE ART, not on the sprite anchor: a pack
+  -- bakes one union canvas per animation, so a creature sitting off-centre in
+  -- its own frame would otherwise have every circle drawn off to one side.
+  -- startEvolutionAnim measures and passes `cx`; see Ev.artShift.
   ------------------------------------------------------------------
-  local EVOLUTION_SAFETY = 8.0
+  Ev.SAFETY = 30.0
+  -- How long the reveal beat may be held waiting for the new form's art, in
+  -- seconds.  Deliberately long: the user's own rule is that the sequence must
+  -- PLAY OUT rather than be cut short, and the wait it covers is only a lazy
+  -- pixel bake (a second or two at worst).  It is a backstop against a pack
+  -- that never produces the image at all, not a display budget -- a real bake
+  -- always lands long before it.
+  Ev.HOLD_MAX = 30.0
 
   -- The evolving battler's whiten amount and size multiplier this frame, or
   -- nil for every other battler.  Read by drawContent's sprite pass.
@@ -6542,7 +7690,7 @@ return function(mod)
   -- Where the clip should play: the battler's own spriteAnchor (filled by the
   -- sprite pass every frame, so it is the box that was really drawn) with the
   -- slot rect as the fallback for a frame before the first sprite pass.
-  local function evolutionBox(self, battler)
+  function Ev.box(self, battler)
     local side, slot
     for i, b in ipairs(self.enemyBattlers) do
       if b == battler then side, slot = "enemy", i break end
@@ -6563,18 +7711,208 @@ return function(mod)
              w = r.w, h = r.h, side = side }
   end
 
+  -- --- where the sequence is drawn ---------------------------------------
+  --
+  -- Ev.box above hands the clip the ANCHOR the field draws the sprite
+  -- on.  What the show should be centred on, though, is the art the player can
+  -- see -- and those two are not always the same point.  A sprite pack bakes a
+  -- frame as ONE canvas for the whole animation (the union of every frame's
+  -- content, so the sprite never jitters as it animates), which means a frame
+  -- whose art does not fill that canvas symmetrically is DRAWN off-centre: the
+  -- anchor sits on the canvas' middle while the creature's body sits left or
+  -- right of it.  A perfect circle built on the anchor then reads as an
+  -- off-centre bubble around the Pokemon -- exactly the defect this measures
+  -- away (user-reported, round two-hundred-and-fifty-eight).
+  --
+  -- The measurement is the centre of the pixels the frame really paints, read
+  -- back ONCE per transformation (a few dozen milliseconds at worst, on a beat
+  -- that is already a three-second set piece).  It is deliberately best-effort:
+  -- an image with no pixel reader answers nil and the anchor is used unchanged,
+  -- so nothing here can make a transformation fail.
+
+  -- The image, bake flag and draw inputs the sprite pass would use for
+  -- `battler` THIS frame, resolved without drawing.  nil when there is no art
+  -- (or none yet).  `resolveSprite` is this file's own resolver, so this is the
+  -- same picture -- and the same bake request -- the field itself makes.
+  function Ev.art(self, battler)
+    if type(FN.resolveSprite) ~= "function" or not battler then return nil end
+    local side, slot
+    for i, b in ipairs(self.enemyBattlers or {}) do
+      if b == battler then side, slot = "enemy", i break end
+    end
+    if not side then
+      for i, b in ipairs(self.playerBattlers or {}) do
+        if b == battler then side, slot = "player", i break end
+      end
+    end
+    if not side then return nil end
+    local rects
+    if type(self.slotRects) == "function" then
+      local ok, enemyRects, playerRects = pcall(self.slotRects, self)
+      if ok then rects = (side == "enemy") and enemyRects or playerRects end
+    end
+    local r = rects and rects[slot]
+    if not (r and r.w) and type(self.slotRectFor) == "function" then
+      local ok, fallback = pcall(self.slotRectFor, self, side, slot)
+      if ok then r = fallback end
+    end
+    if not (r and r.w) then return nil end
+    local boss = (side == "enemy") and self.isBoss and slot == 1 or false
+    local field
+    if type(self.spriteArt) == "function" then
+      local ok, f = pcall(self.spriteArt, self, side)
+      if ok and type(f) == "string" then field = f end
+    end
+    if not field then
+      field = (side == "player") and "spriteBack" or "spriteFront"
+    end
+    local scaleMul = (side == "player") and self.spriteScaleBack
+      or self.spriteScaleFront
+    local ok, img, naturalBake = pcall(FN.resolveSprite, r, boss, battler, field,
+      self.data, scaleMul)
+    if not ok or not img then return nil end
+    return img, naturalBake
+  end
+
+  -- How far (design px) the pixels an image really paints sit from that
+  -- image's own centre.  Positive means the art is right of centre.  nil when
+  -- the image cannot be read back at all, and 0-ish for art that is centred.
+  -- Split out from the caller so the harness can feed it a synthetic frame.
+  function Ev.artShiftX(img, naturalBake)
+    if type(img) ~= "table" then return nil end
+    local id
+    for _, getter in ipairs({ "newImageData", "getData" }) do
+      local fn = img[getter]
+      if type(fn) == "function" then
+        local ok, data = pcall(fn, img)
+        if ok and type(data) == "table" then id = data break end
+      end
+    end
+    if not (id and type(id.getPixel) == "function"
+        and type(id.getWidth) == "function"
+        and type(id.getHeight) == "function") then
+      return nil
+    end
+    local okAll, shift = pcall(function()
+      local w, h = id:getWidth(), id:getHeight()
+      if not (w and h and w > 1 and h > 1) then return nil end
+      local minX, maxX
+      -- Every column, every other row: an outline or a wing tip is always more
+      -- than one pixel tall, so a half-height scan still finds both edges and
+      -- costs half the readback.
+      for x = 0, w - 1 do
+        local hit = false
+        for y = 0, h - 1, 2 do
+          local _, _, _, a = id:getPixel(x, y)
+          -- Alpha is 0..1 on a modern build and 0..255 on an old one; "any
+          -- visible pixel" is the same test either way.
+          if a and a > 0.1 then hit = true break end
+        end
+        if hit then
+          if not minX then minX = x end
+          maxX = x
+        end
+      end
+      if not (minX and maxX and maxX > minX) then return nil end
+      -- Image pixels are CANVAS pixels for a natural bake (the pack's frames)
+      -- and design pixels for a vanilla pic -- the same divisor drawSprite's
+      -- own blit scale uses, so the shift comes back in design px either way.
+      local perImagePx = naturalBake and (1 / DS) or 1
+      return ((minX + maxX) / 2 - w / 2) * perImagePx
+    end)
+    if okAll and type(shift) == "number" then return shift end
+    return nil
+  end
+
+  -- The shift to draw the sequence at for `battler`, or nil when the anchor is
+  -- the best answer available.
+  function Ev.artShift(self, battler)
+    local ok, img, naturalBake = pcall(Ev.art, self, battler)
+    if not ok or not img then return nil end
+    local okM, shift = pcall(Ev.artShiftX, img, naturalBake)
+    if okM and type(shift) == "number" then return shift end
+    return nil
+  end
+
+  -- Is the battler's CURRENT art drawable this frame?  Raised by
+  -- updateEvolution while the screen is held solid white, so a form whose sheet
+  -- is still baking cannot pop in after the white has gone: the clip is simply
+  -- frozen on its reveal beat (which IS the solid-white window) until this
+  -- answers true, or until Ev.HOLD_MAX gives up on it.
+  --
+  -- Answers true whenever there is nothing to wait for -- no frame seam at all,
+  -- or a probe that raised -- so this can never be the reason a turn stalls.
+  function Ev.artReady(self, battler)
+    local okHook, wants = pcall(function()
+      return (Runtime and type(Runtime.wantsHook) == "function")
+        and Runtime.wantsHook("battle.mon_pic")
+    end)
+    if not okHook or not wants then return true end
+    local ok, img = pcall(Ev.art, self, battler)
+    if not ok then return true end
+    return img ~= nil
+  end
+
+  -- Which mon the sequence should play around when a mega is on its way.  The
+  -- owner this scene recorded, else the first player battler -- which is where
+  -- the activation lands anyway when nothing re-focused battle.player, so the
+  -- animation and the form change still name the same Pokemon.
+  function Screen:megaStageMon()
+    if self.gimmickOwnerMon then return self.gimmickOwnerMon end
+    for _, b in ipairs(self.playerBattlers) do
+      if b and b.mon then return b.mon end
+    end
+    return nil
+  end
+
   -- Starts the staged sequence for `mon`, or answers false when there is
   -- nothing to stage -- not a mega, no animation module, no on-field battler.
-  function Screen:startEvolutionAnim(mon)
-    if not (Evolution and type(Evolution.new) == "function") then return false end
-    if not mon then return false end
-    if self.gimmickOwnerId ~= "mega" then return false end
+  function Screen:startEvolutionAnim(mon, opts)
+    -- What counts is "is a mega about to happen", never "did this file record
+    -- it": a mega this scene armed sets gimmickOwnerId, and one battle_forms
+    -- itself is holding armed (a build or a path that did not record an owner
+    -- here) answers through the peer's own published armed(). The sequence is
+    -- costuming, so it must never be the reason a mega silently does not
+    -- happen -- hence the loud one-line reasons below whenever a mega is
+    -- definitely on its way and the animation cannot be built for it.
+    -- `opts.force` (the GIMMICK SEQUENCE's own call, after the transformation has
+    -- ALREADY landed) skips the armed test: the screen detected this form change
+    -- and owns the staging, so the check would only ever refuse its own work.
+    local mega = (opts and opts.force)
+      or (self.gimmickOwnerId == "mega") or (FN.battleFormsArmedId() == "mega")
+    if not (Evolution and type(Evolution.new) == "function") then
+      if mega then
+        mod.log:warn("g9_Battle_Scene: mega is armed but the evolution animation "
+          .. "module is not loaded -- the form change runs without the sequence")
+      end
+      return false
+    end
+    if not mon then
+      if mega then
+        mod.log:warn("g9_Battle_Scene: mega is armed but no on-field battler was "
+          .. "found for it -- the form change runs without the sequence")
+      end
+      return false
+    end
+    if not mega then return false end
     local battler = self:battlerFor(mon)
-    if not battler then return false end
-    local box = evolutionBox(self, battler)
-    if not box then return false end
+    if not battler then
+      mod.log:warn("g9_Battle_Scene: mega is armed for %s but its battler is not "
+        .. "on the field -- the form change runs without the sequence",
+        tostring(FN.displayName(mon)))
+      return false
+    end
+    local box = Ev.box(self, battler)
+    if not box then
+      mod.log:warn("g9_Battle_Scene: mega is armed for %s but no sprite box could "
+        .. "be resolved -- the form change runs without the sequence",
+        tostring(FN.displayName(mon)))
+      return false
+    end
+    local shift = Ev.artShift(self, battler)
     local ok, clip = pcall(Evolution.new, {
-      x = box.x, top = box.top, feet = box.feet, w = box.w, h = box.h,
+      x = box.x, cx = box.x + (shift or 0),
+      top = box.top, feet = box.feet, w = box.w, h = box.h,
       side = box.side, vw = VW, vh = VH,
     })
     if not (ok and type(clip) == "table") then
@@ -6582,9 +7920,21 @@ return function(mod)
         tostring(clip))
       return false
     end
-    self.evolve = { clip = clip, owner = mon, battler = battler, applied = false }
+    local already = (opts and opts.already) and true or false
+    self.evolve = { clip = clip, owner = mon, battler = battler,
+                    applied = already, artShift = shift }
+    -- The sequence is playing over the mon's OLD art: hold the form change
+    -- back until the clip's reveal beat (revealEvolution drops the hold, which
+    -- is the frame the new form's art is requested -- see resolveSprite).
+    if already and type(battler) == "table" then battler.__g9FormHold = true end
     clip.onReveal = function() self:revealEvolution() end
-    self.currentMessage = displayName(mon) .. " is Mega Evolving!"
+    self.currentMessage = FN.displayName(mon) .. " is Mega Evolving!"
+    if shift and math.abs(shift) >= 0.5 then
+      -- Named out loud: if a future report says the sequence sits off-centre,
+      -- this line is what says whether the art was measured and by how much.
+      mod.log:info("g9_Battle_Scene: mega sequence centred %.1fpx off the sprite "
+        .. "anchor (the art sits off-centre in its own frame)", shift)
+    end
     return true
   end
 
@@ -6597,51 +7947,92 @@ return function(mod)
   -- emit is focused on the FORM's owner (see the GIMMICK SELECT section's
   -- FORMS OWNER block) because battle_forms' activate() reads battle.player,
   -- and restored the moment the listener returns.
-  function Screen:applyGimmickActivation(formsMon)
+  function Screen:applyGimmickActivation(formsMon, item)
     self.movesBegun = true
-    local armedBefore = battleFormsArmedId()
-    focusBattlePlayer(self, formsMon, function()
+    -- The arm and the raise both happen INSIDE the focus, because arming a
+    -- move-substituting gimmick (Dynamax's Max Moves, a Z-Move) dispatches the
+    -- mechanic's own arm() hook against battle.player -- it has to be the mon
+    -- that armed it, exactly as the native cell's own arming is focused.
+    --
+    -- When the caller names the gimmick (`item`), make sure THAT one is the
+    -- armed id before the raise: battle_forms holds a single armed slot, so a
+    -- turn with more than one acting Pokemon would otherwise activate only the
+    -- last-armed one.  The armed id is read AFTER the arm so the consumed
+    -- check below is about this gimmick.
+    local armedBefore
+    local emitted = FN.focusBattlePlayer(self, formsMon, function()
+      if item and item.id then
+        if not FN.battleFormsArm(item.id) then
+          -- battle_forms refused to arm it (a spent id, or a build without the
+          -- arm seam).  Raise nothing for this one: emitting with a stale armed
+          -- id would activate somebody else's gimmick.
+          return false
+        end
+      end
+      armedBefore = FN.battleFormsArmedId()
       Runtime.emit("battle.turn_started", { battle = self.battle })
+      return true
     end)
+    if emitted == false then return false end
     if formsMon and armedBefore ~= nil then
+      local id = (item and item.id) or self.gimmickOwnerId
+      local label = (item and item.label) or self.gimmickOwnerLabel
+      local slot = (item and item.slot) or self.gimmickOwnerSlot
       -- Consuming clears the armed id; battle_forms only consumes when the
       -- entry actually activated, so a still-armed id is a refusal.
-      if battleFormsArmedId() == nil then
-        emitFormsEvent(self, "used", { mon = formsMon,
-          slot = self.gimmickOwnerSlot, id = self.gimmickOwnerId,
-          label = self.gimmickOwnerLabel })
+      if FN.battleFormsArmedId() == nil then
+        FN.emitFormsEvent(self, "used", { mon = formsMon,
+          slot = slot, id = id, label = label })
       else
-        emitFormsEvent(self, "cancelled", { mon = formsMon,
-          slot = self.gimmickOwnerSlot, id = self.gimmickOwnerId,
-          label = self.gimmickOwnerLabel, reason = "activation-refused" })
+        FN.emitFormsEvent(self, "cancelled", { mon = formsMon,
+          slot = slot, id = id, label = label, reason = "activation-refused" })
       end
     end
-    clearGimmickOwner(self)
+    FN.clearGimmickOwner(self)
     -- Stepwise Gen 1 resolution: begin this turn's REAL order NOW, then
     -- resolve ONE actor per pass below, so each actor's own events -- and the
     -- sprite/stat changes that go with them -- are DISPLAYED before the next
     -- actor resolves. Gen 2 -- and any engine without the stepwise arm --
     -- returns false here and falls through to the whole-turn batch, unchanged.
-    self.stepwise = (type(self.combat.beginTurn) == "function")
-      and self.combat.beginTurn(self.g9dex, self.battle, self.moveQueue)
-      or false
+    -- Guarded so a turn that activates SEVERAL gimmicks still begins the order
+    -- exactly once.
+    if not self.stepwiseBegun then
+      self.stepwiseBegun = true
+      self.stepwise = (type(self.combat.beginTurn) == "function")
+        and self.combat.beginTurn(self.g9dex, self.battle, self.moveQueue)
+        or false
+    end
+    return true
   end
 
   -- The clip's reveal beat: run the real activation, which is the frame the
   -- old sprite becomes the new one (under the full-white flash).
   function Screen:revealEvolution()
     local ev = self.evolve
-    if not (ev and not ev.applied) then return end
-    ev.applied = true
-    local ok, err = pcall(self.applyGimmickActivation, self, ev.owner)
-    if not ok then
-      mod.log:warn("g9_Battle_Scene: mega activation during the animation failed: %s",
-        tostring(err))
-      self.movesBegun = true
-      clearGimmickOwner(self)
+    if not ev then return end
+    if not ev.applied then
+      -- Staged BEFORE the activation (the old path): perform it now, under the
+      -- full-white flash, so the swap is hidden.
+      ev.applied = true
+      local ok, err = pcall(self.applyGimmickActivation, self, ev.owner)
+      if not ok then
+        mod.log:warn("g9_Battle_Scene: mega activation during the animation failed: %s",
+          tostring(err))
+        self.movesBegun = true
+        FN.clearGimmickOwner(self)
+      end
     end
+    -- The reveal is the frame the new form becomes the one the field draws:
+    -- drop the hold and restart the art-ready wait, so the clip stays frozen on
+    -- the white flash until the form's own sheet is really drawable.  A form
+    -- change swaps the whole sheet, so without the restart the new art could
+    -- pop in after the flash was already gone.
+    ev.revealed = true
+    self:releaseGimmickHold(ev.battler)
+    ev.artReady = false
+    ev.holdT = 0
     if ev.owner then
-      self.currentMessage = displayName(ev.owner) .. " Mega Evolved!"
+      self.currentMessage = FN.displayName(ev.owner) .. " Mega Evolved!"
     end
   end
 
@@ -6655,29 +8046,50 @@ return function(mod)
         ev.applied = true
         pcall(self.applyGimmickActivation, self, ev.owner)
       end
+      self:releaseGimmickHold(ev.battler)
       self.evolve = nil
+      self:finishGimmickAnim()
       return
     end
-    local ok, err = pcall(Evolution.step, ev.clip, dt)
+    -- Hold the reveal beat until the NEW form's art can be drawn (see the
+    -- MEGA EVOLUTION block: the beat is inside the clip's solid-white window,
+    -- so the screen simply stays white rather than lifting on a still-baking
+    -- sheet).  Gated on the REVEAL having fired (`ev.revealed`), never on
+    -- `applied` alone: a pre-activated sequence runs with applied=true from
+    -- frame zero, and gating on that would freeze the clip at t=0 instead of
+    -- on the white flash it is meant to park on.
+    local hold = false
+    if ev.applied and ev.revealed and not ev.artReady then
+      ev.holdT = (ev.holdT or 0) + (dt or 0)
+      if Ev.artReady(self, ev.battler) then
+        ev.artReady = true
+      elseif ev.holdT <= Ev.HOLD_MAX then
+        hold = true
+      end
+    end
+    local ok, err = pcall(Evolution.step, ev.clip, dt, hold)
     if not ok then
       mod.log:warn("g9_Battle_Scene: mega evolution animation failed: %s", tostring(err))
       if not ev.applied then
         ev.applied = true
         pcall(self.applyGimmickActivation, self, ev.owner)
       end
+      self:releaseGimmickHold(ev.battler)
       self.evolve = nil
+      self:finishGimmickAnim()
       return
     end
     ev.elapsed = (ev.elapsed or 0) + (dt or 0)
-    if ev.clip.done or ev.elapsed > EVOLUTION_SAFETY then
+    if ev.clip.done or ev.elapsed > Ev.SAFETY then
       -- Safety valve: a clip that never reports done still performs the
       -- change and lets the turn finish.
       if not ev.applied then
         ev.applied = true
         pcall(self.applyGimmickActivation, self, ev.owner)
       end
+      self:releaseGimmickHold(ev.battler)
       self.evolve = nil
-      self:advanceResolving()
+      self:finishGimmickAnim()
     end
   end
 
@@ -6690,9 +8102,1215 @@ return function(mod)
     if not (Evolution and type(Evolution.draw) == "function") then return end
     local ok, err = pcall(Evolution.draw, ev.clip)
     if not ok then
-      mod.log:warn("g9_Battle_Scene: mega evolution draw failed: %s", tostring(err))
-      self.evolve = nil
+      -- NEVER cancel the sequence over a DRAW failure.  The clip's reveal beat
+      -- is what performs the form change, so clearing self.evolve here would
+      -- silently drop the whole transformation (no animation AND no mega).
+      -- Log once and keep stepping: the next frame may draw fine, and if it
+      -- never does, the clip still finishes and the change still lands.
+      if not ev.drawWarned then
+        ev.drawWarned = true
+        mod.log:warn("g9_Battle_Scene: mega evolution draw failed (%s) -- the "
+          .. "sequence keeps running and the form change still lands",
+          tostring(err))
+      end
     end
+  end
+
+  ------------------------------------------------------------------
+  -- DYNAMAX / GIGANTAMAX -- the staged transformation animation.
+  ------------------------------------------------------------------
+  -- Exactly the MEGA block's shape one section up, with two differences that
+  -- matter:
+  --
+  --   * The clip is drawn in TWO LAYERS.  Dynamax has to show the creature as
+  --     a black silhouette standing inside a furnace of red light, and light
+  --     "behind" the creature is something a clip drawn after the sprites can
+  --     never fake -- so the clip owns a BACK layer (the dim, the red furnace,
+  --     the far half of its cloud) which drawContent raises BEFORE the sprite
+  --     pass, and a FRONT layer (the energy, the flash, the near cloud) which
+  --     is drawn where the mega sequence is.  See dynamax_anim.lua's
+  --     drawBack/draw.
+  --
+  --   * The creature is DARKENED rather than whitened while the clip runs
+  --     (Screen:dynamaxFx -> drawSprite's `darken`), which is what turns it
+  --     into the silhouette.
+  --
+  -- The actual form change is battle_forms', performed on this clip's reveal
+  -- beat (Screen:revealDynamax) under the clip's solid-white window, exactly
+  -- like the mega one.  The SIZE LADDER (x1 -> 1.50 in phases) is g9-battle-sprites'
+  -- own; it starts the moment the change lands and runs on real time, so this
+  -- clip only has to cover the reveal it is hidden behind.  Nothing here waits
+  -- on it.
+  ------------------------------------------------------------------
+  Ev.dyn = Ev.dyn or {}
+  Ev.dyn.SAFETY = 30.0
+  -- Long on purpose, like the mega one: the reveal beat must WAIT for the
+  -- transformation to be fully staged rather than being cut short (the user's
+  -- own protection rule).  A real bake lands far inside this; it only ever
+  -- fires for a pack that never produces the image at all.
+  Ev.dyn.HOLD_MAX = 30.0
+  -- The dynamax animation module, on the `Ev` table rather than in a local of
+  -- its own (see the note by `Evolution`: this function is at the 200-local
+  -- ceiling).  Nil when this build has no sibling file, and every use below is
+  -- guarded, so a missing animation can only ever make a dynamax change
+  -- silently -- never break the turn.
+  Ev.dyn.anim = Ev.dyn.anim or mod.exports.battleSceneDynamaxAnim
+
+  -- Does battle_forms' gimmick id name Dynamax?  The id strings come from the
+  -- engine's formapi (src/dynamax.lua's own registration), not from this file,
+  -- so this matches on the NAME rather than pinning one spelling: the mega id
+  -- this file already relies on is "mega", and its sibling is some spelling of
+  -- "dynamax".  Matching "dyna" (plus the common short forms) cannot collide
+  -- with any other mechanic it is plausible for formapi to register, and a
+  -- build that names it something else entirely simply keeps the old
+  -- immediate activation -- the animation is costuming and never a gate.
+  function Ev.dyn.isId(id)
+    if type(id) ~= "string" then return false end
+    id = id:lower()
+    return id:find("dyna", 1, true) ~= nil
+      or id == "dmax" or id == "gmax" or id == "gigantamax"
+  end
+
+  -- The growing battler's darken amount this frame, or nil for every other
+  -- battler.  Read by drawContent's sprite pass and handed to drawSprite.
+  function Screen:dynamaxFx(battler)
+    local dx = self.dynamax
+    if not (dx and dx.clip and dx.battler == battler) then return nil end
+    if not (Ev.dyn.anim and type(Ev.dyn.anim.darken) == "function") then return nil end
+    local ok, v = pcall(Ev.dyn.anim.darken, dx.clip)
+    if ok and tonumber(v) then return tonumber(v) end
+    return 0
+  end
+
+  -- Which mon the sequence should play around when a dynamax is on its way.
+  -- Same rule as the mega one: the owner this scene recorded, else the first
+  -- player battler, which is where the activation lands anyway.
+  function Screen:dynamaxStageMon()
+    if self.gimmickOwnerMon then return self.gimmickOwnerMon end
+    for _, b in ipairs(self.playerBattlers) do
+      if b and b.mon then return b.mon end
+    end
+    return nil
+  end
+
+  -- Is a dynamax definitely on its way?  The owner this scene recorded, or
+  -- battle_forms' own armed id (a path that never recorded an owner here).
+  function Screen:dynamaxArmed()
+    return Ev.dyn.isId(self.gimmickOwnerId) or Ev.dyn.isId(FN.battleFormsArmedId())
+  end
+
+  ------------------------------------------------------------------
+  -- THE DYNAMAX HP SKIN -- the (30 + L)/20 multiplier, shown.
+  ------------------------------------------------------------------
+  -- battle_forms delivers the Dynamax HP bonus as REDUCED INCOMING DAMAGE
+  -- (its src/hpscale.lua deliberately never writes max/current HP, which are
+  -- save data) and paints its own readout through `battle.overlay` -- a hook
+  -- the VANILLA battle screen fires and this scene, which replaces that
+  -- screen, never does.  So a Dynamaxed mon's real numbers never move here and
+  -- the scene had nothing at all to show for the multiplier.
+  --
+  -- This is the scene's own DRAW-ONLY answer: a visual skin over the readout,
+  -- never a write.  Nothing here assigns to mon.stats.hp / mon.maxHp / mon.hp,
+  -- and the skin is keyed on the SCREEN (to the mon's table), not stored on the
+  -- mon -- so no save state is touched.  Every path that ends a Dynamax (faint,
+  -- switch, battle end, the 3-turn expiry) drops the skin, so the readout snaps
+  -- back to the real values the instant the mon reverts.
+  --
+  -- The curve is the user's own spec, in seconds from the sequence's start:
+  --   0.0 - 1.0   only the MAX climbs, x1 -> x(30+L)/20; the bar's fill ratio
+  --               dips (a bigger pool, the same current HP).
+  --   1.0 - 2.0   the CURRENT climbs to match, x1 -> x(30+L)/20, so the fill
+  --               returns to its old ratio -- now read as scaledC/scaledMax.
+  -- After 2.0 both hold at the multiplier for the rest of the Dynamax.
+  --
+  -- Because the real damage battle_forms lets through is dmg/M and this skin
+  -- multiplies the numbers back up by M, the damage the player reads is the
+  -- RAW hit -- the user's "damage shown multiplied by the multiplier".
+  -- Screen:spawnDmgNumber applies the same M to the floating label so the
+  -- number and the bar agree.
+  Ev.dyn.HP_MAX_T = 1.0
+  Ev.dyn.HP_CUR_T = 2.0
+
+  -- The effective Dynamax Level for `mon`, the engine consumer's own
+  -- precedence: the engine's per-mon level, else its per-save progression,
+  -- else battle_forms' mirrored stamp.
+  function Ev.dyn.levelOf(screen, mon)
+    local eng = screen.g9dex and screen.g9dex.exports
+    if eng then
+      if type(eng.getMonDynamaxLevel) == "function" then
+        local ok, lv = pcall(eng.getMonDynamaxLevel, mon)
+        if ok and lv ~= nil then return lv end
+      end
+      if type(eng.getDynamaxLevel) == "function" then
+        local ok, lv = pcall(eng.getDynamaxLevel)
+        if ok and lv ~= nil then return lv end
+      end
+    end
+    local lv = mon and mon.battleFormsDynamaxLevel
+    if type(lv) == "number" then return lv end
+    return 0
+  end
+
+  -- (30 + L)/20 as numerator/denominator -- x1.5 at L0, x2 at L10, the exact
+  -- rational battle_forms' hpscale reads.
+  function Ev.dyn.multiplierOf(screen, mon)
+    local lv = math.floor(tonumber(Ev.dyn.levelOf(screen, mon)) or 0)
+    if lv < 0 then lv = 0 elseif lv > 10 then lv = 10 end
+    return 30 + lv, 20
+  end
+
+  -- "gigantamax" or "dynamax" for `mon`.  battle_forms writes mon.form for a
+  -- Gigantamax (authoritative once the change lands); a declared boss's own
+  -- kind and the engine's eligible-species answer cover the beats before that.
+  function Ev.dyn.kindOf(screen, mon)
+    local info = screen.battle and screen.battle.g9BossKind
+    if type(info) == "table" then
+      if info.kind == "gigantamax" then return "gigantamax" end
+      if info.kind == "dynamax" then return "dynamax" end
+    end
+    if mon and type(mon.form) == "string" and mon.form ~= "" then
+      return "gigantamax"
+    end
+    local eng = screen.g9dex and screen.g9dex.exports
+    if mon and eng and type(eng.isGigantamaxEligibleSpecies) == "function" then
+      local ok, eligible = pcall(eng.isGigantamaxEligibleSpecies, mon.species)
+      if ok and eligible then return "gigantamax" end
+    end
+    return "dynamax"
+  end
+
+  -- Starts the skin for `mon` (the frame the sequence is staged, or the frame a
+  -- Dynamax is first seen without one).
+  function Screen:startDynamaxHpSkin(mon)
+    if not mon then return end
+    local num, den = Ev.dyn.multiplierOf(self, mon)
+    self.dynHpSkin = { mon = mon, num = num, den = den, t = 0,
+                       kind = Ev.dyn.kindOf(self, mon), seen = false }
+  end
+
+  function Screen:clearDynamaxHpSkin()
+    self.dynHpSkin = nil
+  end
+
+  -- The skin record when it is `mon`'s own, else nil.
+  function Screen:dynamaxHpSkinFor(mon)
+    local sk = self.dynHpSkin
+    if not sk or not mon or sk.mon ~= mon then return nil end
+    return sk
+  end
+
+  -- The two display multipliers for `mon` right now, or nil for every other
+  -- mon.  `max` ramps over 0..HP_MAX_T, `hp` over HP_MAX_T..HP_CUR_T.
+  function Screen:dynamaxHpSkinDisplay(mon)
+    local sk = self:dynamaxHpSkinFor(mon)
+    if not sk then return nil end
+    local m = sk.num / sk.den
+    local t = sk.t or 0
+    local maxP = math.min(1, t / Ev.dyn.HP_MAX_T)
+    local hpP = math.min(1, math.max(0,
+      (t - Ev.dyn.HP_MAX_T) / (Ev.dyn.HP_CUR_T - Ev.dyn.HP_MAX_T)))
+    return { max = 1 + (m - 1) * maxP, hp = 1 + (m - 1) * hpP }
+  end
+
+  -- One tick: advance the ramps, and drop the skin the moment the mon stops
+  -- being Dynamaxed/Gigantamaxed (faint, switch, battle end and the 3-turn
+  -- expiry all clear it) so the readout returns to the real numbers.  A
+  -- Dynamax that arrives with no staged clip (an enemy trainer's, a thin
+  -- install) is picked up here too.
+  function Screen:updateDynamaxHpSkin(dt)
+    local sk = self.dynHpSkin
+    if not sk then
+      for _, list in ipairs({ self.playerBattlers, self.enemyBattlers }) do
+        for _, b in ipairs(list or {}) do
+          if b and b.mon and b.mon.__g9Dynamaxed then
+            return self:startDynamaxHpSkin(b.mon)
+          end
+        end
+      end
+      return
+    end
+    local battler = self:battlerFor(sk.mon)
+    local live = (sk.mon and sk.mon.__g9Dynamaxed == true)
+      or Ev.dyn.liveActive(sk.mon, battler)
+    local inSequence = self.dynamax and self.dynamax.owner == sk.mon
+    if live then
+      sk.seen = true
+    elseif sk.seen or not inSequence then
+      -- Reverted, or the sequence ended without the Dynamax ever landing.
+      return self:clearDynamaxHpSkin()
+    end
+    if sk.t < Ev.dyn.HP_CUR_T then
+      sk.t = math.min(Ev.dyn.HP_CUR_T, sk.t + (dt or 0))
+    end
+  end
+
+  -- Starts the staged sequence for `mon`, or answers false when there is
+  -- nothing to stage.  `opts.already` (the GIMMICK SEQUENCE's own call, after
+  -- the activation has ALREADY landed) means the reveal beat must not run the
+  -- activation again; `opts.force` skips the armed test for the same reason.
+  function Screen:startDynamaxAnim(mon, opts)
+    if not (Ev.dyn.anim and type(Ev.dyn.anim.new) == "function") then return false end
+    if not mon then return false end
+    if not ((opts and opts.force) or self:dynamaxArmed()) then return false end
+    local battler = self:battlerFor(mon)
+    if not battler then return false end
+    local box = Ev.box(self, battler)
+    if not box then return false end
+    local shift = Ev.artShift(self, battler)
+    local ok, clip = pcall(Ev.dyn.anim.new, {
+      x = box.x, cx = box.x + (shift or 0),
+      top = box.top, feet = box.feet, w = box.w, h = box.h,
+      side = box.side, vw = VW, vh = VH,
+    })
+    if not (ok and type(clip) == "table") then
+      mod.log:warn("g9_Battle_Scene: dynamax animation could not start (%s)",
+        tostring(clip))
+      return false
+    end
+    local already = (opts and opts.already) and true or false
+    self.dynamax = { clip = clip, owner = mon, battler = battler,
+                     applied = already, artShift = shift }
+    -- Hold the size ladder back until the reveal: the sprite mod's grow ride
+    -- reads this flag (via dynamaxActive), so the mon stays ordinary-sized while
+    -- the clip plays and starts growing the frame the clip's reveal drops it.
+    if already then battler.__g9DynHold = true end
+    clip.onReveal = function() self:revealDynamax() end
+    -- The DRAW-ONLY HP skin starts the frame the sequence does, so its two
+    -- ramps (max, then current) run across the transformation (see the
+    -- DYNAMAX HP SKIN block).
+    self:startDynamaxHpSkin(mon)
+    -- The pre-reveal line is kind-aware too: a Gigantamax says so, and a plain
+    -- Dynamax no longer borrows the Gigantamax wording (the reported bug).
+    local gmax = Ev.dyn.kindOf(self, mon) == "gigantamax"
+    self.currentMessage = FN.displayName(mon)
+      .. (gmax and " is Gigantamaxing!" or " is Dynamaxing!")
+    return true
+  end
+
+  -- The reveal beat: perform the real activation (and with it the form change
+  -- and the start of the size ladder) under the solid-white flash.
+  function Screen:revealDynamax()
+    local dx = self.dynamax
+    if not dx then return end
+    if not dx.applied then
+      dx.applied = true
+      local ok, err = pcall(self.applyGimmickActivation, self, dx.owner)
+      if not ok then
+        mod.log:warn("g9_Battle_Scene: dynamax activation during the animation failed: %s",
+          tostring(err))
+        self.movesBegun = true
+        FN.clearGimmickOwner(self)
+      end
+    end
+    -- Drop the grow hold so the ladder starts now, on the reveal frame -- the
+    -- transformed creature then grows out from exactly the beat the clip
+    -- breaks, instead of having crept up to size under the animation.
+    dx.revealed = true
+    self:releaseGimmickHold(dx.battler)
+    dx.artReady = false
+    dx.holdT = 0
+    if dx.owner then
+      -- Prefer the LIVE kind: once activation has landed, battle_forms has set
+      -- mon.form for a Gigantamax, so a plain Dynamax says "Dynamaxed!" and
+      -- only a real Gigantamax says "Gigantamaxed!".
+      local gmax = Ev.dyn.kindOf(self, dx.owner) == "gigantamax"
+      self.currentMessage = FN.displayName(dx.owner)
+        .. (gmax and " Gigantamaxed!" or " Dynamaxed!")
+    end
+  end
+
+  -- One step of the sequence, run from Screen:update (phase-independent, so a
+  -- held button cannot skip it).
+  function Screen:updateDynamax(dt)
+    local dx = self.dynamax
+    if not dx then return end
+    -- A build with no animation module (or an older clip): perform the change
+    -- now and get out of the way -- costuming must never gate the mechanic.
+    if not (Ev.dyn.anim and type(Ev.dyn.anim.step) == "function") then
+      if not dx.applied then
+        dx.applied = true
+        pcall(self.applyGimmickActivation, self, dx.owner)
+      end
+      self:releaseGimmickHold(dx.battler)
+      self.dynamax = nil
+      self:finishGimmickAnim()
+      return
+    end
+    -- Hold the reveal beat until the new form's art can be drawn, exactly as
+    -- the mega sequence does (see its note).  Gated on `dx.revealed`, so a
+    -- pre-activated sequence does not freeze at t=0.
+    local hold = false
+    if dx.applied and dx.revealed and not dx.artReady then
+      dx.holdT = (dx.holdT or 0) + (dt or 0)
+      if Ev.artReady(self, dx.battler) then
+        dx.artReady = true
+      elseif dx.holdT <= Ev.dyn.HOLD_MAX then
+        hold = true
+      end
+    end
+    local ok, err = pcall(Ev.dyn.anim.step, dx.clip, dt, hold)
+    if not ok then
+      mod.log:warn("g9_Battle_Scene: dynamax animation failed: %s", tostring(err))
+      if not dx.applied then
+        dx.applied = true
+        pcall(self.applyGimmickActivation, self, dx.owner)
+      end
+      self:releaseGimmickHold(dx.battler)
+      self.dynamax = nil
+      self:finishGimmickAnim()
+      return
+    end
+    dx.elapsed = (dx.elapsed or 0) + (dt or 0)
+    if dx.clip.done or dx.elapsed > Ev.dyn.SAFETY then
+      if not dx.applied then
+        dx.applied = true
+        pcall(self.applyGimmickActivation, self, dx.owner)
+      end
+      self:releaseGimmickHold(dx.battler)
+      self.dynamax = nil
+      self:finishGimmickAnim()
+    end
+  end
+
+  -- The clip's BACK layer (dim + furnace glow + far cloud).  Called from
+  -- drawContent BEFORE any sprite, which is the whole reason it exists: the
+  -- light has to be behind the creature for its silhouette to read.
+  function Screen:drawDynamaxBack()
+    local dx = self.dynamax
+    if not (dx and dx.clip) then return end
+    if not (Ev.dyn.anim and type(Ev.dyn.anim.drawBack) == "function") then return end
+    local ok, err = pcall(Ev.dyn.anim.drawBack, dx.clip)
+    if not ok and not dx.backWarned then
+      dx.backWarned = true
+      mod.log:warn("g9_Battle_Scene: dynamax back layer failed (%s)", tostring(err))
+    end
+  end
+
+  -- The clip's FRONT layer, drawn where the mega sequence is (over every
+  -- sprite, under the F/E narration band).
+  function Screen:drawDynamax()
+    local dx = self.dynamax
+    if not (dx and dx.clip) then return end
+    if not (Ev.dyn.anim and type(Ev.dyn.anim.draw) == "function") then return end
+    local ok, err = pcall(Ev.dyn.anim.draw, dx.clip)
+    if not ok and not dx.drawWarned then
+      dx.drawWarned = true
+      mod.log:warn("g9_Battle_Scene: dynamax draw failed (%s) -- the sequence "
+        .. "keeps running and the form change still lands", tostring(err))
+    end
+  end
+
+  ------------------------------------------------------------------
+  -- DYNAMAX FIELD -- the persistent Dynamax visuals (v3.7.0).
+  ------------------------------------------------------------------
+  -- The clip above plays ONCE, at the moment of the change.  This block is
+  -- what a Dynamaxed mon looks like the rest of the time: the darkened field
+  -- and a red aura behind it (drawn from the BACK layer, before any sprite),
+  -- and -- when a Dynamaxed mon is knocked out -- a held faint that finishes
+  -- its shrink and then bursts.  The state and the size factor come from
+  -- g9-battle-sprites' mod.exports.dynamaxStateOf (it owns the size ladder and
+  -- the live read of battle_forms); the drawing itself is dynamax_field.lua's.
+  -- Every call is guarded and every draw is pcall'd, so a build without the
+  -- sprite mod or the FX module simply shows no field FX -- the battle is
+  -- never gated on any of it.
+  -- NB: every helper below lives on the Ev.dyn table rather than in a local of
+  -- its own -- this module's body is already at Lua's 200-local ceiling (see
+  -- the note by `Evolution`).
+  Ev.dynField = Ev.dynField or mod.exports.battleSceneDynamaxField
+
+  -- The g9-battle-sprites exports, resolved once (nil when that mod is absent).
+  function Ev.dyn.spritesExports()
+    if not Ev.dyn.spritesLooked then
+      Ev.dyn.spritesLooked = true
+      local ok, sp = pcall(function()
+        return mod.find and mod.find("g9-battle-sprites")
+      end)
+      if ok and sp and type(sp.exports) == "table" then
+        Ev.dyn.SPRITES = sp.exports
+      end
+    end
+    return Ev.dyn.SPRITES
+  end
+
+  -- The live Dynamax state of one battler, or nil when nothing can answer.
+  function Ev.dyn.stateOf(mon, battler)
+    if type(mon) ~= "table" then return nil end
+    local ex = Ev.dyn.spritesExports()
+    local fn = ex and ex.dynamaxStateOf
+    if type(fn) ~= "function" then return nil end
+    local ok, st = pcall(fn, mon, battler)
+    if ok and type(st) == "table" then return st end
+    return nil
+  end
+
+  -- Is a Dynamax/Gigantamax live on this battler RIGHT NOW?  The sprite mod's
+  -- live read first (it folds in the grow ladder and the screen's holds), and
+  -- battle_forms' own describe() as a fallback for a build with no sprite mod,
+  -- so the gimmick sequence can still detect an enemy Dynamax on a thin
+  -- install.  Never raises.
+  function Ev.dyn.liveActive(mon, battler)
+    local st = Ev.dyn.stateOf(mon, battler)
+    if type(st) == "table" then return st.active == true end
+    local fapi = Ev.tera.formsExports()
+    if not fapi then return false end
+    local ok, payload = pcall(fapi.describe, mon, battler)
+    return ok and type(payload) == "table" and type(payload.dynamax) == "table"
+  end
+
+  function Ev.dyn.fieldReady()
+    local f = Ev.dynField
+    return type(f) == "table" and type(f.drawDim) == "function"
+      and type(f.drawAura) == "function"
+  end
+
+  -- 0..1: how far through the grow/shrink a record is (see dynamax_field.lua).
+  function Ev.dyn.charge(st)
+    if type(Ev.dynField) ~= "table" or type(Ev.dynField.charge) ~= "function" then
+      return 0
+    end
+    local ok, c = pcall(Ev.dynField.charge, st)
+    if ok and tonumber(c) then return tonumber(c) end
+    return 0
+  end
+
+  function Ev.dyn.optOn(name, default)
+    local f = Ev.dynField
+    if f and type(f[name]) == "function" then
+      local ok, v = pcall(f[name])
+      if ok then return v ~= false end
+    end
+    return default
+  end
+
+  -- Is this state still transformed (so the sprite pass keeps drawing it)?
+  -- `known` covers the shrink-back too, including the one frame after the mon
+  -- reverts but before the ladder has started the shrink (see the sprite mod's
+  -- dynamaxStateOf).
+  function Ev.dyn.transformed(st)
+    if type(st) ~= "table" then return false end
+    return st.known == true or st.active == true
+  end
+
+  -- Read every on-field battler's Dynamax state ONCE per draw -- the back
+  -- layer and the sprite pass both use the map -- and remember any battler that
+  -- has ever been transformed this stay: that flag is what tells the sprite
+  -- pass to hold a fainted Dynamaxed mon through its shrink, not drop it.
+  function Screen:scanDynamaxStates()
+    local map = {}
+    local function scan(battler)
+      if type(battler) ~= "table" or type(battler.mon) ~= "table" then return end
+      local st = Ev.dyn.stateOf(battler.mon, battler)
+      if not st then return end
+      if st.active or st.known then battler.__g9DynWasActive = true end
+      map[battler] = st
+    end
+    for _, b in ipairs(self.enemyBattlers or {}) do scan(b) end
+    for _, b in ipairs(self.playerBattlers or {}) do scan(b) end
+    self.__dynStates = map
+  end
+
+  -- The BACK layer: the darkened field, then an aura behind each transformed
+  -- battler.  Raised from drawContent BEFORE the sprites (see the DYNAMAX FIELD
+  -- call there), so the mons stand out of the light rather than under it.
+  function Screen:drawDynamaxField()
+    if not Ev.dyn.fieldReady() then return end
+    self:scanDynamaxStates()
+    local G = love and love.graphics
+    if not (G and G.push) then return end
+    local states = self.__dynStates or {}
+    local list = {}
+    for _, b in ipairs(self.enemyBattlers or {}) do
+      local st = states[b]
+      if st then list[#list + 1] = { b = b, st = st } end
+    end
+    for _, b in ipairs(self.playerBattlers or {}) do
+      local st = states[b]
+      if st then list[#list + 1] = { b = b, st = st } end
+    end
+    -- the field wash, at the strongest charge on the field
+    local maxCharge = 0
+    for _, e in ipairs(list) do
+      local c = Ev.dyn.charge(e.st)
+      if c > maxCharge then maxCharge = c end
+    end
+    if Ev.dyn.optOn("darkenOn", true) and maxCharge > 0.01 then
+      local ok, err = pcall(Ev.dynField.drawDim, G, VW, VH, maxCharge)
+      if not ok and not self.__dynDimWarned then
+        self.__dynDimWarned = true
+        mod.log:warn("g9_Battle_Scene: dynamax dim failed (%s)", tostring(err))
+      end
+    end
+    -- an aura behind each transformed battler
+    if Ev.dyn.optOn("auraOn", true) then
+      local t = self.dynFieldT or 0
+      for _, e in ipairs(list) do
+        local a = self.spriteAnchor and self.spriteAnchor[e.b]
+        if a then
+          pcall(Ev.dynField.drawAura, G, a.x, a.y - a.h * 0.5, a.w, a.h,
+            Ev.dyn.charge(e.st), t)
+        end
+      end
+    end
+  end
+
+  -- Spawn one faint burst at a battler's own last drawn box.
+  function Screen:spawnDynamaxBurst(battler)
+    if not Ev.dyn.fieldReady() or type(Ev.dynField.newBurst) ~= "function" then return end
+    local a = self.spriteAnchor and self.spriteAnchor[battler]
+    if not a then return end
+    local turn = self.battle and tonumber(self.battle.turn) or 0
+    local ok, b = pcall(Ev.dynField.newBurst, {
+      x = a.x, y = a.y - a.h * 0.5, w = a.w, h = a.h,
+      seed = math.floor((a.x or 0) * 7 + (a.y or 0) * 13 + turn * 31) % 2147483000 + 1,
+    })
+    if not (ok and type(b) == "table") then return end
+    self.dynamaxBursts = self.dynamaxBursts or {}
+    self.dynamaxBursts[#self.dynamaxBursts + 1] = b
+  end
+
+  -- Step the field's own clock and the live bursts.  Run from Screen:update
+  -- with the staged sequences, so a held button cannot skip them.
+  function Screen:stepDynamaxBursts(dt)
+    self.dynFieldT = (self.dynFieldT or 0) + (dt or 0)
+    if type(Ev.dynField) ~= "table" or type(Ev.dynField.stepBurst) ~= "function" then
+      self.dynamaxBursts = nil
+      return
+    end
+    if not self.dynamaxBursts then return end
+    local keep = {}
+    for _, b in ipairs(self.dynamaxBursts) do
+      pcall(Ev.dynField.stepBurst, b, dt)
+      if not b.done then keep[#keep + 1] = b end
+    end
+    if #keep == 0 then self.dynamaxBursts = nil else self.dynamaxBursts = keep end
+  end
+
+  -- The FRONT layer: the bursts, drawn over every sprite (where the clip's
+  -- front layer goes) and under the F/E narration band.
+  function Screen:drawDynamaxFieldFront()
+    if not (self.dynamaxBursts and #self.dynamaxBursts > 0) then return end
+    if not Ev.dyn.fieldReady() or type(Ev.dynField.drawBurst) ~= "function" then return end
+    local G = love and love.graphics
+    for _, b in ipairs(self.dynamaxBursts) do
+      local ok, err = pcall(Ev.dynField.drawBurst, G, b)
+      if not ok and not self.__dynBurstWarned then
+        self.__dynBurstWarned = true
+        mod.log:warn("g9_Battle_Scene: dynamax burst draw failed (%s)", tostring(err))
+      end
+    end
+  end
+
+  ------------------------------------------------------------------
+  -- TERASTALLIZATION -- the staged transformation animation.
+  ------------------------------------------------------------------
+  -- The third costume, beside MEGA and DYNAMAX: battle_forms owns the change
+  -- (the Tera type, and with it the crystal film g9-battle-sprites bakes into
+  -- the sheet), and this screen stages tera_anim.lua around it.
+  --
+  -- TWO THINGS MAKE TERA DIFFERENT from the other two:
+  --
+  --   * THE FILM ARRIVES AT THE BREAK, not at the activation.  The rule: the
+  --     animation builds a crystal construct, BREAKS it, and the transformed
+  --     creature is revealed wearing the persistent voronoi crystal film
+  --     (g9-battle-sprites' TERA ART).  The ACTIVATION itself is run at once
+  --     -- so the Tera type and the film sheet are genuinely live before the
+  --     show starts -- but the battler is marked `__g9TeraHold` for the whole
+  --     show, which g9-battle-sprites answers as "paint no film yet".  The
+  --     clip's reveal beat clears that flag, so the film is placed on the
+  --     creature exactly when the construct breaks.  (The hold carries a
+  --     deadline, so even if a clear is ever missed the film cannot stay
+  --     hidden forever.)
+  --
+  --   * IT PLAYS FOR THE ENEMY TOO.  A PLAYER tera is armed through the cell
+  --     (gimmickOwnerId / battle_forms' armed id), so it stages BEFORE the
+  --     activation, like mega.  But an ENEMY/boss tera is decided and activated
+  --     inside battle_forms' own battle.turn_started listener (src/trainerai),
+  --     which this screen raises -- so there is no "before" to stage on.  The
+  --     screen instead notices the newly-terastallized battler right after the
+  --     activation (a before/after snapshot) and stages the clip then, holding
+  --     the turn while it plays.  The `__g9TeraHold` flag is what keeps an
+  --     already-activated enemy's art plain until the construct breaks.
+  --
+  -- NB: every helper lives on `Ev.tera` rather than in a local of its own --
+  -- this module's body is already at Lua's 200-local ceiling (see the note by
+  -- `Evolution`).
+  Ev.tera = Ev.tera or {}
+  Ev.tera.SAFETY = 30.0
+  -- Long on purpose (see the mega block's note): the reveal beat WAITS for the
+  -- crystal film to be really drawable rather than being cut short, and the wait
+  -- is a lazy bake, not a real cost.
+  Ev.tera.HOLD_MAX = 30.0
+  Ev.tera.anim = Ev.tera.anim or mod.exports.battleSceneTeraAnim
+  -- How long a `__g9TeraHold` may ever keep the sprite mod's crystal film
+  -- hidden, as a backstop: the reveal beat clears it long before this, but if
+  -- a clear is EVER missed the film still lands inside this window instead of
+  -- never.  Written as an absolute love.timer deadline; see Ev.tera.holdStamp.
+  -- Generous, because the hold must outlast the whole clip (REVEAL_T is 4.32s)
+  -- plus the reveal's own art wait.
+  Ev.tera.HOLD_LIMIT = 45.0
+
+  -- The value written to `battler.__g9TeraHold`: an absolute deadline on the
+  -- engine clock (love.timer.getTime), so g9-battle-sprites can read the very
+  -- same number and let the flag expire on its own.  Falls back to `true`
+  -- (held until explicitly cleared) if there is no clock to read.
+  function Ev.tera.holdStamp()
+    local ok, now = pcall(function()
+      return (love and love.timer and love.timer.getTime) and love.timer.getTime() or nil
+    end)
+    if ok and type(now) == "number" then return now + Ev.tera.HOLD_LIMIT end
+    return true
+  end
+
+  -- Does battle_forms' gimmick id name Terastallization?  The id strings come
+  -- from the engine's formapi, so this matches on the NAME (the same forgiving
+  -- rule the mega and dynamax blocks use) and a differently-named build simply
+  -- keeps the old immediate activation.
+  function Ev.tera.isId(id)
+    if type(id) ~= "string" then return false end
+    id = id:lower()
+    return id:find("tera", 1, true) ~= nil or id == "tstl"
+  end
+
+  -- battle_forms' own describe(), for reading a mon's LIVE tera state.  Cached
+  -- on success only, so a mod that loads late is still picked up next call.
+  function Ev.tera.formsExports()
+    if Ev.tera.__forms then return Ev.tera.__forms end
+    local ok, battleForms = pcall(function() return mod:find("battle_forms") end)
+    local api = ok and battleForms and battleForms.exports
+    if api and type(api.describe) == "function" then Ev.tera.__forms = api end
+    return Ev.tera.__forms
+  end
+
+  -- The ENGINE's own public exports.  This is the reliable live-state seam:
+  -- g9-battle-engine sets `mon.teraActive` on its `mod.battle_forms.tera_applied`
+  -- listener and owns the per-mon Tera type (gigantamax/tera_state.lua's
+  -- getTeraType).  battle_forms' describe() payload is NOT a shape this scene
+  -- can rely on, which is why the crystal film could fail to appear at all.
+  function Ev.tera.engineExports()
+    if Ev.tera.__engine ~= nil then return Ev.tera.__engine end
+    local ok, handle = pcall(function() return mod:find("g9-battle-engine") end)
+    local api = ok and handle and handle.exports
+    if type(api) == "table" then Ev.tera.__engine = api end
+    return Ev.tera.__engine
+  end
+
+  -- The live Tera type from the ENGINE alone (no battle_forms payload): the
+  -- type the engine's own combat code would use.  nil when the engine does not
+  -- know this mon or has no type for it.
+  function Ev.tera.engineTypeOf(mon)
+    if type(mon) ~= "table" then return nil end
+    local api = Ev.tera.engineExports()
+    if api and type(api.getTeraType) == "function" then
+      local ok, t = pcall(api.getTeraType, mon)
+      if ok and type(t) == "string" and t ~= "" then return t end
+    end
+    local t = mon.teraType or mon.battleFormsTeraType
+    if type(t) == "string" and t ~= "" then return t end
+    return nil
+  end
+
+  -- Is `mon` Terastallized RIGHT NOW?  The engine's own record first, then
+  -- battle_forms' describe() as the fallback.  Forgiving: a missing
+  -- mod/export, a raised error or a payload with no tera block all answer
+  -- false.
+  function Ev.tera.liveOf(mon, battler)
+    if type(mon) ~= "table" then return false end
+    if mon.teraActive then return true end
+    local api = Ev.tera.engineExports()
+    if api and type(api.isTerastallized) == "function" then
+      local ok, v = pcall(api.isTerastallized, nil, mon)
+      if ok and v then return true end
+    end
+    local fapi = Ev.tera.formsExports()
+    if not fapi then return false end
+    local ok, payload = pcall(fapi.describe, mon, battler)
+    if not (ok and type(payload) == "table") then return false end
+    return type(payload.tera) == "table"
+  end
+
+  -- The mon's live Tera TYPE (a type id), or nil.  Used when the scene stages a
+  -- tera, to stamp the type on the battler so the sprite mod can paint the
+  -- crystal film without depending on battle_forms' payload at all.
+  function Ev.tera.liveTypeOf(mon, battler)
+    -- Only a mon that is LIVE is given a type: a stored Tera type is a
+    -- property every mon may carry before it ever transforms (see the sprite
+    -- mod's own note), so an un-live mon must answer nil or its film would
+    -- paint early.
+    if not Ev.tera.liveOf(mon, battler) then return nil end
+    local t = Ev.tera.engineTypeOf(mon)
+    if t then return t end
+    local fapi = Ev.tera.formsExports()
+    if not fapi then return nil end
+    local ok, payload = pcall(fapi.describe, mon, battler)
+    if not (ok and type(payload) == "table" and type(payload.tera) == "table") then
+      return nil
+    end
+    local live = payload.tera.type or payload.teraType
+    if type(live) == "string" and live ~= "" then return live end
+    return nil
+  end
+
+  -- The whitening the sprite pass should apply to the tera'ing battler this
+  -- frame, or nil for every other battler.
+  function Screen:teraFx(battler)
+    local tx = self.tera
+    if not (tx and tx.clip and tx.battler == battler) then return nil end
+    if not (Ev.tera.anim and type(Ev.tera.anim.whiten) == "function") then return nil end
+    local ok, v = pcall(Ev.tera.anim.whiten, tx.clip)
+    if ok and tonumber(v) then return tonumber(v) end
+    return 0
+  end
+
+  -- Which mon a tera on its way belongs to: the owner this screen recorded,
+  -- else the first player battler (where a player activation lands anyway).
+  function Screen:teraStageMon()
+    if self.gimmickOwnerMon then return self.gimmickOwnerMon end
+    for _, b in ipairs(self.playerBattlers) do
+      if b and b.mon then return b.mon end
+    end
+    return nil
+  end
+
+  -- Starts the staged sequence for `mon`.  `already` is true when the
+  -- activation has ALREADY happened (the enemy/boss path), so the reveal beat
+  -- must not run it a second time.
+  function Screen:startTeraAnim(mon, already)
+    if not (Ev.tera.anim and type(Ev.tera.anim.new) == "function") then return false end
+    if not mon then return false end
+    if self.tera then return false end
+    local battler = self:battlerFor(mon)
+    if not battler then return false end
+    local box = Ev.box(self, battler)
+    if not box then return false end
+    local shift = Ev.artShift(self, battler)
+    local ok, clip = pcall(Ev.tera.anim.new, {
+      x = box.x, cx = box.x + (shift or 0),
+      top = box.top, feet = box.feet, w = box.w, h = box.h,
+      side = box.side, vw = VW, vh = VH,
+    })
+    if not (ok and type(clip) == "table") then
+      mod.log:warn("g9_Battle_Scene: tera animation could not start (%s)",
+        tostring(clip))
+      return false
+    end
+    battler.__g9TeraHold = Ev.tera.holdStamp()
+    -- Stamp the live Tera type on the battler.  The sprite mod paints the
+    -- crystal film from this (resolveSprite forwards it as ctx.liveTeraType),
+    -- so the film can never depend on battle_forms' describe() payload shape.
+    -- Stamped while the show still hides it behind `__g9TeraHold`, so the film
+    -- lands on the break beat, exactly as before.
+    local liveT = Ev.tera.liveTypeOf(mon, battler)
+    if liveT then battler.liveTeraType = liveT end
+    self.tera = { clip = clip, owner = mon, battler = battler,
+                  applied = already and true or false, artShift = shift }
+    clip.onReveal = function() self:revealTera() end
+    self.currentMessage = FN.displayName(mon) .. " is Terastallizing!"
+    return true
+  end
+
+  -- The reveal beat (the frame the construct BREAKS): for a PLAYER tera run the
+  -- real activation -- which is the frame the crystal film appears; for an
+  -- ENEMY tera it has already run.  Either way clear `__g9TeraHold` so the film
+  -- is placed now.
+  function Screen:revealTera()
+    local tx = self.tera
+    if not tx then return end
+    if not tx.applied then
+      tx.applied = true
+      local ok, err = pcall(self.applyGimmickActivation, self, tx.owner)
+      if not ok then
+        mod.log:warn("g9_Battle_Scene: tera activation during the animation failed: %s",
+          tostring(err))
+        self.movesBegun = true
+        FN.clearGimmickOwner(self)
+      end
+    end
+    if type(tx.battler) == "table" then tx.battler.__g9TeraHold = nil end
+    -- The crystal film is requested from this frame on: restart the art-ready
+    -- wait so the clip stays frozen on the white flash until the FILMED sheet
+    -- -- not the plain one it was reading while held -- is really drawable.  This
+    -- is the "crystal layer deployment is over before the turn resolves" rule.
+    tx.revealed = true
+    tx.artReady = false
+    tx.holdT = 0
+    if tx.owner then
+      self.currentMessage = FN.displayName(tx.owner) .. " Terastallized!"
+    end
+  end
+
+  -- One step of the sequence, run from Screen:update (phase-independent).
+  function Screen:updateTera(dt)
+    local tx = self.tera
+    if not tx then return end
+    if not (Ev.tera.anim and type(Ev.tera.anim.step) == "function") then
+      if not tx.applied then
+        tx.applied = true
+        pcall(self.applyGimmickActivation, self, tx.owner)
+      end
+      self:releaseGimmickHold(tx.battler)
+      self.tera = nil
+      self:finishGimmickAnim()
+      return
+    end
+    -- Hold the reveal beat until the filmed sheet can be drawn (the same wait
+    -- the other two clips do; see revealTera, which restarts this wait once the
+    -- hold drops so the FILMED sheet is the thing waited on).  Gated on
+    -- `tx.revealed`, so a pre-activated sequence does not freeze at t=0.
+    local hold = false
+    if tx.applied and tx.revealed and not tx.artReady then
+      tx.holdT = (tx.holdT or 0) + (dt or 0)
+      if Ev.artReady(self, tx.battler) then
+        tx.artReady = true
+      elseif tx.holdT <= Ev.tera.HOLD_MAX then
+        hold = true
+      end
+    end
+    local ok, err = pcall(Ev.tera.anim.step, tx.clip, dt, hold)
+    if not ok then
+      mod.log:warn("g9_Battle_Scene: tera animation failed: %s", tostring(err))
+      if not tx.applied then
+        tx.applied = true
+        pcall(self.applyGimmickActivation, self, tx.owner)
+      end
+      self:releaseGimmickHold(tx.battler)
+      self.tera = nil
+      self:finishGimmickAnim()
+      return
+    end
+    tx.elapsed = (tx.elapsed or 0) + (dt or 0)
+    if tx.clip.done or tx.elapsed > Ev.tera.SAFETY then
+      if not tx.applied then
+        tx.applied = true
+        pcall(self.applyGimmickActivation, self, tx.owner)
+      end
+      self:releaseGimmickHold(tx.battler)
+      self.tera = nil
+      self:finishGimmickAnim()
+    end
+  end
+
+  -- The clip's BACK layer (ground glow + far shards), before any sprite.
+  function Screen:drawTeraBack()
+    local tx = self.tera
+    if not (tx and tx.clip) then return end
+    if not (Ev.tera.anim and type(Ev.tera.anim.drawBack) == "function") then return end
+    local ok, err = pcall(Ev.tera.anim.drawBack, tx.clip)
+    if not ok and not tx.backWarned then
+      tx.backWarned = true
+      mod.log:warn("g9_Battle_Scene: tera back layer failed (%s)", tostring(err))
+    end
+  end
+
+  -- The clip's FRONT layer, over the sprites and under the F/E band.
+  function Screen:drawTera()
+    local tx = self.tera
+    if not (tx and tx.clip) then return end
+    if not (Ev.tera.anim and type(Ev.tera.anim.draw) == "function") then return end
+    local ok, err = pcall(Ev.tera.anim.draw, tx.clip)
+    if not ok and not tx.drawWarned then
+      tx.drawWarned = true
+      mod.log:warn("g9_Battle_Scene: tera draw failed (%s) -- the sequence keeps "
+        .. "running and the crystal still lands", tostring(err))
+    end
+  end
+
+  ------------------------------------------------------------------
+  -- GIMMICK SEQUENCE -- the turn-opening transformation set piece.
+  ------------------------------------------------------------------
+  -- battle_forms owns WHEN a gimmick fires; this block owns what the player
+  -- WATCHES.  At the top of a move phase the scene raises battle.turn_started
+  -- exactly once (Screen:applyGimmickActivation), which is where battle_forms
+  -- performs whatever each side had armed or decided -- the player's FORMS pick
+  -- AND the enemy trainer's own seeded choice, on the SAME turn.  Everything
+  -- that actually transformed is then staged here, in the turn's own ACTION
+  -- ORDER (whoever acts first transforms first), one full sequence at a time,
+  -- with the turn held the whole way: no move's damage is delivered until every
+  -- transformation that happened this turn has played out AND its sprite (form
+  -- art / crystal film / size ladder) is really drawable.
+  --
+  -- WHY DETECT THE CHANGE rather than trust the armed id: the enemy's gimmick is
+  -- decided inside battle_forms' own turn_started listener and never published
+  -- in advance, so the only reliable way to know BOTH sides' transformations is
+  -- to sample their live gimmick state just before the activation and diff it
+  -- just after.  The sample covers Tera, Dynamax/Gigantamax and any battle_forms
+  -- form (mega and friends), so one code path handles every mechanic.
+  --
+  -- NB: every helper lives on `Ev`/`Screen` rather than in a local of its own --
+  -- this module's body is at Lua's 200-local ceiling (see the note by
+  -- `Evolution`).
+
+  -- One battler's live gimmick state, as a small table.
+  function Screen:sampleGimmick(battler)
+    if type(battler) ~= "table" or type(battler.mon) ~= "table" then return nil end
+    return {
+      tera = Ev.tera.liveOf(battler.mon, battler) and true or false,
+      dyn = Ev.dyn.liveActive(battler.mon, battler) and true or false,
+      form = Ev.formSpecies(battler.mon, self.data),
+    }
+  end
+
+  -- Every on-field battler's gimmick state, keyed by battler.
+  function Screen:sampleGimmicks()
+    local map = {}
+    for _, list in ipairs({ self.enemyBattlers or {}, self.playerBattlers or {} }) do
+      for _, b in ipairs(list) do
+        local s = self:sampleGimmick(b)
+        if s then map[b] = s end
+      end
+    end
+    return map
+  end
+
+  -- Which gimmick animation `battler` is owed this turn, or nil.  Order of the
+  -- tests matters: a Gigantamax changes BOTH a form and the dynamax state, and
+  -- it must be costumed by the dynamax sequence, not the mega one.
+  function Screen:gimmickKindOf(battler, before)
+    local p = before and before[battler]
+    if not p then return nil end
+    local mon = battler and battler.mon
+    if type(mon) ~= "table" then return nil end
+    if Ev.tera.liveOf(mon, battler) and not p.tera then return "tera" end
+    if Ev.dyn.liveActive(mon, battler) and not p.dyn then return "dynamax" end
+    local form = Ev.formSpecies(mon, self.data)
+    if form and form ~= p.form then return "mega" end
+    return nil
+  end
+
+  -- The order the gimmick sequences should play in: the mons of this turn's real
+  -- action order, from the combat backend.  Empty on a batch-only engine, where
+  -- the screen then keeps the sample's own insertion order.
+  function Screen:gimmickActorOrder()
+    local combat = self.combat
+    if combat and type(combat.orderedActorMons) == "function" then
+      local ok, list = pcall(combat.orderedActorMons, self.battle)
+      if ok and type(list) == "table" then return list end
+    end
+    return {}
+  end
+
+  -- Every PLAYER gimmick armed this turn, in the turn's own action order.  The
+  -- player may arm one per acting Pokemon (`self.gimmickArmed`, keyed by slot),
+  -- because battle_forms' single armed slot can only ever hold one at a time;
+  -- the scene keeps the others itself and drives them through that slot one at
+  -- a time (Screen:activateArmedGimmicks).  Empty when nothing was armed, in
+  -- which case the scene still raises the activation once so the ENEMY
+  -- trainer's own gimmick can land this turn.
+  function Screen:armedActorsInActionOrder()
+    local armed = self.gimmickArmed
+    if type(armed) ~= "table" then return {} end
+    local order = self:gimmickActorOrder()
+    local rank = {}
+    for i, mon in ipairs(order) do rank[mon] = i end
+    local out = {}
+    for slot, item in pairs(armed) do
+      if type(item) == "table" and item.mon then
+        out[#out + 1] = { mon = item.mon, slot = slot, id = item.id,
+                          label = item.label,
+                          rank = rank[item.mon] or (1000 + (tonumber(slot) or 0)) }
+      end
+    end
+    table.sort(out, function(a, b) return a.rank < b.rank end)
+    return out
+  end
+
+  -- Activate every gimmick this turn -- the player's armed ones, one raise
+  -- each and in action order, plus (on the FIRST raise) whatever the enemy
+  -- trainer's own listener decides.  Always raises at least once, so a turn
+  -- where only the enemy transforms still reaches battle_forms.
+  function Screen:activateArmedGimmicks(armed)
+    local emitted = false
+    for _, item in ipairs(armed or {}) do
+      -- battle_forms holds ONE armed slot, so applyGimmickActivation re-arms
+      -- THIS actor's gimmick (focused on them) and then raises, letting its
+      -- own resolve.onTurnStarted activate and consume it.  When the arm is
+      -- refused (a spent id, or a build with no arm seam) the raise is skipped
+      -- for that actor, so a stale armed id can never activate somebody else's
+      -- gimmick; the others still get their own raise.
+      if self:applyGimmickActivation(item.mon, item) then
+        emitted = true
+      else
+        mod.log:info("g9_Battle_Scene: FORM %s for %s could not be armed this "
+          .. "turn", tostring(item.id), tostring(FN.displayName(item.mon)))
+      end
+    end
+    if not emitted then
+      -- No player gimmick landed -- still one raise, for the enemy's own.
+      self:applyGimmickActivation(nil, nil)
+    end
+  end
+
+  -- Diff the sample into an ordered queue of { mon, battler, kind }, the ones
+  -- whose owner acts FIRST coming first.
+  function Screen:buildGimmickQueue(before)
+    local order = self:gimmickActorOrder()
+    local rank = {}
+    for i, mon in ipairs(order) do rank[mon] = i end
+    local queue = {}
+    for _, list in ipairs({ self.enemyBattlers or {}, self.playerBattlers or {} }) do
+      for _, b in ipairs(list) do
+        local kind = self:gimmickKindOf(b, before)
+        if kind then
+          queue[#queue + 1] = {
+            mon = b.mon, battler = b, kind = kind,
+            rank = rank[b.mon] or (1000 + #queue),
+          }
+        end
+      end
+    end
+    table.sort(queue, function(a, b) return a.rank < b.rank end)
+    return queue
+  end
+
+  -- Put every queued battler under its own hold BEFORE anything is drawn, so a
+  -- transformation waiting its turn in the queue cannot flash its new form (or
+  -- film, or size) while an earlier one plays.  Each hold is dropped at its own
+  -- reveal beat.
+  function Screen:holdGimmickQueue(queue)
+    for _, item in ipairs(queue or {}) do
+      local b = item.battler
+      if type(b) == "table" then
+        if item.kind == "tera" then b.__g9TeraHold = Ev.tera.holdStamp()
+        elseif item.kind == "dynamax" then b.__g9DynHold = true
+        else b.__g9FormHold = true end
+      end
+    end
+  end
+
+  -- Drop every hold a battler could be carrying.
+  function Screen:releaseGimmickHold(battler)
+    if type(battler) ~= "table" then return end
+    battler.__g9FormHold = nil
+    battler.__g9DynHold = nil
+    battler.__g9TeraHold = nil
+  end
+
+  ------------------------------------------------------------------
+  -- BOSS APPEARANCE TRANSFORMATION -- a wild raid boss's declared gimmick,
+  -- played as an intro beat.
+  ------------------------------------------------------------------
+  -- special_boss.lua gives a wild BOSS one STORED special property
+  -- (battle.g9BossKind = { kind, detail }) and deliberately never activates it:
+  -- battle_forms owns WHEN a gimmick fires and a wild Pokemon has no
+  -- enemy-trainer path to reach it.  The sprite mod paints the declared look
+  -- from that stamp (v2.8.1), but the transformation had no ANIMATION -- the
+  -- boss simply faded in already transformed.  This block gives it one, as the
+  -- intro's own beat: the boss fades in as its ordinary self (the holds are
+  -- raised for the whole intro -- see Screen:holdBossTransform), then the same
+  -- clip a mid-battle transformation uses plays over it, and the clip's reveal
+  -- beat drops the hold so the declared look lands exactly on the reveal.
+  --
+  -- NOTHING IS ACTIVATED.  The start calls run with `already=true`/`force=true`
+  -- (the enemy/boss path every other set piece already uses), so the reveal
+  -- beat never performs an activation -- there is none to perform -- and
+  -- battle_forms is never asked to fire.  Costume only, same as the
+  -- declaration it is showing.
+  ------------------------------------------------------------------
+
+  -- The declared gimmick on THIS screen's boss, when there is one to show.
+  -- nil for an ordinary wild fight, a trainer, or a kind with no clip; the
+  -- intro beat and the intro holds are both gated on this one predicate, so
+  -- they can never disagree about whether a transformation is coming.
+  function Screen:bossTransformKind()
+    if not self.isBoss then return nil end
+    local info = self.battle and self.battle.g9BossKind
+    if type(info) ~= "table" then return nil end
+    local kind = info.kind
+    if kind == "tera" or kind == "dynamax" or kind == "gigantamax"
+        or kind == "mega" then return kind end
+    return nil
+  end
+
+  -- Raise the holds a declared boss's transformation keeps -- the crystal
+  -- film, the Dynamax size ladder, the form art -- BEFORE it fades in, so it
+  -- appears as its ordinary self and the intro's own beat is what performs the
+  -- transformation.  Without this the boss would fade in already filmed /
+  -- already grown and the clip would then visibly snap it back to ordinary.
+  -- Called from Screen.new; a transform beat that cannot be built drops the
+  -- holds as it is skipped (see Screen:advanceIntro), and Screen:finishIntro
+  -- drops them again as a backstop, so a stray hold can never outlive the
+  -- intro.
+  function Screen:holdBossTransform()
+    local kind = self:bossTransformKind()
+    if not kind then return end
+    local b = self.enemyBattlers and self.enemyBattlers[1]
+    if type(b) ~= "table" then return end
+    if kind == "tera" then
+      if type(Ev.tera.holdStamp) == "function" then
+        b.__g9TeraHold = Ev.tera.holdStamp()
+      else
+        b.__g9TeraHold = true
+      end
+    elseif kind == "dynamax" or kind == "gigantamax" then
+      b.__g9DynHold = true
+    else
+      b.__g9FormHold = true
+    end
+  end
+
+  -- Play the boss's own transformation clip over the sprite it faded in as, or
+  -- answer false when there is nothing to stage.  `mega` takes the evolution
+  -- clip, `dynamax`/`gigantamax` the Dynamax one, `tera` the crystal show --
+  -- the same mapping the mid-battle set piece uses.  Sets
+  -- `self.bossTransformIntro` so Screen:finishGimmickAnim resumes the
+  -- NARRATION rather than the turn loop when the clip ends.
+  function Screen:startBossTransformAnim()
+    local kind = self:bossTransformKind()
+    if not kind then return false end
+    local b = self.enemyBattlers and self.enemyBattlers[1]
+    local mon = b and b.mon
+    if not mon then return false end
+    local started
+    if kind == "tera" then
+      started = self:startTeraAnim(mon, true)
+    elseif kind == "dynamax" or kind == "gigantamax" then
+      started = self:startDynamaxAnim(mon, { already = true, force = true })
+    else
+      started = self:startEvolutionAnim(mon, { already = true, force = true })
+    end
+    if started then self.bossTransformIntro = true end
+    return started and true or false
+  end
+
+  -- Start the next queued sequence, or answer false when there is none left.
+  -- A stage that cannot be built (no animation module, no battler) drops that
+  -- battler's hold so the change is at least visible, then tries the next.
+  function Screen:startNextGimmickAnim()
+    local queue = self.gimmickQueue
+    if not (queue and #queue > 0) then self.gimmickQueue = nil return false end
+    local item = table.remove(queue, 1)
+    local mon, battler, kind = item.mon, item.battler, item.kind
+    local started = false
+    if kind == "tera" then
+      started = self:startTeraAnim(mon, true)
+    elseif kind == "dynamax" then
+      started = self:startDynamaxAnim(mon, { already = true, force = true })
+    else
+      started = self:startEvolutionAnim(mon, { already = true, force = true })
+    end
+    if started then return true end
+    self:releaseGimmickHold(battler)
+    return self:startNextGimmickAnim()
+  end
+
+  -- A sequence finished (or could not be built): play the next one, or hand the
+  -- turn back to the normal resolve loop once the whole set piece is done.
+  function Screen:finishGimmickAnim()
+    if self:startNextGimmickAnim() then return end
+    -- A BOSS APPEARANCE transformation (see Screen:startBossTransformAnim) is
+    -- the intro's own beat, not a turn's: hand the narration straight back to
+    -- Screen:advanceIntro for the next beat, exactly as the intro was waiting
+    -- for, instead of stepping the resolve loop of a turn that has not begun.
+    if self.bossTransformIntro then
+      self.bossTransformIntro = nil
+      self:advanceIntro()
+      return
+    end
+    -- The set piece is over: this turn's armed picks have all been performed,
+    -- so drop them.  (beginTurn resets the map too; this covers a turn that
+    -- never reaches beginTurn, e.g. a battle that ends mid-sequence.)
+    self.gimmickArmed = {}
+    FN.clearGimmickOwner(self)
+    self:advanceResolving()
   end
 
   -- Consumes the turn one VISIBLE step at a time. A step ends when
@@ -6710,16 +9328,263 @@ return function(mod)
   -- That is the ordering the cart has ("X used TACKLE!" stays up while
   -- the bar empties underneath it), and it falls out of emit order for
   -- free rather than needing the events reordered or looked ahead at.
+  -- The scene's OWN two rows decide WHO answers the learn question (v4.4.0,
+  -- the user's rule): the modern learner runs only while the custom scene is
+  -- on (BACKGROUND not OFF) AND MODERN MOVE LEARN is ON; either one OFF is
+  -- the engine's classic learner, over the white sheet.  Both read lazily --
+  -- the battle runs long after every mod's load -- and fail-open to the
+  -- modern learner, which is the row's own default.
+  FN.modernMoveLearn = function()
+    local options = mod and mod.options
+    if options and type(options.get) == "function" then
+      local ok, value = pcall(function() return options:get("modern_move_learn") end)
+      if ok and value ~= nil then return value == "on" end
+    end
+    return true
+  end
+
+  -- BACKGROUND = OFF is the scene's master switch (background.lua's
+  -- M.sceneWanted): g9-battle-sample then routes every fight to the game's
+  -- own battle screen, so the learner there must stay native.  Read through
+  -- the sibling's own export when it is live, else the raw row, exactly the
+  -- way g9-battle-sample's shared.sceneWanted reads it -- the two can never
+  -- disagree about what OFF means.
+  FN.backgroundOff = function()
+    local api = mod and mod.exports and mod.exports.battleSceneBackground
+    if api and type(api.option) == "function" then
+      local ok, value = pcall(api.option, api)
+      if ok and type(value) == "string" and value ~= "" then return value == "off" end
+    end
+    local options = mod and mod.options
+    if options and type(options.get) == "function" then
+      local ok, value = pcall(function() return options:get("battle_background") end)
+      if ok and type(value) == "string" and value ~= "" then return value == "off" end
+    end
+    local sceneWanted = api and api.sceneWanted
+    if type(sceneWanted) == "function" then
+      local ok, wanted = pcall(sceneWanted, api)
+      if ok then return wanted == false end
+    end
+    return false
+  end
+
+  -- Which screen answers the learn question.  g9-gui (or any other suite that
+  -- takes the learner over) publishes the id it registered under; a registry
+  -- record wins over the engine's builtin inside src.ui.Screens.resolve, so
+  -- pushing that id reaches the MODERN screen whenever one is installed.  Read
+  -- lazily -- the battle runs long after every mod's load -- and fail-open: an
+  -- absent / failed / MODERN-UI-off g9-gui, or no exports at all, answers nil
+  -- and the scene pushes the engine's own classic learner id instead.
+  FN.guiMoveLearnId = function(game)
+    local ok, gui = pcall(function() return mod.find and mod.find("g9-gui") end)
+    if not ok or type(gui) ~= "table" then return nil end
+    local ex = gui.exports
+    local id = ex and ex.moveLearnScreenId
+    if type(id) == "string" and id ~= "" then return id end
+    return nil
+  end
+
+  -- Is the screen that id will actually build MOD-owned?  The engine marks a
+  -- registry-provided factory `__modOwned` (src/ui/Screens.lua), so this one
+  -- test covers g9-gui AND any other suite: such a screen paints its own
+  -- opaque full page, and the scene must not blank the field out from under it
+  -- (see FN.drawLearnSheet).  Any failure to resolve answers false -- the
+  -- classic path -- which is the safe direction.
+  FN.moveLearnOwned = function(game, id)
+    local ok, Screens = pcall(require, "src.ui.Screens")
+    if not ok or type(Screens) ~= "table"
+        or type(Screens.get) ~= "function" then
+      return false
+    end
+    local okG, factory = pcall(Screens.get, game, id)
+    return okG and type(factory) == "table" and factory.__modOwned == true
+  end
+
+  -- MOVE LEARNING, the no-suite fallback sheet.  While the engine's own
+  -- classic learner owns the turn -- a level-up wants a move and all four
+  -- slots are taken -- the whole field is a plain WHITE sheet: the "Delete an
+  -- older move to make room?" question is what is being asked, and the battle,
+  -- its HUD and the Pokemon have no business being read behind it (the user's
+  -- rule).  The scene is the drawn BASE under the pushed classic menu (a wide
+  -- battle keeps its surface through a menu -- Game.drawBaseInStack), so one
+  -- fill over the 320x180 design field covers the whole screen.  A MOD-owned
+  -- learner draws its own opaque page instead, so `self.learn.owned` suppresses
+  -- the sheet and the battle is simply left as it was, under that page.
+  -- Returns true when it painted and the frame is done.
+  FN.drawLearnSheet = function(self)
+    local learn = self and self.learn
+    if not (learn and not learn.owned) then return false end
+    love.graphics.setColor(1, 1, 1, 1)
+    love.graphics.rectangle("fill", 0, 0, VW, VH)
+    return true
+  end
+
+  -- Build and push the learner for this pause, and answer whether a MOD's own
+  -- page really went up.  This is the ONE place the scene decides between the
+  -- modern learner and the game's own, so the user's rule is readable at a
+  -- glance: with the custom scene ON (BACKGROUND not OFF) and MODERN MOVE
+  -- LEARN ON, the learner id a suite published (g9-gui's own, else the
+  -- engine's `MoveLearnMenu` -- where a suite normally registers) is resolved
+  -- through src.ui.Screens and, only when that id's factory is a registry
+  -- record (`__modOwned`) that actually builds, its page is pushed and true is
+  -- answered -- the battle is then left untouched under it.  Looking the
+  -- engine's id up as well means the modern path does not hinge on the
+  -- cross-mod export read alone: a registered learner is found even when
+  -- `mod.find` cannot see the suite.  EVERY other case pushes the engine's own
+  -- src.ui.MoveLearnMenu **directly** and answers false, so the white sheet is
+  -- guaranteed: the classic module is required by name, never resolved through
+  -- the registry, so a g9-gui record can never shadow it, and a modern screen
+  -- that failed to build can never leave the native question standing over a
+  -- live battlefield.  Builtin construction matches Screens.build (the same
+  -- constructor arguments, the same screenId stamp).
+  FN.pushLearner = function(game, mon, moveId, onDone)
+    if not FN.backgroundOff() and FN.modernMoveLearn() then
+      -- g9-gui registers under the engine's own id, so the engine id is the
+      -- fallback candidate: the modern path is found by the registry itself,
+      -- not only by the published export.
+      local published = FN.guiMoveLearnId(game)
+      local candidates = { published or "MoveLearnMenu" }
+      if published and published ~= "MoveLearnMenu" then
+        candidates[#candidates + 1] = "MoveLearnMenu"
+      end
+      local okS, Screens = pcall(require, "src.ui.Screens")
+      if okS and type(Screens) == "table" and type(Screens.get) == "function" then
+        for _, id in ipairs(candidates) do
+          local okF, factory = pcall(Screens.get, game, id)
+          if okF and type(factory) == "table" and factory.__modOwned == true
+              and type(factory.new) == "function" then
+            local okB, inst = pcall(factory.new, game, mon, moveId, onDone, "Level_Up")
+            if okB and type(inst) == "table" then
+              inst.screenId = inst.screenId or id
+              game.stack:push(inst)
+              return true
+            end
+            -- A modern learner that really is registered but will not build is
+            -- why a boot asking for it would otherwise fall to the native
+            -- question: leave the reason in the log before the white fallback.
+            if mod and mod.log and type(mod.log.warn) == "function" then
+              pcall(mod.log.warn, mod.log,
+                "g9-Battle-Scene: modern learner '%s' failed to build (%s) "
+                  .. "-- using the classic learner on the white field",
+                tostring(id), tostring(inst))
+            end
+          end
+        end
+      end
+    end
+    local Builtin = require("src.ui.MoveLearnMenu")
+    local inst = Builtin.new(game, mon, moveId, onDone, "Level_Up")
+    inst.screenId = inst.screenId or "MoveLearnMenu"
+    game.stack:push(inst)
+    return false
+  end
+
+  -- MOVE LEARNING DURING A BATTLE (the user's own rule: "next turn doesn't
+  -- follow until it's either decided not to learn or learnt").  A level-up
+  -- that grants a move is a PAUSE, not a message: when a `choose-forget` event
+  -- reaches the resolution queue -- emitted by g9-battle-engine's Gen 2
+  -- awardExperience (Battle.lua:3807), or by native.lua's Gen 1 learn checks --
+  -- this screen parks the queue on the game's OWN learn screen and does not
+  -- step the turn until it answers.  A free slot is learned without a question
+  -- (a `learn`/message event, already queued by the generation's own award), so
+  -- only the full-moveset case gets here.
+  --
+  -- The answer is the engine's own TryingToLearn / forget-list / AbandonLearning
+  -- flow -- the HM guard and the "1, 2 and... Poof!" narration included --
+  -- rather than a re-implementation that could drift from it.  The engine's
+  -- screen stack updates only its TOP state, so the battle behind it is
+  -- genuinely frozen while it is up.
+  --
+  -- WHO ANSWERS IT is a routing question now (FN.pushLearner, above).  The
+  -- engine's own src.ui.MoveLearnMenu answers whenever the scene's own two
+  -- rows say so -- BACKGROUND = OFF (the master switch; the fight is already
+  -- on the game's own screen) or MODERN MOVE LEARN = OFF -- and then the field
+  -- is whited out for the pause.  Otherwise g9-gui's published modern page
+  -- answers, and the battle is simply left as it was beneath it; if that page
+  -- is not installed or fails to build, the classic learner is used and the
+  -- white sheet still stands.
+  --
+  -- `event` is the generation's own record: Gen 1 feeds `mon` + `move` (a move
+  -- id) + `moveName`; Gen 2 feeds `index` (the party slot) + `move` (a move
+  -- entry) + `moveName`.  Returns true when the pause was started (the caller
+  -- must stop stepping the queue), false when the record cannot be resolved --
+  -- then the event is skipped exactly as an unknown event always was.
+  function Screen:beginMoveLearn(event)
+    if not (self.game and self.game.stack) then return false end
+    local mon = event.mon
+    if not mon and event.index then
+      local party = (self.battle and self.battle.party)
+        or (self.game.save and self.game.save.party) or {}
+      mon = party[event.index]
+    end
+    local moveId = event.move
+    if type(moveId) == "table" then moveId = moveId.id end
+    if not (type(mon) == "table" and type(moveId) == "string") then
+      return false
+    end
+    if type(mon.moves) ~= "table" then mon.moves = {} end
+    self.learn = { mon = mon, moveId = moveId }
+    self.suppressInputFrame = true
+    local screen = self
+    -- The push also answers whether a MOD's page really went up; only then is
+    -- the field left alone, so the sheet can never be suppressed by a learner
+    -- that did not build (FN.pushLearner).
+    self.learn.owned = FN.pushLearner(self.game, mon, moveId, function(learned)
+      screen.learn = nil
+      -- The press that dismissed the learn screen's last text box must not
+      -- also step the battle (the house fix; see Screen:raisePrompt).
+      screen.suppressInputFrame = true
+      if learned then
+        -- MoveLearnMenu writes the slot itself, so mirror what the native
+        -- learn tails re-raise for a mod counting moves.  Keep the in-play
+        -- battler's list pointing at the same table (the engine's own
+        -- Battle:resolveForget does this on Gen 2 for the same reason).
+        if Runtime and type(Runtime.emit) == "function" then
+          Runtime.emit("pokemon.move_learned", { mon = mon, moveId = moveId })
+        end
+        local b = screen.battle
+        if b and b.player and b.player.mon == mon
+            and type(mon.moves) == "table" and b.player.moves ~= mon.moves then
+          b.player.moves = mon.moves
+        end
+      end
+      -- The queue resumes here either way: the WANTED move was learned, or the
+      -- player gave up on it -- both resolve the learn, which is the whole
+      -- gate.  advanceResolving puts the next queued beat on screen.
+      screen:advanceResolving()
+    end, "Level_Up")
+    return true
+  end
+
   function Screen:advanceResolving()
-    -- A staged mega owns the turn until its clip reports done (Screen:
-    -- updateEvolution calls straight back here then) -- nothing may step the
-    -- turn out from under it.
-    if self.evolve then return end
+    -- A staged mega, dynamax or tera owns the turn until its clip reports done
+    -- (Screen:updateEvolution / updateDynamax / updateTera call straight back
+    -- here then) -- nothing may step the turn out from under it.
+    if self.evolve or self.dynamax or self.tera then return end
+    -- The learn screen owns the turn while it is up (see Screen:beginMoveLearn);
+    -- its onDone calls straight back here once the question is answered.
+    if self.learn then return end
     self.hpAnimHolds = false
     while #self.pendingEvents > 0 do
       local event = table.remove(self.pendingEvents, 1)
       self:armHpAnim(event.g9SceneHp)
       if event.kind == "move" then self:startMoveAnimFor(event) end
+      -- A move to learn with no free slot: pause the turn on the learn screen.
+      -- Handled BEFORE the text/last-resort branches so a textless
+      -- `choose-forget` is never silently skipped (which is what used to
+      -- happen -- the fourth move was just never learned).
+      if event.kind == "choose-forget" then
+        if self:beginMoveLearn(event) then return end
+      end
+      -- A SELF-SWITCH the engine paused the turn for (turn_order.lua's
+      -- PIVOT PAUSE): a move like U-turn/Teleport/Parting Shot (or a Dragon
+      -- Tail drag) has taken the player's own mon off the field mid-round.
+      -- The replacement pick is mandatory and the not-yet-acted moves resume
+      -- against whoever comes in, so the turn is held on the party list here
+      -- exactly as it is held on the learn screen above.
+      if event.kind == "pivot-switch" then
+        if self:beginPivotSwitch(event) then return end
+      end
       if event.text then
         self.currentMessage = event.text
         -- Minimum display time before this line may be acknowledged. A
@@ -6758,8 +9623,8 @@ return function(mod)
       if owner and target
           and self.combat.isAlive(owner) and self.combat.isAlive(target) then
         list[a], list[b] = target, owner
-        self.currentMessage = displayName(owner.mon) .. " switched places with "
-          .. displayName(target.mon) .. "!"
+        self.currentMessage = FN.displayName(owner.mon) .. " switched places with "
+          .. FN.displayName(target.mon) .. "!"
         self.beatHold = BEAT_HOLD_TEXT
       end
       -- Resolved either way -- this owner's cue is done.
@@ -6771,7 +9636,29 @@ return function(mod)
       -- this turn, so it never gets to act again until next turn.
       local action = table.remove(self.switchQueue, 1)
       local outgoing = self.playerBattlers[action.actorSlot]
-      self.playerBattlers[action.actorSlot] = self.combat.newBattler(action.mon, "player")
+      local incoming = self.combat.newBattler(action.mon, "player")
+      self.playerBattlers[action.actorSlot] = incoming
+      -- CRITICAL: every action already aimed at the mon that just left must
+      -- follow the SLOT to the mon arriving.  g9-battle-engine captures a
+      -- move's target as the real mon at QUEUE time (combat.lua's
+      -- toActingBattlers reads `action.target.mon`), and the outgoing mon is
+      -- still ALIVE -- it switched out, it did not faint -- so the engine's
+      -- own "the chosen target fainted, redirect to a live foe" rescue never
+      -- fires.  Without this the enemy's move (and any ally-directed move
+      -- aimed at the switching slot) resolved against the Pokemon that was
+      -- no longer on the field, and the switch-in took nothing: the reported
+      -- "damage lands on the one leaving the battlefield".  Repointing the
+      -- queued action at the arriving battler is what makes the switch-in
+      -- take the hit, exactly as the games do.  Both `moveQueue` (what the
+      -- resolution actually consumes, built in Screen:beginResolving) and
+      -- `queuedActions` (its source) are walked, so the two can never
+      -- disagree.
+      for _, queued in ipairs(self.moveQueue or {}) do
+        if queued.target == outgoing then queued.target = incoming end
+      end
+      for _, queued in ipairs(self.queuedActions or {}) do
+        if queued.target == outgoing then queued.target = incoming end
+      end
       -- EXP SHARE: the incoming mon is now active for every enemy present.
       self:expMarkActive(action.mon)
       -- The real, shared engine event bus: announce the switch so
@@ -6803,19 +9690,30 @@ return function(mod)
       -- which would then slide the bar from wherever the fallback left
       -- it rather than from where it was actually drawn.
       self.shownHp[action.mon] = action.mon.hp or 0
-      self.currentMessage = "Go, " .. displayName(action.mon) .. "!"
+      self.currentMessage = "Go, " .. FN.displayName(action.mon) .. "!"
       self.beatHold = BEAT_HOLD_TEXT
       return
     end
     if not self.movesResolved then
       if not self.movesBegun then
-        local formsMon = self.gimmickOwnerMon
-        -- MEGA EVOLUTION (see the MEGA EVOLUTION block below): a mega this
-        -- scene can actually dress hands the turn to the animation and returns
-        -- before the activation runs -- the clip's own reveal beat performs it
-        -- then, over the OLD sprite, with the swap hidden in its white flash.
-        if self:startEvolutionAnim(formsMon) then return end
-        self:applyGimmickActivation(formsMon)
+        -- THE GIMMICK SEQUENCE (see its own block above).  Every gimmick the
+        -- player armed this turn is activated here, one battle.turn_started
+        -- raise each and in the turn's own ACTION ORDER, and the enemy
+        -- trainer's own gimmick lands on the first of those raises -- so
+        -- several gimmicks, on either or both sides, can all take effect on
+        -- the same turn (battle_forms holds a single armed slot, so the scene
+        -- re-arms the right gimmick before each raise rather than letting the
+        -- last pick win).  Every Pokemon that actually transformed is then
+        -- staged in that same action order, and the turn is held until the
+        -- whole set piece has played out -- so no move's damage starts before
+        -- the transformations that belong to this turn are fully shown.
+        local armed = self:armedActorsInActionOrder()
+        local before = self:sampleGimmicks()
+        self:activateArmedGimmicks(armed)
+        local queue = self:buildGimmickQueue(before)
+        self.gimmickQueue = queue
+        self:holdGimmickQueue(queue)
+        if self:startNextGimmickAnim() then return end
       end
 
       if self.stepwise then
@@ -6959,6 +9857,9 @@ return function(mod)
         local mon = self:takeNextEnemyBenchMon()
         if not mon then return false end
         self.enemyBattlers[slot] = self.combat.newBattler(mon, "enemy")
+        -- POKéDEX SEEN: a benched trainer mon is stamped seen the moment it is
+        -- actually sent in, exactly where native's LoadEnemyMon stamps it.
+        N.markSeen(self.game, mon)
         -- EXP SHARE: a NEW enemy starts a fresh active set from whatever is
         -- on the player's field right now -- the outgoing enemy's set is
         -- abandoned, which is the "an enemy switching out resets activity"
@@ -6995,7 +9896,7 @@ return function(mod)
           })
         end
         self.currentMessage = (self:trainerDisplayName() or "TRAINER")
-          .. " sent out " .. displayName(mon) .. "!"
+          .. " sent out " .. FN.displayName(mon) .. "!"
         self.beatHold = BEAT_HOLD_TEXT
         self.ballThrow = { side = "enemy", slot = slot, t = 0 }
         return true
@@ -7120,11 +10021,11 @@ return function(mod)
   function Screen:chooseForcedMon(slot, mon, list)
     local reason
     if (mon.hp or 0) <= 0 then
-      reason = displayName(mon) .. " has no energy left to battle!"
+      reason = FN.displayName(mon) .. " has no energy left to battle!"
     else
       for _, b in ipairs(self.playerBattlers) do
         if b.mon == mon and self.combat.isAlive(b) then
-          reason = displayName(mon) .. " is already in battle!"
+          reason = FN.displayName(mon) .. " is already in battle!"
           break
         end
       end
@@ -7177,12 +10078,183 @@ return function(mod)
       })
     end
     self.shownHp[mon] = mon.hp or 0
-    self.currentMessage = "Go, " .. displayName(mon) .. "!"
+    self.currentMessage = "Go, " .. FN.displayName(mon) .. "!"
     self.beatHold = BEAT_HOLD_TEXT
     self.forcedSwitchOpen = nil
     -- The press that confirmed the pick must not also be read as the press
     -- that acknowledges the "Go, X!" line -- the same one-frame guard every
     -- other native-menu callback in this file sets.
+    self.suppressInputFrame = true
+    self.phase = "resolving"
+  end
+
+  ------------------------------------------------------------------
+  -- PIVOT SELF-SWITCH -- the mid-turn switch a move like U-turn, Volt
+  -- Switch, Flip Turn, Teleport, Parting Shot, Baton Pass or a Dragon Tail
+  -- drag forces.  g9-battle-engine's resolveTurnActions cannot open a party
+  -- menu, so it PAUSES the round at the switch (see its PIVOT PAUSE block)
+  -- and emits a `pivot-switch` event; this scene's own drain loop lands
+  -- here, opens the same mandatory party list a faint opens, performs the
+  -- switch on the pick, and then RESUMES the round -- so every move that had
+  -- not yet resolved against the outgoing slot follows it to the mon that
+  -- came in (g9-battle-engine repoints the not-yet-acted actors at it).
+  --
+  -- The timing therefore falls out of the turn order, which is the rule the
+  -- user asked for: Teleport (-6) acts LAST, so nothing is left pending and
+  -- the switch-in is exposed only to entry hazards / field conditions;
+  -- U-turn acting early leaves the opponent's move pending and it lands on
+  -- the switch-in.  A voluntary PKMN switch (Screen:trySwitchIn) already
+  -- follows the same slot rule.
+  ------------------------------------------------------------------
+  function Screen:beginPivotSwitch(event)
+    local outgoing = self:battlerFor(event and event.mon)
+    local slot
+    for i, b in ipairs(self.playerBattlers) do
+      if b == outgoing then slot = i break end
+    end
+    if not slot then
+      -- The engine paused for a player switch but named no battler we hold
+      -- (never happens for a forcedSwitch, which is player-side only).
+      -- Resume at once so the round can never stall on an unseen prompt.
+      local ok, events = pcall(self.combat.resumeAfterPivot, self.g9dex,
+        self.battle, nil, event and event.mon or nil)
+      for _, e in ipairs((ok and events) or {}) do
+        self.pendingEvents[#self.pendingEvents + 1] = e
+      end
+      return false
+    end
+    self.pivotSwitch = { slot = slot, outgoing = outgoing }
+    self:openPivotSwitch()
+    return true
+  end
+
+  -- The mandatory party list: no cancel back into the turn (a cancel prints
+  -- the same line the faint replacement uses and reopens the list).
+  function Screen:openPivotSwitch()
+    local save = self.game.save
+    local open
+    open = function()
+      local list
+      if N.isGen2 then
+        list = Screens.push(self.game, N.partyMenuId(), {
+          save = save,
+          party = save.party,
+          prompt = "which",
+          onCancel = function() self:refusePivotCancel(list) end,
+          onChoose = function(index, mon) self:choosePivotMon(mon, list) end,
+        })
+      else
+        list = Screens.push(self.game, N.partyMenuId(), {
+          save = save,
+          party = save.party,
+          forceSwitch = true,
+          pickOnly = true,
+          keepOpen = true,
+          onSwitch = function(mon) self:choosePivotMon(mon, list) end,
+          onCancel = function() self:refusePivotCancel(list) end,
+        })
+      end
+    end
+    self.forcedSwitchOpen = open
+    self.phase = "submenu"
+    if not (self.game and self.game.stack) then
+      -- No state stack to open a list on (headless): take the first healthy
+      -- reserve mon so the turn can never deadlock on an unseen prompt.
+      local bench = self:playerBench()
+      if bench[1] then self:applyPivotSwitch(bench[1]) end
+      return
+    end
+    open()
+  end
+
+  -- Same two refusals the faint replacement uses -- a fainted mon, or one
+  -- already standing on the field (which includes the mon that is leaving,
+  -- and is exactly why it cannot simply be picked again).
+  function Screen:choosePivotMon(mon, list)
+    local reason
+    if (mon.hp or 0) <= 0 then
+      reason = FN.displayName(mon) .. " has no energy left to battle!"
+    else
+      for _, b in ipairs(self.playerBattlers) do
+        if b.mon == mon and self.combat.isAlive(b) then
+          reason = FN.displayName(mon) .. " is already in battle!"
+          break
+        end
+      end
+    end
+    if reason then
+      if list then list:refuse(reason) end
+      return
+    end
+    if list then
+      if N.isGen2 then self.game.stack:pop()
+      elseif list.close then list:close()
+      else self.game.stack:pop() end
+    end
+    self:applyPivotSwitch(mon)
+  end
+
+  function Screen:refusePivotCancel(list)
+    if N.isGen2 then
+      if list then list:refuse(FORCED_SWITCH_TEXT) end
+      return
+    end
+    local TextBox = require("src.render.TextBox")
+    self.game.stack:push(TextBox.new(self.game, FORCED_SWITCH_TEXT, function()
+      self.suppressInputFrame = true
+      if self.forcedSwitchOpen then self.forcedSwitchOpen() end
+    end))
+  end
+
+  -- Puts `mon` into the slot the pivot vacated and resumes the paused round.
+  function Screen:applyPivotSwitch(mon)
+    local pivot = self.pivotSwitch
+    self.pivotSwitch = nil
+    self.forcedSwitchOpen = nil
+    local slot = (pivot and pivot.slot) or 1
+    local outgoing = self.playerBattlers[slot]
+    self.playerBattlers[slot] = self.combat.newBattler(mon, "player")
+    -- EXP SHARE: the incoming mon is active for every enemy present.
+    self:expMarkActive(mon)
+    -- Keep the engine's own field model on the mon actually out, so a later
+    -- read of battle.player (the end-of-turn residual this resume is about to
+    -- run, a foe's target fallback) names the switch-in, not the one that
+    -- left.  Only when it currently names the outgoing mon, so a doubles
+    -- slot that is not battle.player's own is left alone.
+    if self.battle and outgoing and self.battle.player == outgoing.mon then
+      self.battle.player = mon
+      pcall(function()
+        if self.battle.party then
+          for index, partyMon in ipairs(self.battle.party) do
+            if partyMon == mon then self.battle.playerIndex = index break end
+          end
+        end
+      end)
+    end
+    -- Same shared-bus announcement every other scene switch raises: the
+    -- engine's per-mon switch-in bookkeeping (Fake Out/First Impression
+    -- counter, Choice lock, switch-in abilities) and every entry hazard /
+    -- field-condition listener run off it.
+    if Runtime and Runtime.emit then
+      Runtime.emit("battle.battler_switched", {
+        battle = self.battle,
+        previous = outgoing and outgoing.mon or nil,
+        battler = mon,
+      })
+    end
+    self.shownHp[mon] = mon.hp or 0
+    self.currentMessage = "Go, " .. FN.displayName(mon) .. "!"
+    self.beatHold = BEAT_HOLD_TEXT
+    -- RESUME the round the pivot paused.  g9-battle-engine repoints every
+    -- actor that had not acted yet -- whose chosen target was the mon that
+    -- left -- at `mon`, resolves them, and runs the end-of-turn, all inside
+    -- this one call; the events come back exactly like the batch turn's.
+    local ok, events = pcall(self.combat.resumeAfterPivot, self.g9dex,
+      self.battle, mon, outgoing and outgoing.mon or nil)
+    events = self:awardFaintExp((ok and events) or {})
+    for _, event in ipairs(events or {}) do
+      self.pendingEvents[#self.pendingEvents + 1] = event
+    end
     self.suppressInputFrame = true
     self.phase = "resolving"
   end
@@ -7267,10 +10339,10 @@ return function(mod)
   -- A press during a hold ends that hold and nothing else; it never also
   -- eats the line underneath, so no message can be skipped unread.
   function Screen:updateResolving(input, dt)
-    -- The staged mega animation owns this beat's whole screen and clock; a
-    -- press cannot skip a once-per-battle transformation (Screen:updateEvolution
-    -- is what ends it).
-    if self.evolve then return end
+    -- The staged mega/dynamax/tera animation owns this beat's whole screen and
+    -- clock; a press cannot skip a once-per-battle transformation
+    -- (Screen:updateEvolution / updateDynamax / updateTera is what ends it).
+    if self.evolve or self.dynamax or self.tera then return end
     -- A press only counts once BOTH the commit window (0.3s after the
     -- action was queued -- see INPUT_DELAY) and this beat's own minimum
     -- display time have elapsed. A bar that is still draining or a move
@@ -7378,14 +10450,58 @@ return function(mod)
   ------------------------------------------------------------------
   -- OVER
   ------------------------------------------------------------------
+  -- The player is done reading the result: run whatever the cart still owes
+  -- before the screen comes down, then exit.  The only such beat is
+  -- ExitBattle's own after-battle arm -- the EvolveAfterBattle sweep (and, on
+  -- Gen 2, GivePokerusAndConvertBerries) -- which the native screen runs
+  -- BETWEEN the victory message and CleanUpBattleRAM.  A scene-drawn fight
+  -- never reached the native screen's WIN arm at all, so this is what makes an
+  -- evolution after a scene battle happen; without it the sweep never ran.
+  --
+  -- The evolution screens are pushed ON TOP of this one and stay there while
+  -- they play, exactly as native pushes them over its own battle screen.  Only
+  -- when the last one resolves does the real exit run -- so the map music,
+  -- wildCooldown and battle.ended timing in Screen:finishBattleExit keep the
+  -- same relationship to the evolution movie that native's CleanUpBattleRAM
+  -- has.
+  --
+  -- `battleExitDone` makes exit() idempotent on purpose: the Gen 1 sweep calls
+  -- its onDone synchronously when nothing is pending AND still reports that it
+  -- staged the sweep, so the same function must be safe to reach twice.
+  function Screen:beginAfterBattleExit()
+    if self.afterBattleExitStarted then return end
+    self.afterBattleExitStarted = true
+    local function exit()
+      if self.battleExitDone then return end
+      self.battleExitDone = true
+      -- Native's order: the save beat (Pokerus/berry juice) sits after the
+      -- evolutions and immediately before CleanUpBattleRAM / battle.ended.
+      pcall(N.afterBattleSaveEffects, self)
+      self:finishBattleExit()
+      self.game.stack:pop()
+    end
+    -- Only a won battle evolves anything (ExitBattle's `and $f / jr nz`): a
+    -- loss, a draw, a run and a catch never reach EvolveAfterBattle in the
+    -- cart, and no exp was awarded on those outcomes anyway.
+    if self.outcome == "win" then
+      local ok, staged = pcall(N.runAfterBattleEvolutions, self, exit)
+      if ok and staged then return end
+      if not ok then
+        mod.log:warn("g9_Battle_Scene: after-battle evolution crashed: %s",
+          tostring(staged))
+      end
+    end
+    exit()
+  end
+
   function Screen:updateOver(input)
     if input:wasPressed("a") or input:wasPressed("b") then
       -- Called explicitly, right here, before the pop -- the same place
       -- native's own onDone closure does its cleanup (World.lua:5865:
       -- the callback pops the screen AND restores the map music itself,
-      -- not a generic post-pop hook).
-      self:finishBattleExit()
-      self.game.stack:pop()
+      -- not a generic post-pop hook).  beginAfterBattleExit adds the
+      -- after-battle evolution sweep ahead of that cleanup.
+      self:beginAfterBattleExit()
     end
   end
 
@@ -7599,7 +10715,7 @@ return function(mod)
   function Screen:drawPromptF()
     local ask = self.prompt
     if not ask then return end
-    drawWrapped(ask.text, self.fTextX, self.fTextY, self.fChars)
+    FN.drawWrapped(ask.text, self.fTextX, self.fTextY, self.fChars)
   end
 
   -- E: the two labels where FIGHT/BAG/PKMN/RUN normally sit, same rows,
@@ -7612,7 +10728,7 @@ return function(mod)
     local ask = self.prompt
     if not ask then return end
     for i = 1, 2 do
-      local label = fitName(ask.choices[i], E_INTERIOR_W - PROMPT_LABEL_INSET, 0)
+      local label = FN.fitName(ask.choices[i], E_INTERIOR_W - PROMPT_LABEL_INSET, 0)
       Font.draw(label, self.eTextX + PROMPT_LABEL_INSET,
         self.eTextY + (i - 1) * PROMPT_ROW_GAP)
     end
@@ -7665,11 +10781,21 @@ return function(mod)
     -- input -- a label fades out over DMG_NUMBER_LIFE seconds whatever
     -- else is happening (see Screen:stepDmgNumbers).
     self:stepDmgNumbers(dt)
-    -- The staged MEGA EVOLUTION sequence (a no-op unless self.evolve is set --
-    -- see the MEGA EVOLUTION block).  Stepped here, before the phase dispatch
-    -- and independent of input, so its reveal beat (which performs the form
-    -- change) lands before this frame is drawn and no press can skip it.
+    -- The staged MEGA EVOLUTION / DYNAMAX sequences (a no-op unless self.evolve
+    -- or self.dynamax is set -- see those blocks).  Stepped here, before the
+    -- phase dispatch and independent of input, so their reveal beats (which
+    -- perform the form change) land before this frame is drawn and no press
+    -- can skip them.
     if self.evolve then self:updateEvolution(dt) end
+    if self.dynamax then self:updateDynamax(dt) end
+    if self.tera then self:updateTera(dt) end
+    -- The DRAW-ONLY Dynamax HP skin (see the DYNAMAX block): its ramps and its
+    -- lifetime are independent of any clip, so it ticks here whether or not a
+    -- sequence is running.
+    self:updateDynamaxHpSkin(dt)
+    -- DYNAMAX FIELD: the field's own clock and the live faint bursts (see the
+    -- DYNAMAX FIELD block).
+    self:stepDynamaxBursts(dt)
     -- Independent of input/phase -- a move animation keeps stepping
     -- underneath the message text the same way it does in every real
     -- Pokemon battle. Runner:step() returns false once the animation
@@ -7881,14 +11007,14 @@ return function(mod)
       -- The game's own ball as it flies this screen's arc: Gen 2's native
       -- object tumbling on its POKE_BALL_1 frameset, or Gen 1's own ball
       -- frame (drawPokeball only if that data isn't in the cache).
-      if not drawNativeBall(self, x, y, t, false) then
-        drawPokeball(x, y, BALL_RADIUS, p)
+      if not FN.drawNativeBall(self, x, y, t, false) then
+        FN.drawPokeball(x, y, BALL_RADIUS, p)
       end
     elseif t < BALL_FLIGHT + BALL_POOF then
       -- Landed: show the ball on the platform (lifted so it sits on the
       -- ground, not half-buried) under the white flash that fades as the
       -- mon materializes -- Gen 2's own opening pose, or Gen 1's own ball.
-      drawNativeBall(self, tx, ty - BALL_LAND_LIFT, 0, true)
+      FN.drawNativeBall(self, tx, ty - BALL_LAND_LIFT, 0, true)
       local tp = (t - BALL_FLIGHT) / BALL_POOF
       love.graphics.setColor(1, 1, 1, 1 - tp)
       love.graphics.circle("fill", tx, ty, 4 + tp * 20)
@@ -7932,16 +11058,16 @@ return function(mod)
       end
       return enemyRects, playerRects
     end
-    local enemyCols = sideColumns(#self.enemyBattlers, "enemy", self.isBoss, false)
-    local playerCols = sideColumns(#self.playerBattlers, "player", false, self.isHorde)
+    local enemyCols = FN.sideColumns(#self.enemyBattlers, "enemy", self.isBoss, false)
+    local playerCols = FN.sideColumns(#self.playerBattlers, "player", false, self.isHorde)
     local enemyRects, playerRects = {}, {}
     for i = 1, #self.enemyBattlers do
       enemyRects[i] = (self.isBoss and i == 1)
-        and bossSlot()
-        or slotRect(enemyCols, enemyCols[i], ENEMY_FEET_T, ROW_H, "enemy")
+        and FN.bossSlot()
+        or FN.slotRect(enemyCols, enemyCols[i], ENEMY_FEET_T, ROW_H, "enemy")
     end
     for i = 1, #self.playerBattlers do
-      playerRects[i] = slotRect(playerCols, playerCols[i], ALLY_FEET_T, ROW_H, "ally")
+      playerRects[i] = FN.slotRect(playerCols, playerCols[i], ALLY_FEET_T, ROW_H, "ally")
     end
     return enemyRects, playerRects
   end
@@ -7975,7 +11101,7 @@ return function(mod)
     if side == "enemy" then
       local battler, r = self.enemyBattlers[slot], enemyRects[slot]
       if battler and r then
-        resolveSprite(r, self.isBoss and slot == 1, battler, "spriteFront",
+        FN.resolveSprite(r, self.isBoss and slot == 1, battler, "spriteFront",
           self.data, self.spriteScaleFront)
       end
     else
@@ -7987,10 +11113,23 @@ return function(mod)
         -- sheet and the send-out flashes its vanilla pic while the real one
         -- builds (the exact native flash this pre-warm exists to prevent).
         local field = self.fantasyLayout and "spriteFront" or "spriteBack"
-        resolveSprite(r, false, battler, field,
+        FN.resolveSprite(r, false, battler, field,
           self.data, self.spriteScaleBack)
       end
     end
+  end
+
+  -- Pre-warm BOTH leads the moment the battle screen is built, before the first
+  -- intro beat is even shown.  The throw beat's own prewarmSlot only fires when
+  -- the ball starts its flight, so any narration/slide beats ahead of it are
+  -- wasted head start; asking here buys those beats as well, so a sheet too big
+  -- to finish inside BALL_THROW_TOTAL still arrives baked.  Leads only: the
+  -- bench is called out later, and pre-warming the whole roster now would split
+  -- the sprite mod's per-frame bake budget across sheets nobody is waiting on.
+  function Screen:prewarmLeads()
+    if not Runtime.wantsHook("battle.mon_pic") then return end
+    self:prewarmSlot("enemy", 1)
+    self:prewarmSlot("player", 1)
   end
 
   -- Optional ground plane behind the sprites, drawn FIRST by drawContent so
@@ -8019,6 +11158,13 @@ return function(mod)
   end
 
   function Screen:drawContent()
+    -- MOVE LEARNING, the no-suite path (see FN.drawLearnSheet): while the
+    -- engine's own classic learner owns the turn the whole field is a plain
+    -- white sheet -- the "Delete an older move?" question is the screen, and
+    -- the Pokemon, the HUD and the terrain must not sit behind it.  A
+    -- mod-owned learner draws its own opaque page, so this returns false and
+    -- the scene draws unchanged under that page.
+    if FN.drawLearnSheet(self) then return end
     -- Field art first (no-op unless the BACKGROUND option is on).
     self:drawBattleBackground()
     -- Sprite positions come from the shared 8-column grid (sideColumns/
@@ -8075,17 +11221,48 @@ return function(mod)
     local playerSpriteField, playerFlip = self:spriteArt("player")
     local enemySpriteField = self:spriteArt("enemy")
 
+    -- DYNAMAX: the clip's BACK layer (its dim, its red furnace and the far
+    -- half of its cloud) goes here, before any sprite.  The light has to be
+    -- behind the creature for the silhouette the clip darkens it into to read
+    -- at all; see the DYNAMAX block.
+    self:drawDynamaxBack()
+    -- TERA: the crystal show's BACK layer (the ground glow and the far shards),
+    -- also before any sprite (see the TERA block).
+    self:drawTeraBack()
+    -- DYNAMAX FIELD: the persistent darkened field and the red auras, behind
+    -- every sprite (see the DYNAMAX FIELD block).  Drawn even when no clip is
+    -- playing -- it is the state of a Dynamaxed mon, not the transformation.
+    self:drawDynamaxField()
+
     for _, i in ipairs(self:paintOrder(self.enemyBattlers)) do
       local battler = self.enemyBattlers[i]
       local r = enemyRects[i]
       local boss = self.isBoss and i == 1
+      -- DYNAMAX FIELD: the delayed faint and the burst (see the DYNAMAX FIELD
+      -- block).  A Dynamaxed mon keeps its sprite -- still shrinking -- after
+      -- its HP has hit zero; only once the shrink is done does it burst and
+      -- vanish.  Every other battler is unaffected.
+      local dynSt = self.__dynStates and self.__dynStates[battler]
+      local dynHp = self:shownHpOf(battler.mon) or 0
+      local dynHold = false
+      if dynHp <= 0 and battler.__g9DynWasActive
+          and not battler.__g9DynBurstDone then
+        if Ev.dyn.transformed(dynSt) then
+          dynHold = true
+        else
+          self:spawnDynamaxBurst(battler)
+          battler.__g9DynBurstDone = true
+        end
+      end
+      local dynVisible = (dynHp > 0 or dynHold) and not battler.caught
+        and not FN.animHidesMon(self, "enemy")
       -- Trainer-battle intro: the enemy trainer's class front-pic stands
       -- in the enemy slot (native's InitEnemyTrainer) while "{TRAINER}
       -- wants to battle!" reads, then slides right off in 8px steps
       -- (native's SlideBattlePicOut) before the first mon is sent out.
       if self.showEnemyTrainer and self.enemyTrainerImage and i == 1 then
-        drawRawImage(self.enemyTrainerImage, r,
-          slideStepPx(self.trainerSlide, TRAINER_SLIDE_DURATION, TRAINER_SLIDE_STEPS),
+        FN.drawRawImage(self.enemyTrainerImage, r,
+          FN.slideStepPx(self.trainerSlide, TRAINER_SLIDE_DURATION, TRAINER_SLIDE_STEPS),
           true, self.enemyTrainerColors, self.enemyTrainerTrueColor)
       elseif self.wildFade and self.wildFade.slot == i
           and (self:shownHpOf(battler.mon) or 0) > 0 and not battler.caught then
@@ -8097,22 +11274,26 @@ return function(mod)
         -- the one that simply materializes. HUD + sprite are revealed only
         -- once the fade ends, exactly as the old drop gated them on landing.
         local p = math.min(1, self.wildFade.t / WILD_FADE_DURATION)
-        local ax, ay, dty, dth, dfull, ddw = drawSprite(r, boss, battler, enemySpriteField, self.data, true, 0, 0, nil, self.spriteScaleFront, p)
+        local ax, ay, dty, dth, dfull, ddw = FN.drawSprite(r, boss, battler, enemySpriteField, self.data, true, 0, 0, nil, self.spriteScaleFront, p)
         if ax then
           self.spriteAnchor[battler] = { x = ax, y = ay, top = dty, h = dth, w = ddw }
           noteHead(battler, dty, dth, dfull)
         end
-      elseif self.enemyRevealed[i] and (self:shownHpOf(battler.mon) or 0) > 0
-          and not battler.caught and not animHidesMon(self, "enemy") then
+      elseif self.enemyRevealed[i] and dynVisible then
         -- A fainted/caught battler's sprite is gone -- the box already hides
         -- on its own (drawGuiBox) and the sprite must follow, so a downed
         -- mon reads as an empty slot and the outro's win/defeat line plays
         -- over an empty field. Keyed off the CHASING hp (shownHpOf), so the
         -- sprite vanishes exactly when its bar drains to zero under the
         -- fainted narration, not the frame the whole turn's math commits.
-        local appear = ballAppearFor(self, "enemy", i)
+        local appear = FN.ballAppearFor(self, "enemy", i)
         local ew, es = self:evolutionFx(battler)
-        local ax, ay, dty, dth, dfull, ddw = drawSprite(r, boss, battler, enemySpriteField, self.data, true, 0, 0, appear, self.spriteScaleFront * (es or 1), nil, nil, ew)
+        -- TERA: the crystallising battler whitens inside its shell (see the
+        -- TERA block); composed with the mega whiten the same way the dynamax
+        -- darken is composed.
+        local tw = self:teraFx(battler)
+        if tw then ew = math.max(ew or 0, tw) end
+        local ax, ay, dty, dth, dfull, ddw = FN.drawSprite(r, boss, battler, enemySpriteField, self.data, true, 0, 0, appear, self.spriteScaleFront * (es or 1), nil, nil, ew, self:dynamaxFx(battler))
         if ax then
           self.spriteAnchor[battler] = { x = ax, y = ay, top = dty, h = dth, w = ddw }
           noteHead(battler, dty, dth, dfull)
@@ -8123,22 +11304,39 @@ return function(mod)
     for _, i in ipairs(self:paintOrder(self.playerBattlers)) do
       local battler = self.playerBattlers[i]
       local r = playerRects[i]
+      -- DYNAMAX FIELD: the same delayed faint on the player's side (see the
+      -- DYNAMAX FIELD block and the enemy loop above).
+      local dynSt = self.__dynStates and self.__dynStates[battler]
+      local dynHp = self:shownHpOf(battler.mon) or 0
+      local dynHold = false
+      if dynHp <= 0 and battler.__g9DynWasActive
+          and not battler.__g9DynBurstDone then
+        if Ev.dyn.transformed(dynSt) then
+          dynHold = true
+        else
+          self:spawnDynamaxBurst(battler)
+          battler.__g9DynBurstDone = true
+        end
+      end
+      local dynVisible = (dynHp > 0 or dynHold) and not battler.caught
+        and not FN.animHidesMon(self, "player")
       -- Intro lead-in: the player trainer's back-pic stands in the player
       -- slot (native's GetTrainerBackpic) until the very end of the
       -- intro, then slides left off in 8px steps (native's backpic-slide)
       -- just before the first "Go! P!". Only then is this mon drawn.
       if self.showPlayerTrainer and self.playerTrainerImage and i == 1 then
-        drawRawImage(self.playerTrainerImage, r,
-          -slideStepPx(self.backpicSlide, BACKPIC_SLIDE_DURATION, BACKPIC_SLIDE_STEPS),
+        FN.drawRawImage(self.playerTrainerImage, r,
+          -FN.slideStepPx(self.backpicSlide, BACKPIC_SLIDE_DURATION, BACKPIC_SLIDE_STEPS),
           nil, self.playerTrainerColors, self.playerTrainerTrueColor)
-      elseif self.playerRevealed[i] and (self:shownHpOf(battler.mon) or 0) > 0
-          and not battler.caught and not animHidesMon(self, "player") then
+      elseif self.playerRevealed[i] and dynVisible then
         -- Pokeball send-out: the mon materializes at its platform (the
         -- ball itself is drawn by drawBallThrow) -- scaled in from the
         -- ground via ballAppearFor while its own "Go! P!" line reads.
-        local appear = ballAppearFor(self, "player", i)
+        local appear = FN.ballAppearFor(self, "player", i)
         local ew, es = self:evolutionFx(battler)
-        local ax, ay, dty, dth, dfull, ddw = drawSprite(r, false, battler, playerSpriteField, self.data, false, 0, 0, appear, self.spriteScaleBack * (es or 1), nil, playerFlip, ew)
+        local tw = self:teraFx(battler)
+        if tw then ew = math.max(ew or 0, tw) end
+        local ax, ay, dty, dth, dfull, ddw = FN.drawSprite(r, false, battler, playerSpriteField, self.data, false, 0, 0, appear, self.spriteScaleBack * (es or 1), nil, playerFlip, ew, self:dynamaxFx(battler))
         if ax then
           self.spriteAnchor[battler] = { x = ax, y = ay, top = dty, h = dth, w = ddw }
           noteHead(battler, dty, dth, dfull)
@@ -8173,16 +11371,16 @@ return function(mod)
     -- that mon's own head line (see Screen.fantasyHeadY) -- a hat on the mon it
     -- reports on, wherever the zig-zag puts it. The normal horizontal layout
     -- is untouched.
-    local enemyRow = self.fantasyLayout and enemyCentres or spreadBoxCentres(enemyCentres)
-    local playerRow = self.fantasyLayout and playerCentres or spreadBoxCentres(playerCentres)
+    local enemyRow = self.fantasyLayout and enemyCentres or FN.spreadBoxCentres(enemyCentres)
+    local playerRow = self.fantasyLayout and playerCentres or FN.spreadBoxCentres(playerCentres)
     -- One head line per side -- the mean of the heads of the sprites DRAWN
     -- for it this frame (sideHeadY/headLines) -- so every box on the side
     -- keeps the same height. Each box puts its BOTTOM edge on that line
     -- (one box per slot now, so both sides place their single row the same
     -- way); a side with nothing drawn yet falls back to its own ground line
     -- (its HUD is hidden until then anyway).
-    local GUI_HEADLINE_ENEMY = sideHeadY(self.enemyBattlers, headLines, ENEMY_FEET_T * 8)
-    local GUI_HEADLINE_ALLY = sideHeadY(self.playerBattlers, headLines, ALLY_FEET_T * 8)
+    local GUI_HEADLINE_ENEMY = FN.sideHeadY(self.enemyBattlers, headLines, ENEMY_FEET_T * 8)
+    local GUI_HEADLINE_ALLY = FN.sideHeadY(self.playerBattlers, headLines, ALLY_FEET_T * 8)
     local GUI_TOP_ENEMY = GUI_HEADLINE_ENEMY - GUI_BOX_H_ENEMY * BOX_SCALE * 8
     local GUI_TOP_ALLY = GUI_HEADLINE_ALLY - GUI_BOX_H_PLAYER * BOX_SCALE * 8
     -- Where each battler's readout actually landed this frame (its centre-x,
@@ -8206,10 +11404,10 @@ return function(mod)
         -- horizontal path.
         local groundY = enemyRects[i].y + enemyRects[i].h
         local headY = Screen.fantasyHeadY(headLines, battler, groundY)
-        gx, gy = self:pos("enemyGui" .. i, guiTxOn(enemyCentres[i]),
+        gx, gy = self:pos("enemyGui" .. i, FN.guiTxOn(enemyCentres[i]),
           (headY - GUI_BOX_H_ENEMY * BOX_SCALE * 8) / 8)
       else
-        gx, gy = self:pos("enemyGui" .. i, guiTxOn(enemyRow[i]), GUI_TOP_ENEMY / 8)
+        gx, gy = self:pos("enemyGui" .. i, FN.guiTxOn(enemyRow[i]), GUI_TOP_ENEMY / 8)
       end
       local gs = self:sizeMul("enemyGui" .. i)
       self.hudMark[battler] = { x = gx * 8 + GUI_BOX_HALF_W * gs, top = gy * 8,
@@ -8219,8 +11417,9 @@ return function(mod)
       -- battle's intro shows the trainer's pic, not the mon, in this
       -- slot) -- drawGuiBox still hides it on its own for fainted/caught.
       if self.enemyRevealed[i] then
-        drawGuiBox(gx, gy, GUI_TW, GUI_BOX_H_ENEMY, battler, self.data, false,
-          false, gs, self:shownHpOf(battler.mon), self.hud)
+        FN.drawGuiBox(gx, gy, GUI_TW, GUI_BOX_H_ENEMY, battler, self.data, false,
+          false, gs, self:shownHpOf(battler.mon), self.hud, true,
+          self:dynamaxHpSkinDisplay(battler.mon))
       end
     end
     for i, battler in ipairs(self.playerBattlers) do
@@ -8250,18 +11449,19 @@ return function(mod)
           -- its bottom edge on that mon's own head line.
           local groundY = playerRects[i].y + playerRects[i].h
           local headY = Screen.fantasyHeadY(headLines, battler, groundY)
-          gx, gy = self:pos("playerGui" .. i, guiTxOn(playerCentres[i]),
+          gx, gy = self:pos("playerGui" .. i, FN.guiTxOn(playerCentres[i]),
             (headY - GUI_BOX_H_PLAYER * BOX_SCALE * 8) / 8)
         else
-          gx, gy = self:pos("playerGui" .. i, guiTxOn(playerRow[i]), GUI_TOP_ALLY / 8)
+          gx, gy = self:pos("playerGui" .. i, FN.guiTxOn(playerRow[i]), GUI_TOP_ALLY / 8)
         end
         local gs = self:sizeMul("playerGui" .. i)
         self.hudMark[battler] = { x = gx * 8 + GUI_BOX_HALF_W * gs, top = gy * 8,
           left = gx * 8, gs = gs, h = GUI_BOX_H_PLAYER * 8,
           visible = self.playerRevealed[i] and true or false }
         if self.playerRevealed[i] then
-          drawGuiBox(gx, gy, GUI_TW, GUI_BOX_H_PLAYER, battler, self.data, true,
-            false, gs, self:shownHpOf(battler.mon), self.hud)
+          FN.drawGuiBox(gx, gy, GUI_TW, GUI_BOX_H_PLAYER, battler, self.data, true,
+            false, gs, self:shownHpOf(battler.mon), self.hud, nil,
+            self:dynamaxHpSkinDisplay(battler.mon))
         end
       end
     end
@@ -8313,6 +11513,16 @@ return function(mod)
     -- keeps its text box legible over the effects).
     self:drawEvolution()
 
+    -- DYNAMAX: the same slot for the growing sequence's FRONT layer (its back
+    -- layer already went out before the sprites -- see drawDynamaxBack).
+    self:drawDynamax()
+    -- TERA: the same slot for the crystal show's FRONT layer (its back layer
+    -- already went out before the sprites -- see drawTeraBack).
+    self:drawTera()
+    -- DYNAMAX FIELD: the faint bursts, over every sprite (see the DYNAMAX FIELD
+    -- block).
+    self:drawDynamaxFieldFront()
+
     -- Bottom: F (message/move/target, wide) beside E (FIGHT/BAG/PKMN/RUN,
     -- narrow), the two panes of the cart's own bottom box. Both go through
     -- Screen:withScale to apply their tuned size (see its own header for
@@ -8361,14 +11571,14 @@ return function(mod)
       self:withScale("fBox", fx, fy, function()
         love.graphics.setColor(1, 1, 1, 1)
         if joined then
-          drawNativeFrame(fx, fy, fw + E_TW, BOTTOM_H)
-          drawNativeDivider(ex, fy, BOTTOM_H)
+          FN.drawNativeFrame(fx, fy, fw + E_TW, BOTTOM_H)
+          FN.drawNativeDivider(ex, fy, BOTTOM_H)
         else
-          drawNativeFrame(fx, fy, fw, BOTTOM_H)
+          FN.drawNativeFrame(fx, fy, fw, BOTTOM_H)
         end
         love.graphics.setColor(0, 0, 0, 1)
         if self.phase == "intro" then
-          drawWrapped(self.currentMessage or "", self.fTextX, self.fTextY, self.fChars)
+          FN.drawWrapped(self.currentMessage or "", self.fTextX, self.fTextY, self.fChars)
         elseif self.phase == "actionMenu" then
           self:drawActionMenuF()
         elseif self.phase == "moveSelect" then
@@ -8382,9 +11592,9 @@ return function(mod)
         elseif self.phase == PROMPT_PHASE then
           self:drawPromptF()
         elseif self.phase == "resolving" then
-          drawWrapped(self.currentMessage or "", self.fTextX, self.fTextY, self.fChars)
+          FN.drawWrapped(self.currentMessage or "", self.fTextX, self.fTextY, self.fChars)
         elseif self.phase == "over" then
-          drawWrapped(self.overMessage or "", self.fTextX, self.fTextY, self.fChars)
+          FN.drawWrapped(self.overMessage or "", self.fTextX, self.fTextY, self.fChars)
         end
       end)
 
@@ -8392,7 +11602,7 @@ return function(mod)
         self:withScale("eBox", ex, ey, function()
           if not joined then
             love.graphics.setColor(1, 1, 1, 1)
-            drawNativeFrame(ex, ey, E_TW, BOTTOM_H)
+            FN.drawNativeFrame(ex, ey, E_TW, BOTTOM_H)
           end
           love.graphics.setColor(0, 0, 0, 1)
           -- The prompt's two labels go where FIGHT/BAG/PKMN/RUN normally sit
@@ -8447,13 +11657,22 @@ return function(mod)
     for slot, battler in ipairs(self.playerBattlers) do
       local mon = battler and battler.mon
       if mon and self.playerRevealed[slot] then
+        local dhp = self:shownHpOf(mon) or mon.hp or 0
+        local dmax = FN.maxHpOf(mon)
+        -- The DRAW-ONLY Dynamax HP skin (see the DYNAMAX block): the fantasy
+        -- party row shows the same scaled numbers the native readouts do.
+        local skin = self:dynamaxHpSkinDisplay(mon)
+        if skin then
+          dhp = math.floor(dhp * (skin.hp or 1) + 0.5)
+          dmax = math.floor(dmax * (skin.max or 1) + 0.5)
+        end
         party[slot] = {
-          name = displayName(mon),
-          hp = self:shownHpOf(mon) or mon.hp or 0,
-          maxHp = maxHpOf(mon),
+          name = FN.displayName(mon),
+          hp = dhp,
+          maxHp = dmax,
           level = mon.level or 1,
-          expFrac = expFraction(mon, self.data),
-          eff = statusTag(mon, self.data),
+          expFrac = FN.expFraction(mon, self.data),
+          eff = FN.statusTag(mon, self.data),
           alive = combat.isAlive(battler),
         }
       end
@@ -8575,8 +11794,8 @@ return function(mod)
     if not (w and h and w > 0 and h > 0) then
       w, h = love.graphics.getDimensions()
     end
-    local scale = fitScale(w, h)
-    local ox, oy = fitOrigin(w, h, scale)
+    local scale = FN.fitScale(w, h)
+    local ox, oy = FN.fitOrigin(w, h, scale)
     love.graphics.push()
     love.graphics.translate(ox, oy)
     -- Window px per CANVAS px (scale) times CANVAS px per DESIGN px (DS):
@@ -8593,8 +11812,8 @@ return function(mod)
   function Screen:drawWidescreen(winW, winH)
     love.graphics.setColor(1, 1, 1, 1)
     love.graphics.rectangle("fill", 0, 0, winW, winH)
-    local scale = fitScale(winW, winH)
-    local ox, oy = fitOrigin(winW, winH, scale)
+    local scale = FN.fitScale(winW, winH)
+    local ox, oy = FN.fitOrigin(winW, winH, scale)
     love.graphics.push()
     love.graphics.translate(ox, oy)
     love.graphics.scale(scale * DS, scale * DS)
@@ -8716,7 +11935,7 @@ return function(mod)
   -- roster this screen is actually rendering, e.g. just 2 of a trainer's
   -- full team for a doubles subset) rather than trusting whatever the
   -- real trainer table's own `party` field says.
-  local function buildBattle(game, data)
+  FN.buildBattle = function(game, data)
     -- `Battle.party` is the WHOLE player party, not the mons this layout
     -- fields.  src/battle/gen2/Battle.lua's own contract is "party -- the
     -- player's party (array of Mon)" and Battle.party IS save.party: the
@@ -8794,7 +12013,7 @@ return function(mod)
         .. "one encounter, so battle.started has fired twice and any mod "
         .. "holding the battle it was told about is holding the wrong one.")
     end
-    local battle = buildBattle(game, data)
+    local battle = FN.buildBattle(game, data)
     -- Wild-boss special properties (SPECIAL BOSSES / SHINY BOSS) and the
     -- BOSS CATCH marker -- see special_boss.lua's own header.  Runs BEFORE
     -- Screen.new on purpose: the shiny flag decides which sprite the intro
@@ -8856,7 +12075,7 @@ return function(mod)
   -- other line in that function relies on -- is what separates "the screen
   -- being played" from "the last screen that was". Parking a question on a
   -- screen one frame from being popped would silently drop it.
-  local function resolvePromptTarget(target)
+  FN.resolvePromptTarget = function(target)
     local live = lastScreen
     if live ~= nil and live.exited then live = nil end
     if target == nil then return live end
@@ -8927,7 +12146,7 @@ return function(mod)
     if type(request.text) ~= "string" or request.text == "" then
       return false, "request.text must be a non-empty string"
     end
-    local screen = resolvePromptTarget(target)
+    local screen = FN.resolvePromptTarget(target)
     if screen == nil then return false, "no live g9-Battle-Scene battle screen" end
     if screen.exited or screen.phase == "over" then return false, "battle is over" end
     -- One question at a time. Stacking would mean the second raise saving
@@ -8974,7 +12193,7 @@ return function(mod)
   -- different things to a caller: a pending prompt may still be dropped
   -- if the battle ends first, an active one will always reach onAnswer.
   mod.exports.battleChoiceActive = function(target)
-    local screen = resolvePromptTarget(target)
+    local screen = FN.resolvePromptTarget(target)
     if screen == nil then return nil end
     if screen.prompt ~= nil then return "active" end
     if screen.pendingPrompt ~= nil then return "pending" end
@@ -8987,7 +12206,7 @@ return function(mod)
   -- was no answer. The displaced phase is put back exactly as an answer
   -- would put it back, so this is always safe to call.
   mod.exports.cancelBattleChoice = function(target)
-    local screen = resolvePromptTarget(target)
+    local screen = FN.resolvePromptTarget(target)
     if screen == nil then return false end
     if screen.pendingPrompt ~= nil then
       screen.pendingPrompt = nil
@@ -9024,7 +12243,7 @@ return function(mod)
     if type(slotA) ~= "number" or type(slotB) ~= "number" then
       return false, "slotA and slotB must be numbers"
     end
-    local screen = resolvePromptTarget(target)
+    local screen = FN.resolvePromptTarget(target)
     if screen == nil then return false, "no live g9-Battle-Scene battle screen" end
     if screen.exited or screen.phase == "over" then return false, "battle is over" end
     if math.abs(slotA - slotB) ~= 1 then return false, "slots must be adjacent" end
@@ -9046,7 +12265,7 @@ return function(mod)
       return nil, "side must be 'enemy' or 'player'"
     end
     if type(slot) ~= "number" then return nil, "slot must be a number" end
-    local screen = resolvePromptTarget(target)
+    local screen = FN.resolvePromptTarget(target)
     if screen == nil then return nil, "no live g9-Battle-Scene battle screen" end
     local list = (side == "enemy") and screen.enemyBattlers or screen.playerBattlers
     local out = {}

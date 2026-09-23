@@ -191,11 +191,18 @@ return function(mod)
   local function toActingBattlers(queuedActions)
     local actingBattlers = {}
     for _, action in ipairs(queuedActions) do
-      if Combat.isAlive(action.actor) and action.target then
+      -- `fail` actions carry NO recipient on purpose: the scene's positional
+      -- adjacency left every candidate out of reach, so the move is meant to
+      -- be used and fail.  They still go to the engine, which announces the
+      -- move and prints its own "But it failed!" line (spending the PP);
+      -- without this they were dropped here and the slot silently did
+      -- nothing at all.
+      if Combat.isAlive(action.actor) and (action.target or action.fail) then
         actingBattlers[#actingBattlers + 1] = {
           mon = action.actor.mon,
           move = action.slot.id,
-          target = action.target.mon,
+          target = action.target and action.target.mon or nil,
+          fail = action.fail or nil,
         }
       end
     end
@@ -216,6 +223,17 @@ return function(mod)
     return N.resolveTurn(g9dex, battle, toActingBattlers(queuedActions))
   end
 
+  -- Resume a turn a pivot self-switch paused (g9-battle-engine's
+  -- combat/turn_order.lua PIVOT PAUSE).  `incoming` is the mon the scene sent
+  -- in; the engine finishes the round -- repointing every not-yet-acted actor
+  -- that had been aimed at the mon that left -- and its events are drained
+  -- here exactly like the batch turn's.  Returns an empty list on a backend
+  -- with no resume arm (Gen 1, whose pivots are inert by design).
+  function Combat.resumeAfterPivot(g9dex, battle, incoming, outgoing)
+    if type(N.resumeAfterPivot) ~= "function" then return {} end
+    return N.resumeAfterPivot(g9dex, battle, incoming, outgoing)
+  end
+
   -- Stepwise resolution (see N.beginTurn's own note): begin this turn's REAL
   -- order, then ask for one action at a time -- which lets the scene display
   -- each action's own events (and the sprite/stat changes that go with them)
@@ -233,6 +251,33 @@ return function(mod)
   function Combat.resolveNextAction(g9dex, battle)
     if type(N.resolveNextAction) ~= "function" then return nil, true end
     return N.resolveNextAction(g9dex, battle)
+  end
+
+  -- The mons in this turn's own real ACTION ORDER, for the battle screen's
+  -- gimmick sequence: when both sides transform on the same turn, the
+  -- animation that belongs to whichever Pokemon acts FIRST plays first (see
+  -- battle_screen's GIMMICK SEQUENCE block).  Prefers an engine export when the
+  -- engine grows one; otherwise reads the order the engine's own
+  -- beginTurnActionsForGen1 parked on the battle -- `__g9Gen1Order`, the exact
+  -- field resolveNextActionForGen1 walks -- so no engine change is needed for
+  -- the read.  Returns an empty list when neither is available (a batch-only
+  -- engine, i.e. Gen 2), and the screen then falls back to its own stable
+  -- order rather than guessing.
+  function Combat.orderedActorMons(battle)
+    local eng = engineExports()
+    if eng and type(eng.orderedActionMonsForGen1) == "function" then
+      local ok, list = pcall(eng.orderedActionMonsForGen1, battle)
+      if ok and type(list) == "table" then return list end
+    end
+    local out = {}
+    local ordered = battle and battle.__g9Gen1Order
+    if type(ordered) == "table" then
+      for _, actor in ipairs(ordered) do
+        local mon = actor and actor.id and actor.id.mon
+        if mon then out[#out + 1] = mon end
+      end
+    end
+    return out
   end
 
   function Combat.sideDefeated(battlers)

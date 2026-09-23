@@ -241,16 +241,42 @@ return function(mod)
     return math.floor(n)
   end
 
-  -- A uniform integer in 0..maxExclusive-1.  The scene hands us the running
-  -- battle's own random, which is love.math.random(a, b); a one-argument
-  -- random and love/math.random are the fallbacks so a harness or a trimmed
-  -- engine still rolls rather than raising.
+  -- A uniform integer in 0..maxExclusive-1.  The battle's own random arrives
+  -- in one of TWO shapes built into the engine, and they are NOT
+  -- interchangeable -- the generation picks the shape:
+  --
+  --   Gen 1  battle.rng(a, b)  -> a..b, inclusive.  This is the scene's own
+  --                               buildBattle `state.random`, literally
+  --                               love.math.random(a, b).
+  --   Gen 2  battle.random(n)  -> 0..n-1.  gen2/Battle.lua:276
+  --                               `self.random = opts.random or function(n)
+  --                               return rand(nil, n) end`, whose default
+  --                               rand(nil, n) is love.math.random(n) - 1.
+  --
+  -- Probing the arity CANNOT tell these apart, and guessing wrong is
+  -- catastrophic: LOVE's RandomGenerator:random(l, u) computes
+  -- floor(r * l) + 1 when u is nil (love wrap_RandomGenerator.lua), so
+  -- calling a ONE-argument roll as rng(0, n) is not an error -- it returns 1
+  -- every single time.  Every check then passes and every thrown ball becomes
+  -- a guaranteed catch, which is exactly the reported "catch formula seems to
+  -- be 100%".  The generation decides instead, mirroring the engine's own
+  -- modules (g9-battle-engine's percentRoll/rangeRoll in main.lua).  The value
+  -- is clamped into the requested range so an off-contract roll from a
+  -- trimmed build can never escape 0..maxExclusive-1.
   local function modernRoll(random, maxExclusive)
     if type(random) == "function" then
-      local ok, value = pcall(random, 0, maxExclusive - 1)
-      if ok and type(value) == "number" then return math.floor(value) end
-      ok, value = pcall(random, maxExclusive)
-      if ok and type(value) == "number" then return math.floor(value) - 1 end
+      local ok, value
+      if N.isGen2 then
+        ok, value = pcall(random, maxExclusive)
+      else
+        ok, value = pcall(random, 0, maxExclusive - 1)
+      end
+      if ok and type(value) == "number" then
+        value = math.floor(value)
+        if value < 0 then return 0 end
+        if value > maxExclusive - 1 then return maxExclusive - 1 end
+        return value
+      end
     end
     local rng = (love and love.math and love.math.random) or math.random
     return math.floor(rng(maxExclusive)) - 1
@@ -405,16 +431,13 @@ return function(mod)
   N.ballBonus = function(ballId, opts)
     opts = opts or {}
     local ball = ballId or "POKE_BALL"
-    if BALL_CERTAIN[ball] then return 255, true, 0 end
-    local flat = BALL_MULTIPLIER_MODERN[ball]
-    if flat then return flat, false, 0 end
-    local arm = BALL_ARM_MODERN[ball]
-    if arm then
-      local bonus, adjust = arm(opts)
-      return bonus or 1, false, adjust or 0
-    end
-    -- A ball this table does not know is a mod's own: honour its registry
-    -- record before falling back to a plain ball.
+    -- The merged ball registry (data.balls, which the game fills from its own
+    -- src/battle/Catching.lua) is the authoritative source for a ball's catch
+    -- factor, exactly as the Gen I and Gen II arms read it.  When it carries a
+    -- record for this ball, honour that record's autoCatch / multiplier before
+    -- the flat SV table below; a Gen I/II record carries neither (its effect is
+    -- randMax/hpFactor/wobbleFactor) so it falls straight through to the SV
+    -- numbers.  This is what makes a mod-added ball's own multiplier land.
     local record = N.registeredBall(ball, opts)
     if record then
       if record.autoCatch or record.multiplier == math.huge then
@@ -423,6 +446,14 @@ return function(mod)
       if type(record.multiplier) == "number" then
         return record.multiplier, false, 0
       end
+    end
+    if BALL_CERTAIN[ball] then return 255, true, 0 end
+    local flat = BALL_MULTIPLIER_MODERN[ball]
+    if flat then return flat, false, 0 end
+    local arm = BALL_ARM_MODERN[ball]
+    if arm then
+      local bonus, adjust = arm(opts)
+      return bonus or 1, false, adjust or 0
     end
     return 1, false, 0
   end
@@ -547,7 +578,27 @@ return function(mod)
     opts = opts or {}
     local ball = opts.ball or "POKE_BALL"
     if ball == "MASTER_BALL" then return true, 3, 255, 1 end
-    local def = GEN1_BALLS[ball] or GEN1_BALL_DEFAULT
+    -- The ball's own catch data comes from the MERGED registry the game loads
+    -- (data.balls, filled by src/battle/Catching.lua's registerInto) when it
+    -- carries it, exactly as the game's own Catching.attempt reads `opts.ballDef
+    -- or BALLS[ball] or DEFAULT_BALL`.  A ball record's autoCatch is the cart's
+    -- "never rolls" (the Master Ball); its randMax/hpFactor/wobbleFactor are
+    -- ItemUseBall's own per-ball numbers.  Our table is only the fallback for a
+    -- boot with no loader (a harness) or an id the game does not know.
+    local record = N.registeredBall(ball, opts)
+    if record and (record.autoCatch or record.multiplier == math.huge) then
+      return true, 3, 255, 1
+    end
+    local def
+    if record and type(record.randMax) == "number" then
+      def = {
+        randMax = record.randMax,
+        hpFactor = record.hpFactor or GEN1_BALL_DEFAULT.hpFactor,
+        wobbleFactor = record.wobbleFactor or GEN1_BALL_DEFAULT.wobbleFactor,
+      }
+    else
+      def = GEN1_BALLS[ball] or GEN1_BALL_DEFAULT
+    end
     local maxHp = math.max(1, floorNumber(opts.maxHp, 1))
     local hp = math.max(1, math.min(floorNumber(opts.hp, maxHp), maxHp))
     local rate = tonumber(opts.catchRate) or tonumber(opts.rate) or 45
@@ -658,13 +709,13 @@ return function(mod)
   -- rate_modified: the species rate through the flat multiplier or the
   -- conditional arm, clamped to [1, 255].  Returns rate, certain.
   local function gen2BallRate(catchRate, ball, opts)
-    local multiplier = GEN2_MULTIPLIER[ball]
-    if multiplier then return math.floor(catchRate * multiplier), false end
-    local arm = GEN2_SPECIALTY[ball]
-    if arm then return arm(catchRate, opts), false end
-    -- A ball this table does not know is a mod's own: honour its merged
-    -- registry record (a numeric multiplier, an autoCatch, or a specialty
-    -- fn), the same fallback the engine's Gen 2 module uses.
+    -- The game's own src/battle/gen2/Catching.lua resolves the ball through the
+    -- MERGED registry record FIRST (Catching.recordFor -> data.gen2Balls), and
+    -- only then applies a flat multiplier or a specialty arm -- an unregistered
+    -- id leaves the species rate alone.  Mirror that exact order so the ball's
+    -- real BallMultiplierFunctionTable factor is the one used; our own tables
+    -- are only the fallback for a loader-free boot (a harness) or an id the game
+    -- does not know.
     local record = N.registeredBall(ball, opts)
     if record then
       if record.autoCatch or record.multiplier == math.huge then
@@ -677,6 +728,10 @@ return function(mod)
         return record.specialty(catchRate, opts), false
       end
     end
+    local multiplier = GEN2_MULTIPLIER[ball]
+    if multiplier then return math.floor(catchRate * multiplier), false end
+    local arm = GEN2_SPECIALTY[ball]
+    if arm then return arm(catchRate, opts), false end
     return catchRate, false
   end
 
@@ -741,10 +796,10 @@ return function(mod)
     if a > 255 then a = 255 end
 
     if a >= 255 then return true, 3, a, 1 end
-    local chance = (a + 1) / 256
-    -- The catch check (one byte, caught on roll <= a) resolves the catch
-    -- FIRST; the shake checks only decide how a failure looks.
-    if modernRoll(opts.random, 256) <= a then return true, 3, a, chance end
+    -- The cart's own single-byte roll: a value under the final rate catches,
+    -- so the odds are exactly a/256 (PokeBallEffect's `cp b / jr nc`).
+    local chance = a / 256
+    if modernRoll(opts.random, 256) < a then return true, 3, a, chance end
     local b = gen2ShakeB(a)
     local passed = 0
     for _ = 1, 3 do
@@ -758,17 +813,39 @@ return function(mod)
   end
 
   -- The selected formula, read from the CATCH FORMULA option at throw time (so
-  -- a change lands on the very next ball, no reload), defaulting to Gen IX
-  -- when the option is absent (a harness, or the mod disabled).
-  local CATCH_FORMULA_DEFAULT = "gen9"
-  local CATCH_FORMULA_KEYS = { gen1 = true, gen2 = true, gen9 = true }
+  -- a change lands on the very next ball, no reload).
+  --
+  -- AUTO (the default) follows the RUNNING GAME: a Red/Blue/Yellow boot throws
+  -- with Gen I's ItemUseBall maths and a Gold/Silver/Crystal boot with Gen II's
+  -- PokeBallEffect maths.  That is the "proper path" -- each generation's own
+  -- ball data (Gen I's per-ball randMax/hpFactor/wobbleFactor, Gen II's
+  -- BallMultiplierFunctionTable factor) is what the cart actually applies, and
+  -- it is what the game's own src/battle/Catching.lua and
+  -- src/battle/gen2/Catching.lua implement.  The scene used to default to
+  -- GEN IX on every boot, so a Gen I game ran Scarlet/Violet's maths: SV's
+  -- bonus_level (`max((36-2*level)/10,1)` below level 13) inflates the rate
+  -- for the low-level wild Pokemon both Gen I and Gen II field, and for the
+  -- many species whose catch rate is already 255 it reaches a = 1044480 --
+  -- the certainty ceiling -- so a thrown Poke Ball was a guaranteed catch.
+  -- That is exactly the reported "catch is 100%".  GEN 1 / GEN 2 / GEN 9 stay
+  -- available as explicit overrides (a Gen I game can still be asked for SV
+  -- maths), and an unknown or absent option resolves through AUTO.
+  local CATCH_FORMULA_DEFAULT = "auto"
+  local CATCH_FORMULA_KEYS = {
+    auto = true, gen1 = true, gen2 = true, gen9 = true,
+  }
   N.catchFormula = function()
+    local value
     local options = mod and mod.options
     if options and type(options.get) == "function" then
-      local ok, value = pcall(function() return options:get("catch_formula") end)
-      if ok and CATCH_FORMULA_KEYS[value] then return value end
+      local ok, got = pcall(function() return options:get("catch_formula") end)
+      if ok then value = got end
     end
-    return CATCH_FORMULA_DEFAULT
+    if value == nil or value == "" or not CATCH_FORMULA_KEYS[value]
+        or value == "auto" then
+      return N.isGen2 and "gen2" or "gen1"
+    end
+    return value
   end
 
   -- One dispatcher for all three arms, so the throw, the mod seam and the
@@ -868,6 +945,103 @@ return function(mod)
       return "All right! " .. name .. " was caught!"
     end
     return "Gotcha! " .. name .. " was caught!"
+  end
+
+  -- The POKéDEX "SEEN" stamp, which has the same owner problem as the caught
+  -- tail below: native writes it while LOADING an enemy mon
+  -- (`LoadEnemyMon`'s "Saw this mon", gen1 BattleState.lua:781/912 and gen2
+  -- `BattleState:markSeen`), and this scene replaces that screen.  `seen` is
+  -- spelled the same on both generations, so this needs no split.
+  N.markSeen = function(game, mon)
+    local save = game and game.save
+    if not (save and mon and mon.species) then return end
+    save.pokedex = save.pokedex or { seen = {} }
+    save.pokedex.seen = save.pokedex.seen or {}
+    save.pokedex.seen[mon.species] = true
+  end
+
+  -- THE CAUGHT MON'S DEX REGISTRATION, which this scene owns because it
+  -- replaces the native screen that used to do it.
+  --
+  -- Native marks the POKéDEX inside the very method that files the catch:
+  -- Gen 1's `BattleState:storeCaughtMon` calls `markOwned(game, species)`
+  -- (which sets `pokedex.owned[species]` and `seen`), then `stampOT`; Gen 2's
+  -- `BattleState:pushCaught` runs `SetSeenAndCaughtMon` / `CheckCaughtMon`
+  -- (`pokedex.caught[species]` + `seen`), `Mon.stampOT`, `stampCaughtData`
+  -- (met place/time/level) and `Unown.registerCatch`.  A scene catch added the
+  -- mon to the party but ran NONE of that, so `save.pokedex` was never touched
+  -- and the caught count never moved -- the reported "catch is not registering
+  -- caught to pokedex completeness".
+  --
+  -- Returns (isNew, species): `isNew` is whether the row was NOT already
+  -- owned/caught, the flag the native screens read to decide whether to show
+  -- the "new POKéDEX data" beat.
+  N.registerCatch = function(game, mon, opts)
+    opts = opts or {}
+    local save = game and game.save
+    if not (save and mon) then return false, mon and mon.species end
+    local species = mon.species
+    if N.isGen2 then
+      -- OT first, exactly as PokeBallEffect's TryAddMonToParty /
+      -- SendMonIntoBox arm writes wPlayerName/wPlayerID before the mon is
+      -- filed (item_effects.asm:548-556).
+      local Mon = tryRequire("src.battle.gen2.Mon")
+      if Mon and type(Mon.stampOT) == "function" then
+        pcall(Mon.stampOT, save, mon)
+      end
+      save.pokedex = save.pokedex or { seen = {}, caught = {} }
+      local dex = save.pokedex
+      dex.seen = dex.seen or {}
+      dex.caught = dex.caught or {}
+      -- CheckCaughtMon answers BEFORE SetSeenAndCaughtMon stamps (:519-527).
+      local knew = dex.caught[species] and true or false
+      dex.caught[species] = true
+      dex.seen[species] = true
+      -- caught_data.asm:163-199 (Crystal only; a no-op elsewhere).  The opts
+      -- are the same set native's `BattleState:stampCaughtData` builds.
+      local Catching2 = tryRequire("src.battle.gen2.Catching")
+      if Catching2 and type(Catching2.stampCaughtData) == "function" then
+        local world = game.world
+        local battle = opts.battle
+        local map = world and world.map
+        pcall(Catching2.stampCaughtData, mon, {
+          version = save.version,
+          save = save,
+          data = game.data,
+          bugContest = opts.bugContest,
+          timeOfDay = (battle and battle.timeOfDay)
+            or (world and world.timeOfDayId and world:timeOfDayId()),
+          map = map and map.def,
+          backupMap = world and world.backupMapId and world.maps
+            and world.maps[world.backupMapId],
+          playerGender = save.player and save.player.gender,
+        })
+      end
+      -- AddPartyMon's `.registerunowndex` / SendMonIntoBox's `.not_unown`.
+      local Unown = tryRequire("src.core.gen2.Unown")
+      if Unown and type(Unown.registerCatch) == "function" then
+        pcall(Unown.registerCatch, save, mon)
+      end
+      return (not knew), species
+    end
+    -- Gen 1: `pokedex.owned` is the caught table and `pokedex.seen` the seen
+    -- one (there is no separate `caught` map).  `markOwned` is the native
+    -- routine itself when the engine still exports it.
+    save.pokedex = save.pokedex or { seen = {}, owned = {} }
+    local dex = save.pokedex
+    dex.seen = dex.seen or {}
+    dex.owned = dex.owned or {}
+    local knew = dex.owned[species] and true or false
+    local BattleStateMod = tryRequire("src.battle.BattleState")
+    if BattleStateMod and type(BattleStateMod.markOwned) == "function" then
+      pcall(BattleStateMod.markOwned, game, species)
+    end
+    dex.owned[species] = true
+    dex.seen[species] = true
+    if BattleStateMod and type(BattleStateMod.stampOT) == "function" then
+      pcall(BattleStateMod.stampOT, save, mon)
+    end
+    return (not knew), species
   end
 
   -- The whole modern attempt, behind the mod catch.rate hook.  The hook
@@ -1016,6 +1190,110 @@ return function(mod)
       }
     end
 
+    -- THE AFTER-BATTLE EVOLUTION SWEEP (ExitBattle's own `predef
+    -- EvolveAfterBattle`, engine/battle/core.asm).  A fight this screen draws
+    -- never reaches the native BattleState's WIN arm -- finishTurn/throwBall
+    -- just set self.outcome -- so the sweep simply never ran and no
+    -- scene-driven battle could EVER evolve a Pokemon.  This is the Gen 2 half
+    -- of closing that gap; the Gen 1 half is the same-named function in the
+    -- Gen 1 arm below.
+    --
+    -- `flags` is Screen.g9EvolvableFlags, a set of party INDICES -- Gen 2's own
+    -- wEvolvableFlags shape, filled by Screen:awardFaintExp from the model's
+    -- per-level `level` events, exactly where the cart sets that slot's bit.
+    -- The conditions AND the apply both come from the engine's own module
+    -- (src/core/gen2/Evolution.lua), so g9-evolutions' patched rows and every
+    -- native row are read the way the cart reads them; the only thing added
+    -- here is the screen stack that plays the result.  `runsAfterBattle` is the
+    -- native ExitBattle gate (a loss or a draw never evolves); the scene only
+    -- calls this on a WIN anyway.
+    --
+    -- Returns false when there is nothing to stage OR the engine module is
+    -- absent (an older engine), so the caller falls straight through to its own
+    -- exit.  When it returns true it OWNS the exit and calls onDone once the
+    -- last animation has resolved.
+    N.runAfterBattleEvolutions = function(screen, onDone)
+      local Evolution = tryRequire("src.core.gen2.Evolution")
+      local Screens = tryRequire("src.ui.Screens")
+      if not (Evolution and type(Evolution.plan) == "function"
+          and type(Evolution.runsAfterBattle) == "function"
+          and type(Screens) == "table" and type(Screens.push) == "function") then
+        return false
+      end
+      if not Evolution.runsAfterBattle(screen.outcome) then return false end
+      local flags = screen.g9EvolvableFlags
+      if type(flags) ~= "table" or not next(flags) then return false end
+      local game = screen.game
+      local battle = screen.battle
+      local save = game and game.save
+      local party = (battle and battle.party) or (save and save.party) or {}
+      -- wTimeOfDay, for the TR_MORNDAY / TR_NITE happiness rows, captured here
+      -- exactly as the native screen captures it (Palettes.clockDaytime).
+      local timeOfDay
+      local Palettes = tryRequire("src.world.gen2.Palettes")
+      if Palettes and type(Palettes.clockDaytime) == "function" then
+        local ok, value = pcall(Palettes.clockDaytime)
+        if ok then timeOfDay = value end
+      end
+      local plans = Evolution.plan((game and game.data) or {}, party, flags,
+        { timeOfDay = timeOfDay })
+      if #plans == 0 then return false end
+      local index = 0
+      local function nextOne()
+        index = index + 1
+        local plan = plans[index]
+        if not plan then
+          if onDone then onDone() end
+          return
+        end
+        Screens.push(game, "Gen2EvolutionAnim", {
+          mon = plan.mon,
+          entry = plan.entry,
+          index = plan.index,
+          party = party,
+          save = save,
+          -- The native screen's own chaining, verbatim: the animation calls
+          -- onDone and the CALLER pops it (it never pops itself).
+          onDone = function()
+            game.stack:pop()
+            nextOne()
+          end,
+        })
+      end
+      nextOne()
+      return true
+    end
+
+    -- ExitBattle's `farcall GivePokerusAndConvertBerries`, the beat that sits
+    -- immediately after `predef EvolveAfterBattle` inside the SAME WIN arm --
+    -- so it belongs to the same after-battle moment as the evolution sweep
+    -- above and was missing from a scene fight for the same reason.  Silent by
+    -- design: nothing tells the player, and the Pokemon Center nurse is the
+    -- first thing that ever mentions it.  Gen 1 has no Pokerus and no berry
+    -- juice, so the Gen 1 arm defines this as a no-op.  pcall'd -- a save
+    -- mutation must never be able to strand the player in a battle that cannot
+    -- exit.
+    N.afterBattleSaveEffects = function(screen)
+      local evolution = tryRequire("src.core.gen2.Evolution")
+      if evolution and type(evolution.runsAfterBattle) == "function"
+          and not evolution.runsAfterBattle(screen.outcome) then
+        return
+      end
+      local game = screen.game
+      local battle = screen.battle
+      local save = game and game.save
+      if not save then return end
+      local party = (battle and battle.party) or save.party or {}
+      local BerryJuice = tryRequire("src.battle.gen2.BerryJuice")
+      if BerryJuice and type(BerryJuice.convertAfterBattle) == "function" then
+        pcall(BerryJuice.convertAfterBattle, save, party)
+      end
+      local Pokerus = tryRequire("src.core.gen2.Pokerus")
+      if Pokerus and type(Pokerus.giveAfterBattle) == "function" then
+        pcall(Pokerus.giveAfterBattle, save, party)
+      end
+    end
+
     -- Prize money for beating a trainer -- the engine's OWN routine, not a
     -- re-derivation: Prize.award is ComputeTrainerReward + WinTrainerBattle
     -- (baseMoney x wCurPartyLevel, four quarters split between the wallet and
@@ -1083,6 +1361,17 @@ return function(mod)
 
     N.resolveTurn = function(g9dex, battle, actingBattlers)
       g9dex.exports.resolveTurnActions(battle, actingBattlers)
+      return battle:takeEvents()
+    end
+
+    -- Resume a turn a pivot self-switch paused (see g9-battle-engine's
+    -- combat/turn_order.lua PIVOT PAUSE).  The engine re-enters its own
+    -- resolver with the mon the scene sent in; the rest of the round's events
+    -- are drained here exactly like N.resolveTurn's.
+    N.resumeAfterPivot = function(g9dex, battle, incoming, outgoing)
+      local eng = g9dex and g9dex.exports
+      if not (eng and type(eng.resumeAfterPivot) == "function") then return {} end
+      eng.resumeAfterPivot(battle, incoming, outgoing)
       return battle:takeEvents()
     end
 
@@ -1477,6 +1766,25 @@ return function(mod)
       -- sleeping/frozen/fully-paralysed/confused/must-recharge mon would
       -- silently get a free move.
       function state:useMove(attackerMon, defenderMon, moveId)
+        -- A Pokemon that only reaches the field MID-battle -- a benched mon
+        -- switched in -- has no engine battler yet: `byMon` is built from the
+        -- STARTING field roster only.  Native builds a fresh battler from the
+        -- mon on every switch-in (BattleState.makeBattler) and this scene
+        -- caches ONE per mon and reuses it (see g9-battle-engine's own
+        -- combat/modern_transform.lua note), so the equivalent here is to
+        -- build it the first time the mon is actually used.  Without this a
+        -- switched-in mon could neither be hit nor attack on Gen 1 -- the
+        -- scene's own retarget of a queued attacker onto the arriving mon
+        -- (Screen:advanceResolving's switch branch) would resolve against a
+        -- mon with no battler and the move would be dropped in silence --
+        -- which is what makes a switch-in take the hit it now correctly aims
+        -- at.
+        local function ensureBattler(mon)
+          if not mon or byMon[mon] then return end
+          addBattler(mon, mon.multiSide ~= "enemy")
+        end
+        ensureBattler(attackerMon)
+        ensureBattler(defenderMon)
         local user = byMon[attackerMon]
         local target = defenderMon and byMon[defenderMon] or nil
         if not (user and target) then return end
@@ -1488,6 +1796,14 @@ return function(mod)
         self.queue = {}
         self.nextInsert = 0
         self.moveAnimRow = nil
+        -- The scene's own HP vector as of BEFORE this action resolves (see
+        -- drainNativeMove): the per-hit drain beats walk this forward, so a
+        -- multi-hit move's bar comes to rest at every landed hit instead of
+        -- jumping to the final total.  `g9Scene` is published by the scene's
+        -- event probe; without it every beat falls back to the probe's own
+        -- live snapshot, exactly as before this change.
+        self.__g9PreMoveSnap = (self.g9Scene and self.g9Scene.snapshotHp)
+          and self.g9Scene:snapshotHp() or nil
         -- The held-in-place mirror executeAction refreshes before the status
         -- checks (core.asm:414-416): the victim is held exactly while the
         -- opponent's trapping counter is live (including a counter sitting at
@@ -1526,6 +1842,26 @@ return function(mod)
           self:drainNativeMove(user.trapMove)
           return
         end
+        -- Bide continuation: the exact same shape one branch down from
+        -- executeAction's own `bide` arm (core.asm's fightLockedAction -- a
+        -- live store skips the move menu and runs continueBide).  The store is
+        -- STARTED by the Bide move's own effect (g9-battle-engine's
+        -- GALAR_BIDE_EFFECT -- see combat/modern_bide.lua); from then on every
+        -- turn runs the cart's native wait/release here, which is also what
+        -- keeps a continuation from spending a second PP (it never reaches
+        -- performMove).  `statusInterrupt` still gets first refusal, so a
+        -- sleeping/frozen/paralysed user loses the beat but keeps the store,
+        -- matching the native order.
+        if user.bideTurns and type(BattleState.continueBide) == "function" then
+          if self:statusGate(user, target, "BIDE") then
+            self:drainNativeMove(nil)
+            return
+          end
+          local okBide, errBide = pcall(BattleState.continueBide, self, user, target)
+          self:drainNativeMove("BIDE")
+          if not okBide then error(errBide, 0) end
+          return
+        end
         -- The pre-move status gauntlet, before every ordinary move. When it
         -- eats the turn, the status text it queued is all this action emits.
         if self:statusGate(user, target, moveId) then
@@ -1547,10 +1883,42 @@ return function(mod)
         if not ok then error(err, 0) end
       end
 
+      -- A shallow copy of an HP vector (mon table -> hp).  Each emitted beat
+      -- carries its own copy rather than the running table the next drain row
+      -- would overwrite, so the scene's chase can hold it safely.
+      function state.copyHpSnap(src)
+        local out = {}
+        for mon, hp in pairs(src) do out[mon] = hp end
+        return out
+      end
+
       function state:drainNativeMove(moveId)
+        -- The native queue carries the bar's OWN per-hit stops: every landed
+        -- hit funnels through BattleState:applyDamage -> self:drainNext(target,
+        -- target.mon.hp), which queues { drain = true, battler = target,
+        -- stopAt = <hp after THIS hit> }.  The multi-hit loop in
+        -- EffectRegistry.runDamaging calls applyDamage once per hit, so the
+        -- queue holds one drain row per hit.  Walking them in order and
+        -- emitting a textless beat apiece is what lets the scene's own chase
+        -- rest at EVERY hit -- previously everything but .text was dropped, so
+        -- each event the scene saw already carried the final total and a
+        -- two-hit move animated as ONE drop (the reported collapse).
+        --
+        -- `snap` starts at the HP vector from before this action and steps
+        -- forward with each drain row, so the beats are the real per-hit
+        -- positions (and a recoil drain on the user lands after the target's,
+        -- exactly as the native queue orders them).
+        local base = self.__g9PreMoveSnap
+        local snap = base and state.copyHpSnap(base) or nil
         for _, row in ipairs(self.queue) do
-          if type(row) == "table" and type(row.text) == "string" then
-            self:emit({ kind = "say", text = row.text })
+          if type(row) == "table" then
+            if row.drain and row.battler and row.battler.mon and snap then
+              snap[row.battler.mon] = row.stopAt or (row.battler.mon.hp or 0)
+              self:emit({ kind = "damage", g9SceneHp = state.copyHpSnap(snap) })
+            elseif type(row.text) == "string" then
+              self:emit({ kind = "say", text = row.text,
+                          g9SceneHp = snap and state.copyHpSnap(snap) or nil })
+            end
           end
         end
         -- A move happened: give the scene a per-action move beat so anything
@@ -1559,6 +1927,7 @@ return function(mod)
         if moveId then self:emit({ kind = "move", move = moveId }) end
         self.queue = {}
         self.nextInsert = 0
+        self.__g9PreMoveSnap = nil
       end
 
       -- Experience, via the pure module the native screen's awardExp is built
@@ -1602,12 +1971,74 @@ return function(mod)
             and (self.player.mon.hp or 0) > 0 then
           participants, alive = 1, { self.player.mon }
         end
+        -- The native per-level learn checks (engine/battle/experience.asm:245-
+        -- 256).  A mon that reaches a level its species learns a move at either
+        -- learns it at once (a free slot) or -- full moveset -- has to be asked
+        -- which move to forget.  This arm bypasses BattleState:learnMove (it is
+        -- queue-coupled to the native screen), so the checks are re-issued as
+        -- scene events instead: a `learn` line, or a `choose-forget` record the
+        -- screen parks on until the player answers (Screen:beginMoveLearn).
+        -- The mon's OWN record is read per level, so a multi-level gain learns
+        -- every move each level grants, exactly as the native loop does -- the
+        -- pooled multi-faint award's synthetic loser def never matters here.
+        local function learnAt(mon, lv)
+          local speciesDef = self.data.pokemon[mon.species]
+          if not speciesDef then return end
+          local speciesName = mon.nickname
+            or (type(speciesDef.name) == "string" and speciesDef.name)
+            or tostring(mon.species)
+          for _, moveId in ipairs(Experience.movesLearnedAt(speciesDef, lv)) do
+            mon.moves = mon.moves or {}
+            local known = false
+            for _, mv in ipairs(mon.moves) do
+              if mv.id == moveId then known = true break end
+            end
+            local mdef = self.data.moves[moveId]
+            if not known and mdef then
+              if #mon.moves < 4 then
+                mon.moves[#mon.moves + 1] = { id = moveId, pp = mdef.pp }
+                if Runtime and type(Runtime.emit) == "function" then
+                  Runtime.emit("pokemon.move_learned",
+                    { mon = mon, moveId = moveId })
+                end
+                self:emit({ kind = "learn", mon = mon, move = moveId,
+                  text = require("src.core.Strings")("%s learned %s!",
+                    speciesName, mdef.name) })
+              else
+                self:emit({ kind = "choose-forget", mon = mon, move = moveId,
+                  moveName = mdef.name })
+              end
+            end
+          end
+        end
         local function applyShare(mon, split, announce)
           local traded = playerId ~= nil
             and ((mon.otId ~= nil and mon.otId ~= playerId)
               or (mon.otId == nil and mon.traded == true))
           local levels, gained = Experience.apply(self.data, mon, def,
             loser.level or 1, self.kind == "trainer", split, traded, nil)
+          -- Track level-ups for the after-battle evolution sweep, exactly the
+          -- way the native screen tracks wEvolvableFlags: a mon that grew this
+          -- fight is what EvolveAfterBattle walks, and the B-cancel leaves the
+          -- mon at/above its threshold so it is NOT re-offered after every
+          -- later fight.  Kept mon-keyed (Gen 1's own checkParty shape) on the
+          -- model, which is what this shim's self is.
+          if levels and #levels > 0 then
+            self.g9LeveledUp = self.g9LeveledUp or {}
+            self.g9LeveledUp[mon] = true
+            -- GrewLevelText (experience.asm:245) followed by the move checks,
+            -- the native order: one "grew to level" line per level reached,
+            -- each followed by that level's learn checks.
+            local speciesDef = self.data.pokemon[mon.species]
+            local speciesName = mon.nickname
+              or (speciesDef and speciesDef.name) or tostring(mon.species)
+            local Strings = require("src.core.Strings")
+            for _, lv in ipairs(levels) do
+              self:emit({ kind = "level", mon = mon, level = lv,
+                text = Strings("%s grew to level %d!", speciesName, lv) })
+              learnAt(mon, lv)
+            end
+          end
           if Runtime and type(Runtime.emit) == "function" then
             Runtime.emit("battle.exp_gained", {
               battle = self, mon = mon, gained = gained, levels = levels,
@@ -1707,6 +2138,47 @@ return function(mod)
         loser = { species = id, level = divisor },
       }
     end
+
+    -- THE AFTER-BATTLE EVOLUTION SWEEP -- the Gen 1 half.  The native screen
+    -- runs `require("src.pokemon.Evolution").checkParty(game, onDone,
+    -- self.leveledUp)` from BattleState:finish, before EndOfBattle hands the
+    -- map back (end_of_battle.asm:42-45).  A scene-drawn Gen 1 battle never
+    -- reaches that finish() -- finishTurn in battle_screen.lua is what decides
+    -- the outcome -- so the sweep never ran and nothing could evolve.  This
+    -- closes that gap; the Gen 2 half is the same-named function in the Gen 2
+    -- arm above.
+    --
+    -- `battle.g9LeveledUp` is the mon-keyed set this arm's own applyShare fills
+    -- from Experience.apply's returned level list, so the gate is the cart's own
+    -- "only a mon that gained a level during the fight is offered an
+    -- evolution".
+    --
+    -- checkParty owns the whole movie (it pushes the native EvolutionState
+    -- screens and applies the change), so nothing is driven here -- and because
+    -- it calls onDone synchronously when nothing is pending, the caller's exit
+    -- is deliberately idempotent (see battle_screen.lua's beginAfterBattleExit)
+    -- so that synchronous call and a `return true` cannot double-exit.
+    N.runAfterBattleEvolutions = function(screen, onDone)
+      local Evolution = tryRequire("src.pokemon.Evolution")
+      if not (Evolution and type(Evolution.checkParty) == "function") then
+        return false
+      end
+      local battle = screen.battle
+      local leveled = battle and battle.g9LeveledUp
+      if type(leveled) ~= "table" or not next(leveled) then return false end
+      local ok, err = pcall(Evolution.checkParty, screen.game, onDone, leveled)
+      if not ok then
+        mod.log:warn("g9_Battle_Scene: after-battle evolution failed: %s",
+          tostring(err))
+        return false
+      end
+      return true
+    end
+
+    -- Gen 1 has no Pokerus and no berry juice, so the after-battle save beat is
+    -- a no-op here.  Defined anyway so battle_screen.lua never branches on
+    -- generation (the same contract every other N.* seam keeps).
+    N.afterBattleSaveEffects = function() end
 
     -- Prize money for beating a trainer.  Gen 1's own routine, the one
     -- BattleState:enemyMonFainted runs: `local prize = (self.trainer.baseMoney

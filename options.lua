@@ -23,18 +23,23 @@ return {
     key = "catch_formula",
     label = "CATCH FORMULA",
     type = "choice",
-    default = "gen9",
+    default = "auto",
     choices = {
+      { "AUTO", "auto" },
       { "GENERATION 1", "gen1" },
       { "GENERATION 2", "gen2" },
       { "GENERATION 9", "gen9" },
     },
     description = "Which generation's capture maths a thrown ball uses. "
-      .. "GENERATION 9 (default) is the current Scarlet/Violet formula; "
-      .. "GENERATION 2 is Gold/Silver's modified catch rate plus its "
-      .. "shake-probability table; GENERATION 1 is Red/Blue/Yellow's two-roll "
-      .. "ItemUseBall with its per-ball roll ceiling. The ball's own wobble "
-      .. "count and the failure line both follow the chosen generation.",
+      .. "AUTO (default) follows the game being played -- Generation 1's "
+      .. "ItemUseBall maths on Red/Blue/Yellow, Generation 2's PokeBallEffect "
+      .. "maths on Gold/Silver/Crystal -- so each ball uses its own "
+      .. "generation's real catch data. GENERATION 9 forces the current "
+      .. "Scarlet/Violet formula on any game; GENERATION 2 is Gold/Silver's "
+      .. "modified catch rate plus its shake-probability table; GENERATION 1 "
+      .. "is Red/Blue/Yellow's two-roll ItemUseBall with its per-ball roll "
+      .. "ceiling. The ball's own wobble count and the failure line both "
+      .. "follow the chosen generation.",
   },
   -- The three wild-boss rows below are read by special_boss.lua and apply
   -- ONLY to a WILD encounter whose layout is the bossFight preset -- a
@@ -115,12 +120,47 @@ return {
     description = "The ground the battle is fought on, seen from above. "
       .. "This mod ships no art: put background PNGs in the mod's "
       .. "assets/backgrounds/ folder, named by the fight they are for -- "
-      .. "grass, water, cave, gym1..gym16, elitefour1..elitefour4, champion, "
-      .. "red, rival, rocket, ho-oh, lugia, suicune, and fated (any other "
-      .. "legendary or static encounter). AUTO (default) reads each battle "
-      .. "and draws the matching file; add more than one for a tag (gym1-2, "
-      .. "gym1-23, ...) and one is rolled per fight. OFF keeps the plain "
-      .. "white field this scene has always drawn.",
+      .. "grass, water, cave, gym, gym1..gym16, elitefour1..elitefour4, "
+      .. "champion, red, rival, rocket, ho-oh, lugia, suicune, and fated "
+      .. "(any other legendary or static encounter). AUTO (default) reads "
+      .. "each battle and draws the matching file; add more than one for a "
+      .. "tag (gym1-2, gym1-23, ...) and one is rolled per fight. A gym/"
+      .. "Elite Four/Champion fight with no numbered file falls back to "
+      .. "gym.png, then grass.png. OFF is the scene's MASTER SWITCH: "
+      .. "g9-battle-sample then routes EVERY fight to the game's own battle "
+      .. "screen -- no ground art and no custom layout at all -- so leave it "
+      .. "on AUTO to keep the custom scene.",
+  },
+  -- MOVE LEARNER (v4.4.0).  Which screen answers a mid-battle level-up that
+  -- wants a fifth move.  Read live by battle_screen.lua's routing with the
+  -- BACKGROUND row: the MODERN (g9-gui) learner runs only when the custom
+  -- scene is on (BACKGROUND not OFF) AND this row is ON; either one OFF is
+  -- the game's own classic src.ui.MoveLearnMenu, drawn over a plain WHITE
+  -- field with its own native messages (no Pokemon, HUD or terrain behind
+  -- it -- the user's rule).  See battle_screen.lua's FN.pushLearner.
+  {
+    key = "modern_move_learn",
+    label = "MODERN MOVE LEARN",
+    type = "choice",
+    default = "on",
+    choices = {
+      { "OFF", "off" },
+      { "ON", "on" },
+    },
+    description = "Which screen asks which move to forget when a Pokemon "
+      .. "levels into a fifth move. ON (default): with g9-gui installed, "
+      .. "the learn question opens on that suite's own modern page (its "
+      .. "540x360 move learner), and the battle is left untouched behind "
+      .. "it. OFF: the game's own learner runs instead -- its "
+      .. "\"A is trying to learn B! ... Delete an older move?\" question, "
+      .. "the four-move forget list, the HM guard and the whole native "
+      .. "\"1, 2 and... Poof!\" sequence -- on a plain WHITE screen, with no "
+      .. "Pokemon, HUD or ground art visible behind it. The game's own "
+      .. "learner also runs when BACKGROUND (above) is OFF: that row is the "
+      .. "scene's master switch, so the fight is already on the game's own "
+      .. "battle screen and nothing here can change. g9-gui absent, failed "
+      .. "or with MODERN UI off also falls back to the game's own learner "
+      .. "on the same white screen, never a bare battle.",
   },
   -- The modernized combat GUI (fantasy_combat.lua). OFF (default) is the
   -- native tile-font F/E box pair this scene has always drawn. ON replaces
@@ -255,5 +295,88 @@ return {
       .. "field during the fainted enemy's stay, and an enemy switching out "
       .. "(not fainting) is what resets that. EV points are always awarded in "
       .. "full; only the level-experience split changes.",
+  },
+  -- The persistent Dynamax visuals (v3.7.0).  While a battler is Dynamaxed or
+  -- Gigantamaxed -- or is shrinking back from it -- the scene darkens the field
+  -- and rings the creature with a red aura.  The transformation clip itself
+  -- (dynamax_anim.lua) is unchanged, and the size ladder is g9-battle-sprites'.
+  -- Both rows are read by dynamax_field.lua, per call.
+  {
+    key = "dynamax_darken",
+    label = "DYNAMAX DARKEN",
+    type = "choice",
+    default = "on",
+    choices = {
+      { "OFF", "off" },
+      { "ON", "on" },
+    },
+    description = "ON (default): while a Pokemon is Dynamaxed or "
+      .. "Gigantamaxed, the battlefield sinks under a deep maroon wash so the "
+      .. "transformed creature reads against a dim ground. The wash clears as "
+      .. "the Pokemon shrinks back to its normal size when the transformation "
+      .. "ends, and at once if it switches out. OFF leaves the field at its "
+      .. "ordinary brightness.",
+  },
+  {
+    key = "dynamax_aura",
+    label = "DYNAMAX AURA",
+    type = "choice",
+    default = "on",
+    choices = {
+      { "OFF", "off" },
+      { "ON", "on" },
+    },
+    description = "ON (default): a Dynamaxed or Gigantamaxed Pokemon wears a "
+      .. "pulsing red aura while it is transformed, and one that FAINTS bursts "
+      .. "in red Galar energy. The burst plays only after the Pokemon's own "
+      .. "shrink-back has finished, so the faint is held until the "
+      .. "transformation has fully wound down; a Dynamax that simply runs out "
+      .. "its three turns, or is switched out, gets no burst. OFF removes "
+      .. "both the aura and the burst.",
+  },
+  -- WHITE ROW (v4.0.8).  Read live by fantasy_combat.lua, which draws the
+  -- FANTASY COMBAT party status list.  It repaints each party row's own
+  -- BACKGROUND panel -- not the HP bar inside it, and not any other element.
+  {
+    key = "white_row",
+    label = "WHITE ROW",
+    type = "choice",
+    default = "off",
+    choices = {
+      { "OFF", "off" },
+      { "ON", "on" },
+    },
+    description = "OFF (default): each Pokemon's party row in FANTASY "
+      .. "COMBAT keeps the usual dark translucent panel behind it. ON draws "
+      .. "that row's own BACKGROUND as a translucent WHITE panel (white at "
+      .. "40% opacity) instead, so the field reads through the row. Only the "
+      .. "row background changes: the name, the HP bar, the level, the exp bar "
+      .. "and the status tag all keep their own colours, and nothing changes "
+      .. "at all unless FANTASY COMBAT is on.",
+  },
+  -- ENEMY STAT WHITE (v4.2.0).  Read live by battle_screen.lua, which draws
+  -- the ENEMY's own over-the-head stat readout: it sets the rounded panel
+  -- BEHIND that readout and nothing else.  In either state the enemy's HP
+  -- bar takes the party list's own muted colour family (the row's
+  -- COL.good/warn/bad), so the enemy surface matches the ally rows.
+  {
+    key = "enemy_stat_white",
+    label = "ENEMY STAT WHITE",
+    type = "choice",
+    default = "on",
+    choices = {
+      { "OFF", "off" },
+      { "ON", "on" },
+    },
+    description = "ON (default): the enemy's over-the-head stat readout sits "
+      .. "on a translucent rounded panel -- white at 40% transparency (60% "
+      .. "solid) -- so its name, level and HP bar stay readable over a busy "
+      .. "field. OFF matches that panel to the party rows' usual dark "
+      .. "background instead, and the readout's own text (the name, the level "
+      .. "readout and the gender glyph) is drawn WHITE -- recoloured, not "
+      .. "tinted, because the cart's font glyphs are black -- so it stays "
+      .. "readable on that dark surface. The enemy's HP bar takes the same "
+      .. "muted green / yellow / red the FANTASY COMBAT party rows use in "
+      .. "both states.",
   },
 }

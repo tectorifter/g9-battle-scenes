@@ -23,6 +23,8 @@
 --   grass              wild encounter in grass
 --   water              wild encounter on water (surfing or fishing)
 --   cave               wild encounter in a cave / indoor encounter
+--   gym                the GENERIC gym ground -- a fallback for a gym/Elite
+--                      Four/Champion fight (see FALLBACKS below)
 --   gym1 .. gym16      gym 1 through gym 16 (badge order; see below)
 --   elitefour1 .. 4    the four Elite Four members, in league order
 --   champion           the Champion
@@ -52,6 +54,14 @@
 -- the Kanto gyms in badge order (Pewter..Viridian), matching the sixteen
 -- badges Gold/Silver actually hands out.
 --
+-- FALLBACKS.  A gym, Elite Four or Champion fight whose own numbered file is
+-- absent does not go white or borrow the map's cave ground: it walks, in order,
+-- its own tag -> gym.png (the generic gym ground) -> grass.png (the grass
+-- ground).  So a missing gym7.png shows gym.png when you have one, grass.png
+-- otherwise, and never the cave art an indoor gym map would otherwise infer.
+-- Every other tag keeps the older single fallback: the map's terrain (see
+-- M.pickFile and fieldTag).
+--
 -- HOW A TAG IS CHOSEN.  See M.tagFor -- in short: the battle's trainer class
 -- decides a gym/Elite Four/Champion/Red/rival/Rocket tag; otherwise a battle
 -- whose opponents include a named legend gives ho-oh/lugia/suicune, any other
@@ -67,9 +77,13 @@
 -- A trainer fight in none of those groups falls back to the map's terrain, and
 -- a gym map with no class match still gives its gym number.
 --
--- OPTION.  BACKGROUND defaults to AUTO (the tagging above); OFF draws nothing
--- at all and the field is the plain white it has always been.  A raw tag name
--- is also accepted in the option, to pin every battle to one backdrop.
+-- OPTION.  BACKGROUND defaults to AUTO (the tagging above); a raw tag name is
+-- also accepted, to pin every battle to one backdrop.  OFF is the scene's
+-- MASTER SWITCH: g9-battle-sample reads it (M.sceneWanted) and hands every
+-- fight back to the game's own battle screen -- no ground art and no custom
+-- layout.  (The scene's own drawing still degrades to the plain white field
+-- when it is asked to draw with no art, but with g9-battle-sample routing OFF
+-- means native.)
 --
 -- NEVER FATAL.  A missing folder, no files, a broken PNG, an unknown option
 -- value, or a scene harness with no love.image all degrade to the old white
@@ -97,11 +111,24 @@ return function(mod)
   local TAGS = {}
   local function tag(t) TAGS[t] = true end
   tag("grass"); tag("water"); tag("cave")
+  tag("gym")               -- the GENERIC gym ground, a fallback (see FALLBACK)
   for i = 1, 16 do tag("gym" .. i) end
   for i = 1, 4 do tag("elitefour" .. i) end
   tag("champion"); tag("red"); tag("rival"); tag("rocket")
   tag("ho-oh"); tag("lugia"); tag("suicune"); tag("fated")
   local TERRAIN_TAGS = { grass = true, water = true, cave = true }
+
+  -- FALLBACK CHAINS.  A fight tagged with one of these whose own art is missing
+  -- walks the chain in order before giving up, instead of dropping straight to
+  -- the map's terrain (which, for an indoor gym, is the cave ground).  A gym /
+  -- Elite Four / Champion fight therefore reads: its own numbered file
+  -- (gym1..gym16 / elitefour1..4 / champion) -> the generic gym ground
+  -- (gym.png, its own tag above) -> the grass ground (grass.png).  A tag NOT
+  -- listed here keeps the older single fallback (the map's terrain) -- see
+  -- M.pickFile and fieldTag.
+  local FALLBACK = { gym = { "grass" }, champion = { "gym", "grass" } }
+  for i = 1, 16 do FALLBACK["gym" .. i] = { "gym", "grass" } end
+  for i = 1, 4 do FALLBACK["elitefour" .. i] = { "gym", "grass" } end
 
   -- Longest first, so `gym10` is tried before `gym1` when matching a stem.
   local TAGS_SORTED = {}
@@ -597,6 +624,15 @@ return function(mod)
   -- The raw option value, defaulting to auto.
   function M.option() return optionString("battle_background", "auto") end
 
+  -- Does the player want the custom battle SCENE at all?  This is the master
+  -- routing switch g9-battle-sample consults before it takes a fight over:
+  -- BACKGROUND = OFF now means "use the game's own battle screen" -- no custom
+  -- scene at all, ground art and layouts alike -- while AUTO (the default) or
+  -- a pinned tag keeps the scene.  The scene's own drawing is unchanged (with
+  -- nothing to draw it still degrades to the white field); this is purely the
+  -- answer a caller reads before routing.
+  function M.sceneWanted() return M.option() ~= "off" end
+
   -- The tag this battle should use, or nil.  Priority: trainer class
   -- (gym/Elite Four/Champion/Red/rival/Rocket), the opposing species
   -- (legends), then the WILD TERRAIN -- and there the map the fight is
@@ -652,12 +688,22 @@ return function(mod)
   function M.selectedId(screen) return M.resolvedTag(screen) end
 
   -- Pick the file for a tag (one per tag, random, stable for a battle), or nil.
-  -- A tag with no art falls back to the map's terrain when it is not itself a
-  -- terrain tag, so a missing gym1.png still shows the gym's ground.
+  -- A tag in FALLBACK whose own art is missing walks its explicit chain first
+  -- (gym/Elite Four/Champion: the generic gym art, then grass); any other
+  -- non-terrain tag with no art falls back to the map's terrain, so a missing
+  -- gym1.png still shows a gym/grass backdrop rather than white.
   function M.pickFile(t, screen)
     local list = filesFor(t)
-    if #list == 0 and not TERRAIN_TAGS[t] then
-      list = filesFor(inferTerrain(screen))
+    if #list == 0 then
+      local chain = FALLBACK[t]
+      if chain then
+        for i = 1, #chain do
+          list = filesFor(chain[i])
+          if #list > 0 then break end
+        end
+      elseif not TERRAIN_TAGS[t] then
+        list = filesFor(inferTerrain(screen))
+      end
     end
     if #list == 0 then return nil end
     return list[randInt(#list)]
@@ -1145,8 +1191,10 @@ return function(mod)
   end
 
   -- The tag whose ART is actually on the field: the resolved tag when it has
-  -- art of its own (or is itself a terrain tag), otherwise the map's terrain
-  -- that pickFile falls back to.  The life rings key off THIS rather than the
+  -- art of its own (or is itself a terrain tag), otherwise the first tag in its
+  -- FALLBACK chain that has art (gym/Elite Four/Champion: gym.png then
+  -- grass.png), otherwise the map's terrain that pickFile falls back to.  The
+  -- life rings key off THIS rather than the
   -- raw tag, because the two can disagree: a static/scripted wild fight
   -- resolves to `fated` (no encounter roll behind it) and then borrows the
   -- map's water art, and a fight standing on water must float its mons
@@ -1155,6 +1203,13 @@ return function(mod)
     local t = cachedTag(screen)
     if not t then return false end
     if #filesFor(t) > 0 or TERRAIN_TAGS[t] then return t end
+    local chain = FALLBACK[t]
+    if chain then
+      for i = 1, #chain do
+        if #filesFor(chain[i]) > 0 then return chain[i] end
+      end
+      return false
+    end
     return inferTerrain(screen)
   end
 
