@@ -203,7 +203,7 @@ return {
     key = "fantasy_asset_size",
     label = "FANTASY SIZE",
     type = "choice",
-    default = "1.25",
+    default = "1",
     visible_if = { key = "fantasy_layout", equals = "on" },
     choices = {
       { "50%", "0.5" },

@@ -97,6 +97,11 @@ return function(mod)
   -- battle.exp_award seam this module wraps.  See exp_share.lua's own
   -- header for the per-generation split and the active-set contract.
   loadSibling(mod, "exp_share.lua")(mod)
+  -- The MEGA EVOLUTION animation (the transformation sequence).  Loaded after
+  -- the options schema and before battle_screen.lua, which captures its export
+  -- at load time and stages the sequence from its own resolve pass.  See
+  -- evolution_anim.lua's header and battle_screen.lua's MEGA EVOLUTION block.
+  loadSibling(mod, "evolution_anim.lua")(mod)
   loadSibling(mod, "battle_screen.lua")(mod)
   -- Wild-boss options LAST, so battle_screen.lua's own install has already
   -- run when this registers its battle.damage 1-HP wrap and its exports.

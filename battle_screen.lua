@@ -73,6 +73,12 @@ return function(mod)
   -- take a battle down.  Screen.new reads Fantasy.enabled() fresh per
   -- battle, exactly like settings.lua is reread per screen.
   local Fantasy = mod.exports.fantasyCombat
+  -- The MEGA EVOLUTION animation module (evolution_anim.lua, loaded just
+  -- before this file).  Nil for a caller that loaded this scene without that
+  -- sibling (or an older build), and every use below is guarded, so a missing
+  -- animation can only ever make a mega change silently -- never break the
+  -- turn.  See this file's MEGA EVOLUTION block for the staging contract.
+  local Evolution = mod.exports.battleSceneEvolutionAnim
   -- Real native Battle, constructed here so battle:useMove (driven
   -- through g9-battle-engine's mod.exports.resolveTurnActions) has
   -- the type chart/stats/RNG/event-queue machinery it needs -- see
@@ -1756,7 +1762,7 @@ return function(mod)
   -- same on-screen box, reversed; the returned bottom-center anchor is
   -- unchanged either way, so the HUD, the ball's landing spot and every
   -- move animation still agree with where the art lands.
-  local function drawSprite(r, boss, battler, spriteField, data, anchorRight, offX, offY, appear, scaleMul, alpha, flipX)
+  local function drawSprite(r, boss, battler, spriteField, data, anchorRight, offX, offY, appear, scaleMul, alpha, flipX, whiten)
     local img, naturalBake = resolveSprite(r, boss, battler, spriteField, data, scaleMul)
     if not img then return nil end
     local iw, ih = img:getDimensions()
@@ -1776,11 +1782,34 @@ return function(mod)
     -- are derived below, so the HUD readout and the ball's landing spot move
     -- with the art.
     if boss then dy = dy + BOSS_Y_SHIFT end
-    love.graphics.setColor(1, 1, 1, alpha or 1)
-    if flipX then
-      love.graphics.draw(img, dx + dw, dy, 0, -scale, scale)
+    -- WHITEN (the mega-evolution animation's "shining/whitening the sprite"
+    -- beat; nil/0 is the ordinary draw, bit for bit).  Two mechanisms on
+    -- purpose: a colour multiplier above 1 over-exposes the art toward a
+    -- solid silhouette (values >1 are legal in LÖVE and are the standard way
+    -- to blow a draw out), and a handful of additive passes of the SAME art
+    -- burn it bright even on a build that clamps the multiplier back to 1 --
+    -- so the sprite visibly whitens either way.  Transparent pixels stay
+    -- transparent under both.
+    local function blit(cr, cg, cb, ca)
+      love.graphics.setColor(cr, cg, cb, ca)
+      if flipX then
+        love.graphics.draw(img, dx + dw, dy, 0, -scale, scale)
+      else
+        love.graphics.draw(img, dx, dy, 0, scale, scale)
+      end
+    end
+    local wf = whiten or 0
+    if wf > 0.001 then
+      local mul = 1 + wf * 6
+      blit(mul, mul, mul, alpha or 1)
+      local passes = math.max(1, math.floor(wf * 6 + 0.5))
+      local burn = math.min(0.85, 0.28 + wf * 0.60)
+      love.graphics.push("all")
+      love.graphics.setBlendMode("add")
+      for _ = 1, passes do blit(1, 1, 1, burn) end
+      love.graphics.pop()
     else
-      love.graphics.draw(img, dx, dy, 0, scale, scale)
+      blit(1, 1, 1, alpha or 1)
     end
     -- The bottom-center anchor; this sprite's own drawn box (top y and
     -- height, design px); and that height at appear = 1 (see the header
@@ -2753,6 +2782,12 @@ return function(mod)
     self.gimmickOwnerSlot = nil
     self.gimmickOwnerId = nil
     self.gimmickOwnerLabel = nil
+    -- The staged MEGA EVOLUTION animation (see the MEGA EVOLUTION block):
+    -- { clip, owner, battler, applied } while the sequence is playing, nil
+    -- otherwise.  While it is set the resolving loop is held and the
+    -- battle.turn_started activation that performs the form change has not
+    -- run yet -- the clip's own reveal beat fires it.
+    self.evolve = nil
     -- Move-animation state: spriteAnchor is filled in every drawContent
     -- pass (see drawSprite's own return value) with each battler's real
     -- on-screen bottom-center this frame -- Screen:startMoveAnim reads
@@ -6464,6 +6499,202 @@ return function(mod)
     self:advanceResolving()
   end
 
+  ------------------------------------------------------------------
+  -- MEGA EVOLUTION -- the staged transformation animation.
+  --
+  -- battle_forms performs the real change from `battle.turn_started`
+  -- (src/mega.lua's activate -> Forms.becomeForm), which this screen raises
+  -- at the head of a resolve pass.  The animation has to play BEFORE that, so
+  -- the charge, the aura, the orb and the whitening all play over the OLD
+  -- sprite and the swap itself is hidden inside the clip's white flash.
+  -- So the pass no longer raises the event itself: it hands the turn to
+  -- evolution_anim.lua (startEvolutionAnim), which raises it on its own
+  -- reveal beat (revealEvolution -> applyGimmickActivation).  Everything else
+  -- about the activation is UNCHANGED by the split: the same owner focus, the
+  -- same armed/consumed refusal detection, the same FORMS_EVENT
+  -- announcements, the same once-per-battle limit (which lives in
+  -- battle_forms, not here), and the same stepwise beginTurn right after.
+  --
+  -- Only MEGA is staged.  Dynamax/Terastal/Z-Moves share battle_forms' one
+  -- activation seam but their own visual language is not this clip's, so they
+  -- keep the old immediate activation -- as does a build with no animation
+  -- sibling, or a mega this screen cannot place on the field.
+  --
+  -- The clip is held for its whole duration: Screen:updateResolving returns
+  -- early while self.evolve is set and Screen:update steps the clip (so a
+  -- mashed button can never skip a once-per-battle transformation), with an
+  -- 8-second safety valve that abandons the costume and still performs the
+  -- change -- a broken animation must never cost the player the mechanic.
+  ------------------------------------------------------------------
+  local EVOLUTION_SAFETY = 8.0
+
+  -- The evolving battler's whiten amount and size multiplier this frame, or
+  -- nil for every other battler.  Read by drawContent's sprite pass.
+  function Screen:evolutionFx(battler)
+    local ev = self.evolve
+    if not (ev and ev.clip and ev.battler == battler) then return nil end
+    if not (Evolution and type(Evolution.whiten) == "function") then return nil end
+    local ok, w = pcall(Evolution.whiten, ev.clip)
+    local ok2, s = pcall(Evolution.scaleMul, ev.clip)
+    return (ok and tonumber(w)) or 0, (ok2 and tonumber(s)) or 1
+  end
+
+  -- Where the clip should play: the battler's own spriteAnchor (filled by the
+  -- sprite pass every frame, so it is the box that was really drawn) with the
+  -- slot rect as the fallback for a frame before the first sprite pass.
+  local function evolutionBox(self, battler)
+    local side, slot
+    for i, b in ipairs(self.enemyBattlers) do
+      if b == battler then side, slot = "enemy", i break end
+    end
+    if not side then
+      for i, b in ipairs(self.playerBattlers) do
+        if b == battler then side, slot = "player", i break end
+      end
+    end
+    if not side then return nil end
+    local a = self.spriteAnchor and self.spriteAnchor[battler]
+    if a and a.w and a.top then
+      return { x = a.x, top = a.top, feet = a.y, w = a.w, h = a.h, side = side }
+    end
+    local r = self:slotRectFor(side, slot)
+    if not r then return nil end
+    return { x = r.x + r.w / 2, top = r.y, feet = r.y + r.h,
+             w = r.w, h = r.h, side = side }
+  end
+
+  -- Starts the staged sequence for `mon`, or answers false when there is
+  -- nothing to stage -- not a mega, no animation module, no on-field battler.
+  function Screen:startEvolutionAnim(mon)
+    if not (Evolution and type(Evolution.new) == "function") then return false end
+    if not mon then return false end
+    if self.gimmickOwnerId ~= "mega" then return false end
+    local battler = self:battlerFor(mon)
+    if not battler then return false end
+    local box = evolutionBox(self, battler)
+    if not box then return false end
+    local ok, clip = pcall(Evolution.new, {
+      x = box.x, top = box.top, feet = box.feet, w = box.w, h = box.h,
+      side = box.side, vw = VW, vh = VH,
+    })
+    if not (ok and type(clip) == "table") then
+      mod.log:warn("g9_Battle_Scene: mega evolution animation could not start (%s)",
+        tostring(clip))
+      return false
+    end
+    self.evolve = { clip = clip, owner = mon, battler = battler, applied = false }
+    clip.onReveal = function() self:revealEvolution() end
+    self.currentMessage = displayName(mon) .. " is Mega Evolving!"
+    return true
+  end
+
+  -- The activation the resolve pass used to run inline, lifted whole so the
+  -- animation's reveal beat can run exactly the same thing.  `battle.turn_started`
+  -- matches native's own turn-loop timing, right before this turn's actions
+  -- run: it is what lets battle_forms' own listener (src/resolve.lua's
+  -- M.onTurnStarted) perform whatever's armed and mark it spent, respecting
+  -- the once-per-battle limit exactly as it would for a native battle.  The
+  -- emit is focused on the FORM's owner (see the GIMMICK SELECT section's
+  -- FORMS OWNER block) because battle_forms' activate() reads battle.player,
+  -- and restored the moment the listener returns.
+  function Screen:applyGimmickActivation(formsMon)
+    self.movesBegun = true
+    local armedBefore = battleFormsArmedId()
+    focusBattlePlayer(self, formsMon, function()
+      Runtime.emit("battle.turn_started", { battle = self.battle })
+    end)
+    if formsMon and armedBefore ~= nil then
+      -- Consuming clears the armed id; battle_forms only consumes when the
+      -- entry actually activated, so a still-armed id is a refusal.
+      if battleFormsArmedId() == nil then
+        emitFormsEvent(self, "used", { mon = formsMon,
+          slot = self.gimmickOwnerSlot, id = self.gimmickOwnerId,
+          label = self.gimmickOwnerLabel })
+      else
+        emitFormsEvent(self, "cancelled", { mon = formsMon,
+          slot = self.gimmickOwnerSlot, id = self.gimmickOwnerId,
+          label = self.gimmickOwnerLabel, reason = "activation-refused" })
+      end
+    end
+    clearGimmickOwner(self)
+    -- Stepwise Gen 1 resolution: begin this turn's REAL order NOW, then
+    -- resolve ONE actor per pass below, so each actor's own events -- and the
+    -- sprite/stat changes that go with them -- are DISPLAYED before the next
+    -- actor resolves. Gen 2 -- and any engine without the stepwise arm --
+    -- returns false here and falls through to the whole-turn batch, unchanged.
+    self.stepwise = (type(self.combat.beginTurn) == "function")
+      and self.combat.beginTurn(self.g9dex, self.battle, self.moveQueue)
+      or false
+  end
+
+  -- The clip's reveal beat: run the real activation, which is the frame the
+  -- old sprite becomes the new one (under the full-white flash).
+  function Screen:revealEvolution()
+    local ev = self.evolve
+    if not (ev and not ev.applied) then return end
+    ev.applied = true
+    local ok, err = pcall(self.applyGimmickActivation, self, ev.owner)
+    if not ok then
+      mod.log:warn("g9_Battle_Scene: mega activation during the animation failed: %s",
+        tostring(err))
+      self.movesBegun = true
+      clearGimmickOwner(self)
+    end
+    if ev.owner then
+      self.currentMessage = displayName(ev.owner) .. " Mega Evolved!"
+    end
+  end
+
+  -- One step of the sequence, run from Screen:update (phase-independent, so a
+  -- held button cannot skip it).
+  function Screen:updateEvolution(dt)
+    local ev = self.evolve
+    if not ev then return end
+    if not (Evolution and type(Evolution.step) == "function") then
+      if not ev.applied then
+        ev.applied = true
+        pcall(self.applyGimmickActivation, self, ev.owner)
+      end
+      self.evolve = nil
+      return
+    end
+    local ok, err = pcall(Evolution.step, ev.clip, dt)
+    if not ok then
+      mod.log:warn("g9_Battle_Scene: mega evolution animation failed: %s", tostring(err))
+      if not ev.applied then
+        ev.applied = true
+        pcall(self.applyGimmickActivation, self, ev.owner)
+      end
+      self.evolve = nil
+      return
+    end
+    ev.elapsed = (ev.elapsed or 0) + (dt or 0)
+    if ev.clip.done or ev.elapsed > EVOLUTION_SAFETY then
+      -- Safety valve: a clip that never reports done still performs the
+      -- change and lets the turn finish.
+      if not ev.applied then
+        ev.applied = true
+        pcall(self.applyGimmickActivation, self, ev.owner)
+      end
+      self.evolve = nil
+      self:advanceResolving()
+    end
+  end
+
+  -- Draws the sequence over the field.  Called from drawContent just before
+  -- the F/E narration band, so the message stays readable over it -- which is
+  -- what the source clip does with its own text box.
+  function Screen:drawEvolution()
+    local ev = self.evolve
+    if not (ev and ev.clip) then return end
+    if not (Evolution and type(Evolution.draw) == "function") then return end
+    local ok, err = pcall(Evolution.draw, ev.clip)
+    if not ok then
+      mod.log:warn("g9_Battle_Scene: mega evolution draw failed: %s", tostring(err))
+      self.evolve = nil
+    end
+  end
+
   -- Consumes the turn one VISIBLE step at a time. A step ends when
   -- something changed on screen that the player is owed a look at:
   -- either a new line of text, or a bar that has started moving.
@@ -6480,6 +6711,10 @@ return function(mod)
   -- the bar empties underneath it), and it falls out of emit order for
   -- free rather than needing the events reordered or looked ahead at.
   function Screen:advanceResolving()
+    -- A staged mega owns the turn until its clip reports done (Screen:
+    -- updateEvolution calls straight back here then) -- nothing may step the
+    -- turn out from under it.
+    if self.evolve then return end
     self.hpAnimHolds = false
     while #self.pendingEvents > 0 do
       local event = table.remove(self.pendingEvents, 1)
@@ -6574,54 +6809,13 @@ return function(mod)
     end
     if not self.movesResolved then
       if not self.movesBegun then
-        self.movesBegun = true
-        -- Real "battle.turn_started" -- matches native's own turn-loop
-        -- timing, right before this turn's actions actually run. This is
-        -- what lets battle_forms's own real battle.turn_started listener
-        -- (src/resolve.lua's M.onTurnStarted) perform whatever's armed
-        -- (Screen:updateGimmickSelect) and mark it spent, respecting the
-        -- once-per-battle limit exactly as it would for a battle native's
-        -- own runTurn drove. Nothing here assumes battle_forms specifically
-        -- -- any mod keying real per-turn work off this real, standard
-        -- event benefits the same way.
-        --
-        -- Focused on the FORM's owner for the activation itself (see the
-        -- GIMMICK SELECT section's FORMS OWNER block): battle_forms' entry
-        -- activate() reads battle.player, so without this a FORM armed from
-        -- any slot but the first would transform slot 1 instead. Restored the
-        -- moment the listener returns.
         local formsMon = self.gimmickOwnerMon
-        local armedBefore = battleFormsArmedId()
-        focusBattlePlayer(self, formsMon, function()
-          Runtime.emit("battle.turn_started", { battle = self.battle })
-        end)
-        if formsMon and armedBefore ~= nil then
-          -- Consuming clears the armed id; battle_forms only consumes when the
-          -- entry actually activated, so a still-armed id is a refusal.
-          if battleFormsArmedId() == nil then
-            emitFormsEvent(self, "used", { mon = formsMon,
-              slot = self.gimmickOwnerSlot, id = self.gimmickOwnerId,
-              label = self.gimmickOwnerLabel })
-          else
-            emitFormsEvent(self, "cancelled", { mon = formsMon,
-              slot = self.gimmickOwnerSlot, id = self.gimmickOwnerId,
-              label = self.gimmickOwnerLabel, reason = "activation-refused" })
-          end
-        end
-        clearGimmickOwner(self)
-        -- Stepwise Gen 1 resolution: begin this turn's REAL order NOW, then
-        -- resolve ONE actor per pass below, so each actor's own events -- and
-        -- the sprite/stat changes that go with them -- are DISPLAYED before
-        -- the next actor resolves. Previously the whole turn resolved in one
-        -- call, so every state change (a Transform's stat/sprite exchange, a
-        -- faint) landed before the first message for it had been shown, which
-        -- read as the transform "happening" ahead of a higher-priority move
-        -- even though the messages themselves were already in order. Gen 2 --
-        -- and any engine without the stepwise arm -- returns false here and
-        -- falls through to the whole-turn batch below, unchanged.
-        self.stepwise = (type(self.combat.beginTurn) == "function")
-          and self.combat.beginTurn(self.g9dex, self.battle, self.moveQueue)
-          or false
+        -- MEGA EVOLUTION (see the MEGA EVOLUTION block below): a mega this
+        -- scene can actually dress hands the turn to the animation and returns
+        -- before the activation runs -- the clip's own reveal beat performs it
+        -- then, over the OLD sprite, with the swap hidden in its white flash.
+        if self:startEvolutionAnim(formsMon) then return end
+        self:applyGimmickActivation(formsMon)
       end
 
       if self.stepwise then
@@ -7073,6 +7267,10 @@ return function(mod)
   -- A press during a hold ends that hold and nothing else; it never also
   -- eats the line underneath, so no message can be skipped unread.
   function Screen:updateResolving(input, dt)
+    -- The staged mega animation owns this beat's whole screen and clock; a
+    -- press cannot skip a once-per-battle transformation (Screen:updateEvolution
+    -- is what ends it).
+    if self.evolve then return end
     -- A press only counts once BOTH the commit window (0.3s after the
     -- action was queued -- see INPUT_DELAY) and this beat's own minimum
     -- display time have elapsed. A bar that is still draining or a move
@@ -7467,6 +7665,11 @@ return function(mod)
     -- input -- a label fades out over DMG_NUMBER_LIFE seconds whatever
     -- else is happening (see Screen:stepDmgNumbers).
     self:stepDmgNumbers(dt)
+    -- The staged MEGA EVOLUTION sequence (a no-op unless self.evolve is set --
+    -- see the MEGA EVOLUTION block).  Stepped here, before the phase dispatch
+    -- and independent of input, so its reveal beat (which performs the form
+    -- change) lands before this frame is drawn and no press can skip it.
+    if self.evolve then self:updateEvolution(dt) end
     -- Independent of input/phase -- a move animation keeps stepping
     -- underneath the message text the same way it does in every real
     -- Pokemon battle. Runner:step() returns false once the animation
@@ -7908,7 +8111,8 @@ return function(mod)
         -- sprite vanishes exactly when its bar drains to zero under the
         -- fainted narration, not the frame the whole turn's math commits.
         local appear = ballAppearFor(self, "enemy", i)
-        local ax, ay, dty, dth, dfull, ddw = drawSprite(r, boss, battler, enemySpriteField, self.data, true, 0, 0, appear, self.spriteScaleFront)
+        local ew, es = self:evolutionFx(battler)
+        local ax, ay, dty, dth, dfull, ddw = drawSprite(r, boss, battler, enemySpriteField, self.data, true, 0, 0, appear, self.spriteScaleFront * (es or 1), nil, nil, ew)
         if ax then
           self.spriteAnchor[battler] = { x = ax, y = ay, top = dty, h = dth, w = ddw }
           noteHead(battler, dty, dth, dfull)
@@ -7933,7 +8137,8 @@ return function(mod)
         -- ball itself is drawn by drawBallThrow) -- scaled in from the
         -- ground via ballAppearFor while its own "Go! P!" line reads.
         local appear = ballAppearFor(self, "player", i)
-        local ax, ay, dty, dth, dfull, ddw = drawSprite(r, false, battler, playerSpriteField, self.data, false, 0, 0, appear, self.spriteScaleBack, nil, playerFlip)
+        local ew, es = self:evolutionFx(battler)
+        local ax, ay, dty, dth, dfull, ddw = drawSprite(r, false, battler, playerSpriteField, self.data, false, 0, 0, appear, self.spriteScaleBack * (es or 1), nil, playerFlip, ew)
         if ax then
           self.spriteAnchor[battler] = { x = ax, y = ay, top = dty, h = dth, w = ddw }
           noteHead(battler, dty, dth, dfull)
@@ -8101,6 +8306,12 @@ return function(mod)
       love.graphics.rectangle("fill", 0, VH - cover, VW, cover)
       love.graphics.setColor(1, 1, 1, 1)
     end
+
+    -- MEGA EVOLUTION: the transformation sequence, drawn over every sprite
+    -- and GUI box but UNDER the F/E narration band below, so the "X is Mega
+    -- Evolving!" line stays readable through it (exactly as the source clip
+    -- keeps its text box legible over the effects).
+    self:drawEvolution()
 
     -- Bottom: F (message/move/target, wide) beside E (FIGHT/BAG/PKMN/RUN,
     -- narrow), the two panes of the cart's own bottom box. Both go through
