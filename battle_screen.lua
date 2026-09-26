@@ -473,16 +473,68 @@ return function(mod)
     -- never on the enemy count, so a normal 2-3 enemy fight is never
     -- widened by this. Read off the screen, which owns the layout.
     local isHorde = screen.isHorde == true
+    -- 4v4 rule, explicit user directive: every battler on a side counts as
+    -- adjacent to every other -- the same "all allies = all allies" a boss
+    -- fight reports (rule 1), extended to BOTH teams ("all enemies are
+    -- considered adjacent to each other"), so an ally-scope move like Life
+    -- Dew reaches the whole team and a foes-scope switch-in ability
+    -- (Intimidate) reaches every foe. The ONE exception is an OFFENSIVE
+    -- SPREAD move (the two archetypes the engine's own isSpreadMove names
+    -- -- all-opponents / all-other-pokemon: Rock Slide, Muddy Water,
+    -- Earthquake, Surf, ...): on the ENEMY side those keep NORMAL
+    -- positional adjacency, so they reach at most three of the four
+    -- enemies and NEVER all four (rule 2). An all-other-pokemon move
+    -- (Earthquake) still reaches the WHOLE ally side (rule 3) -- which the
+    -- `allyFull` switch below reports -- and keeps the same three-enemy
+    -- cap. Spread-damage mitigation is untouched: it rides to the engine
+    -- on the resolved target count exactly as it always did, and so still
+    -- only drops out when a single target was actually affected.
+    --
+    -- Read off the screen, which owns the layout; the whole block is
+    -- inert unless the active preset is the 4v4 one, so no other layout
+    -- can be reached by it.
+    local isFourVFour = screen.isFourVFour == true
+    local canReach = FN.canReachNonAdjacent(moveId, FN.moveFlagsFn())
+    -- Is this move-use one of the two offensive spread archetypes?
+    -- The engine's own isSpreadMove is the authority (national_dex's own
+    -- `target` field); an older engine without that export falls back to
+    -- the move def's `target` -- the same fallback Screen:isSpreadMove
+    -- already uses. Only consulted in 4v4, and never for a
+    -- distance-capable move (canReach), which opens the whole board
+    -- anyway.
+    local isSpreadMove = false
+    if isFourVFour and not canReach and moveId ~= nil then
+      local eng = screen.g9dex and screen.g9dex.exports
+        and screen.g9dex.exports.isSpreadMove
+      if eng then
+        local ok, res = pcall(eng, moveId)
+        isSpreadMove = ok and res == true
+      else
+        local def = screen.data and screen.data.moves
+          and screen.data.moves[moveId]
+        local tgt = def and def.target
+        isSpreadMove = tgt == "all-opponents" or tgt == "all-other-pokemon"
+      end
+    end
     -- The one switch for "report the whole roster": a boss fight, a horde
     -- fight, a non-move roster query (nil moveId), or a move whose own id
     -- can reach across a slot. Otherwise real positional adjacency applies.
-    local full = isBossFight or isHorde or FN.canReachNonAdjacent(moveId, FN.moveFlagsFn())
+    local full = isBossFight or isHorde or canReach
+    -- Per-side reach. Every OTHER layout resolves both flags to `full`,
+    -- exactly as before; 4v4 always reports its whole own team (rule 1)
+    -- and its whole opposing team too -- except for the offensive spread
+    -- moves above, which keep the real positional enemy adjacency (rules
+    -- 2 and 3).
+    local allyFull = full or isFourVFour
+    local enemyFull = full or (isFourVFour and not isSpreadMove)
     local allies, enemies = {}, {}
     for i, b in ipairs(ownArr) do
       if i ~= casterIndex and (not isAlive or isAlive(b)) then
-        -- Same side: literal neighbours only (|i - caster| == 1); the
-        -- far slot on a three-wide side is NOT adjacent.
-        if full or math.abs(i - casterIndex) == 1 then
+        -- Same side: literal neighbours only (|i - caster| == 1) unless
+        -- this side's own reach was opened above (a boss/horde/4v4 wants
+        -- the whole team); the far slot on a three-wide side is NOT
+        -- adjacent.
+        if allyFull or math.abs(i - casterIndex) == 1 then
           allies[#allies + 1] = b.mon
         end
       end
@@ -492,13 +544,39 @@ return function(mod)
         -- Across sides: this slot's own column and the two beside it
         -- (|caster - j| <= 1) -- wings reach two foes, the centre all
         -- three. A two-wide side is entirely within 1, so doubles and
-        -- singles are unchanged.
-        if full or math.abs(j - casterIndex) <= 1 then
+        -- singles are unchanged. A 4v4 opens the whole opposing team
+        -- except for its offensive spread moves (see `enemyFull`).
+        if enemyFull or math.abs(j - casterIndex) <= 1 then
           enemies[#enemies + 1] = b.mon
         end
       end
     end
     return { allies = allies, enemies = enemies }
+  end, 0)
+
+  -- IMPOSTER'S POSITION QUERY (Showdown abilities.ts:2123): "the foe directly
+  -- opposite this battler's slot." g9-battle-engine's combat/move_targeting
+  -- .lua asks through g9.request_opposite; this is the scene-side answer, from
+  -- the SAME index-aligned grid the adjacency wrap above reports. `caster`
+  -- arrives as a RAW mon (the engine's runSwitchInAbilities unwraps the
+  -- battler before asking), so battlerArraysFor's `b.mon == mon` match
+  -- resolves it. Returns the mon in the OPPOSING array at the caster's own
+  -- index -- literally the same column -- and nil when that slot is empty or
+  -- its occupant is not standing: the "Imposter fails and never targets an
+  -- ally" rule. A mon not on this screen's field falls through to the
+  -- engine's native two-battler fallback.
+  mod.hooks:wrap("g9.request_opposite", function(nextFn, battle, caster)
+    local screen = lastScreen
+    if not (screen and screen.battle == battle) then
+      return nextFn(battle, caster)
+    end
+    local ownArr, oppArr, casterIndex = FN.battlerArraysFor(screen, caster)
+    if not ownArr then return nextFn(battle, caster) end
+    local combat = mod.exports.combat
+    local isAlive = combat and combat.isAlive
+    local opp = oppArr and oppArr[casterIndex]
+    if opp and (not isAlive or isAlive(opp)) then return opp.mon end
+    return nil
   end, 0)
 
   -- Clears the mon.multiSide tag this mod's own combat.lua sets
@@ -1817,6 +1895,66 @@ return function(mod)
     return (mon and mon.maxHp) or (mon and mon.stats and mon.stats.hp) or 0
   end
 
+  -- Localize a string our OWN mod sends to the screen (a battle refusal, an
+  -- outcome line, the gimmick picker's label) through g9-gui's translation
+  -- layer (ui/translation.lua's M.line).  The translation mod translates the
+  -- ROM's own text itself; this covers the strings that are OURS, which it
+  -- never sees.  Read lazily through mod.find and fail-open: without g9-gui,
+  -- with the layer's TRANSLATION option off, or with no translation mod
+  -- installed, M.line returns the string unchanged, so this is a no-op.
+  local translationLayer
+  local function g9Translation()
+    if translationLayer then return translationLayer end
+    local ok, gui = pcall(function() return mod.find and mod.find("g9-gui") end)
+    if not ok or type(gui) ~= "table" then return nil end
+    local ex = gui.exports
+    local t = ex and ex.translation
+    if type(t) == "table" and type(t.line) == "function" then
+      translationLayer = t
+    end
+    return translationLayer
+  end
+  FN.localize = function(text)
+    if type(text) ~= "string" or text == "" then return text end
+    local t = g9Translation()
+    if not t then return text end
+    local ok, v = pcall(t.line, text)
+    if ok and type(v) == "string" and v ~= "" then return v end
+    return text
+  end
+
+  -- UTF-8 helpers.  `maxChars` is a budget in CODEPOINTS, not bytes: a
+  -- Japanese/Korean translation packs 3 bytes per glyph, so the old byte
+  -- count broke a line after ~a third of the columns it was allowed, and a
+  -- space-less run (CJK has no word breaks) could only overflow as one line
+  -- -- the reported "message runs past the box".
+  local function utf8Len(s, i)
+    local b = s:byte(i) or 0
+    if b >= 0xF0 then return 4 elseif b >= 0xE0 then return 3
+    elseif b >= 0xC0 then return 2 end
+    return 1
+  end
+  local function utf8Count(s)
+    local n, i, len = 0, 1, #s
+    while i <= len do n = n + 1; i = i + utf8Len(s, i) end
+    return n
+  end
+  -- Split one over-long, space-less token (a CJK run, a long name) into
+  -- chunks of at most maxChars codepoints.
+  local function breakToken(token, maxChars)
+    local out, cur, n = {}, "", 0
+    local i, len = 1, #token
+    while i <= len do
+      local cl = utf8Len(token, i)
+      cur = cur .. token:sub(i, i + cl - 1)
+      n = n + 1
+      i = i + cl
+      if n >= maxChars then out[#out + 1] = cur; cur = ""; n = 0 end
+    end
+    if cur ~= "" then out[#out + 1] = cur end
+    return out
+  end
+
   -- Word-wraps text to fit F's own real interior width (F_TW-2 chars,
   -- see this file's header note on Font.drawBox's border cost) and
   -- draws it as however many lines that takes. Battle messages
@@ -1842,20 +1980,29 @@ return function(mod)
     text = text:gsub("%s+", " ")
     local line = ""
     local row = 0
-    for word in text:gmatch("%S+") do
-      local candidate = (line == "") and word or (line .. " " .. word)
-      if #candidate > maxChars and line ~= "" then
-        Font.draw(line, x, y + row * lineHeight)
-        row = row + 1
-        line = word
-      else
-        line = candidate
-      end
-    end
-    if line ~= "" then
-      Font.draw(line, x, y + row * lineHeight)
+    local function emit(s)
+      Font.draw(s, x, y + row * lineHeight)
       row = row + 1
     end
+    for word in text:gmatch("%S+") do
+      if utf8Count(word) > maxChars then
+        -- A single run too long for a line (CJK, or a very long name): flush
+        -- what is pending, then break the run across lines.
+        if line ~= "" then emit(line); line = "" end
+        local pieces = breakToken(word, maxChars)
+        for k = 1, #pieces - 1 do emit(pieces[k]) end
+        line = pieces[#pieces] or ""
+      else
+        local candidate = (line == "") and word or (line .. " " .. word)
+        if line ~= "" and utf8Count(candidate) > maxChars then
+          emit(line)
+          line = word
+        else
+          line = candidate
+        end
+      end
+    end
+    if line ~= "" then emit(line) end
     return row
   end
 
@@ -3285,6 +3432,14 @@ vec4 effect(vec4 color, Image tex, vec2 tc, vec2 sc) {
     -- lone ally at a2 (col 2).
     self.isBoss = (activeLayout and activeLayout.boss) and true or false
     self.isHorde = (activeLayout and activeLayout.horde) and true or false
+    -- 4v4 (layouts/4v4.lua's own flag): the preset whose whole reason to
+    -- exist is the exclusive adjacency ruleset in this file's
+    -- g9.request_adjacency wrap below and the picker helpers beside it.
+    -- It is the ONLY switch that ruleset reads, so singles, doubles,
+    -- triples, hordes and boss fights can never be reached by it. No
+    -- placement or sizing is attached to it -- the shared grid already
+    -- stands four per side.
+    self.isFourVFour = (activeLayout and activeLayout.fourVFour) and true or false
     -- THIS battle's sprite scale, PER SIDE, from the preset's own optional
     -- `spriteScaleFront` / `spriteScaleBack` override (or the legacy single
     -- `spriteScale`, which sets both), else this file's own defaults -- read
@@ -4417,6 +4572,28 @@ vec4 effect(vec4 color, Image tex, vec2 tc, vec2 sc) {
     -- for the whole fight.
     self.bossTransformIntro = nil
     for _, b in ipairs(self.enemyBattlers or {}) do self:releaseGimmickHold(b) end
+    -- IMPOSTER / ILLUSION AT SEND-OUT. This is the last intro beat, so every
+    -- fielded mon has now really been sent out -- the moment a switch-in
+    -- ability fires. g9-battle-engine's own constructors (newWild/newTrainer)
+    -- drive this for native battles, but this screen builds its battle MODEL
+    -- itself (native.lua's buildBattle) and so never called it: a
+    -- double-battle Imposter never transformed, or transformed into whatever
+    -- `battle.enemy`/`battle.player` happened to be (sometimes its OWN ally).
+    -- Run the engine's switch-in dispatch for every active battler; it is
+    -- idempotent (a mon already transformed is skipped) and the engine's
+    -- requestOpposite seam (the g9.request_opposite wrap above) resolves each
+    -- mon's DIRECTLY OPPOSITE foe by its real slot column -- no opposite foe
+    -- means Imposter does nothing at all.
+    local eng = self.g9dex and self.g9dex.exports
+    local runSwitchIn = eng and eng.runSwitchInAbilities
+    if runSwitchIn then
+      for _, b in ipairs(self.enemyBattlers or {}) do
+        if self.combat.isAlive(b) then pcall(runSwitchIn, self.battle, b.mon) end
+      end
+      for _, b in ipairs(self.playerBattlers or {}) do
+        if self.combat.isAlive(b) then pcall(runSwitchIn, self.battle, b.mon) end
+      end
+    end
     self.currentMessage = nil
     self:beginTurn()
   end
@@ -4694,6 +4871,75 @@ vec4 effect(vec4 color, Image tex, vec2 tc, vec2 sc) {
     return a, b
   end
 
+  -- ------------------------------------------------------- Gigantamax control
+  -- battle_forms decides a Gigantamax purely from the mon's SPECIES:
+  -- src/dynamax.lua's activate() reads `deps.gigantamax[mon.species]` for the
+  -- form and its arm() reads `deps.gmaxMoves(battle.data, mon)` for the G-Max
+  -- moves.  It reads no Factor anywhere, so on its own it would Gigantamax
+  -- EVERY eligible species whatever the engine's own per-mon `gigantamaxFactor`
+  -- says -- the Factor would be inert.
+  --
+  -- This is the gate: a mon WITHOUT the Factor is handed a stand-in species
+  -- that carries no G-Max record and no G-Max move, so it Dynamaxes plainly; a
+  -- mon WITH the Factor is handed its real species, so an eligible one
+  -- Gigantamaxes exactly as battle_forms already knows how.
+  --
+  -- The stand-in is a REAL species, present in the data and absent from
+  -- battle_forms' gigantamax map: battle_forms still runs its ordinary Dynamax
+  -- path (Max Moves, the clock, the HP scale) off whatever species it is handed,
+  -- so a fabricated id would only make one of its lookups miss.
+  FN.FORMS_FALLBACK_SPECIES = "RATTATA"
+
+  -- The engine's own Gigantamax Factor read, with the bare field (what the
+  -- engine's storage accessors write) as the fallback for a build without
+  -- g9-battle-engine's exports.
+  FN.hasGigantamaxFactor = function(mon)
+    if type(mon) ~= "table" then return false end
+    local eng = mod:find("g9-battle-engine")
+    local api = eng and eng.exports
+    if api and type(api.getGigantamaxFactor) == "function" then
+      local ok, value = pcall(api.getGigantamaxFactor, mon)
+      if ok then return value == true end
+    end
+    return mon.gigantamaxFactor == true
+  end
+
+  -- The species to hand battle_forms for `mon`, or nil to leave `mon.species`
+  -- alone.  Nil means "no swap needed": a mon that already has the Factor keeps
+  -- its real species (so an eligible one Gigantamaxes), and a species that is
+  -- not Gigantamax-capable at all cannot Gigantamax either way, so the swap
+  -- would only rename a saved Pokemon's field for nothing.
+  FN.formsSpeciesFor = function(self, mon)
+    if type(mon) ~= "table" or type(mon.species) ~= "string" then return nil end
+    if FN.hasGigantamaxFactor(mon) then return nil end
+    local eng = mod:find("g9-battle-engine")
+    local api = eng and eng.exports
+    if not (api and type(api.isGigantamaxEligibleSpecies) == "function") then
+      return nil
+    end
+    local ok, eligible = pcall(api.isGigantamaxEligibleSpecies, mon.species)
+    if not (ok and eligible) then return nil end
+    return FN.FORMS_FALLBACK_SPECIES
+  end
+
+  -- Runs `fn` with `mon.species` swapped to the battle_forms stand-in (when one
+  -- is needed), restoring the REAL species afterwards whether fn returns or
+  -- raises -- the same pcall-and-restore discipline focusBattlePlayer uses for
+  -- battle.player, and for the same reason: a raising battle_forms call must
+  -- never leave a saved Pokemon's species renamed.
+  FN.withFormsSpecies = function(self, mon, fn)
+    if type(fn) ~= "function" then return end
+    if type(mon) ~= "table" or type(mon.species) ~= "string" then return fn() end
+    local want = FN.formsSpeciesFor(self, mon)
+    if want == nil or want == mon.species then return fn() end
+    local real = mon.species
+    mon.species = want
+    local ok, a, b = pcall(fn)
+    mon.species = real
+    if not ok then error(a, 0) end
+    return a, b
+  end
+
   -- formapi's own published `armed()` (the internals are not the peer
   -- contract). The armed id disappearing between two reads is also the signal
   -- that battle.turn_started actually consumed it; staying armed means the
@@ -4955,7 +5201,7 @@ vec4 effect(vec4 color, Image tex, vec2 tc, vec2 sc) {
         local row = math.floor((i - 1) / 2) + 1
         local col = (i - 1) % 2 + 1
         local x, y = colX[col], self.fTextY + (row - 1) * 9
-        Font.draw(entry.label, x, y)
+        Font.draw(FN.localize(entry.label), x, y)
         if i == self.gimmickCursor then
           Font.drawCode(CURSOR_CODE, x - 12, y)
         end
@@ -5322,7 +5568,7 @@ vec4 effect(vec4 color, Image tex, vec2 tc, vec2 sc) {
     -- invented its own "<name>'s turn:" prompt here -- not vanilla,
     -- replaced on request.
     if self.message then
-      FN.drawWrapped(self.message, self.fTextX, self.fTextY, self.fChars)
+      FN.drawWrapped(FN.localize(self.message), self.fTextX, self.fTextY, self.fChars)
     end
   end
 
@@ -6124,19 +6370,52 @@ vec4 effect(vec4 color, Image tex, vec2 tc, vec2 sc) {
     return id and SPREAD_MOVE_IDS[id] == true or false
   end
 
-  -- ROUND 26 (2026-09-10): can this picked move legally be aimed at one
-  -- of the caster's OWN living teammates? Authoritative answer:
-  -- g9-battle-engine's isAllyTargetable (national_dex's own target
-  -- archetype plus the selected-pokemon/heal records like Heal Pulse).
-  -- Trusted when the engine has it; an OLD engine predating that export
-  -- falls back to the move def's own target/healing fields, so the
-  -- picker still offers allies with a stale engine. Used only to widen
-  -- the target picker -- the ENGINE still decides at resolution time
-  -- whether a fainted ally means the move redirects (foe) or fails (ally).
+  -- ROUND 26 / 380 (2026-10-04): can this picked move legally be aimed at
+  -- one of the caster's OWN living teammates? Authoritative answer:
+  -- g9-battle-engine's isAllyTargetable -- the inherently ally-directed
+  -- archetypes ("ally"/"user-or-ally"), the selected-pokemon HEAL records
+  -- (Heal Pulse, Floral Healing) AND every non-damaging (status/support)
+  -- selected-pokemon move, which is aimable at an adjacent ally exactly as
+  -- the cartridges and Showdown allow (Transform -- any adjacent Pokemon
+  -- including an ally -- plus Thunder Wave, Toxic, Trick, Skill Swap,
+  -- Instruct, ...). Trusted when the engine has it; an OLD engine predating
+  -- that export falls back to the move def's own target/healing/power
+  -- fields, so the picker still offers allies with a stale engine. Used
+  -- only to widen the target picker -- the ENGINE still decides at
+  -- resolution time whether a fainted ally means the move redirects (foe)
+  -- or fails (ally).
   function Screen:isAllyTargetable(picked)
     if not picked then return false end
     local id = picked.slot and picked.slot.id
     local eng = self.g9dex and self.g9dex.exports and self.g9dex.exports.isAllyTargetable
+    if eng then
+      local ok, res = pcall(eng, id)
+      if ok then return res == true end
+    end
+    local def = picked.def
+    if def then
+      if def.target == "ally" or def.target == "user-or-ally" then return true end
+      if def.target == "selected-pokemon" then
+        if (def.healing or 0) > 0 or def.category == "heal"
+            or def.damageClass == "status" or (def.power or 0) == 0 then
+          return true
+        end
+      end
+    end
+    return false
+  end
+
+  -- ROUND 380 (2026-10-04): can this picked move ONLY be aimed at one of the
+  -- caster's OWN living teammates (Helping Hand, Aromatic Mist, Heal Pulse,
+  -- Floral Healing, ...)? Authoritative answer: g9-battle-engine's
+  -- isAllyOnlyMove. The picker must offer NO foe for one of these; in
+  -- singles (no ally) the move is USED and FAILS rather than being silently
+  -- applied to the lone enemy. Falls back to the move def's own
+  -- target/category/healing on a stale engine.
+  function Screen:isAllyOnly(picked)
+    if not picked then return false end
+    local id = picked.slot and picked.slot.id
+    local eng = self.g9dex and self.g9dex.exports and self.g9dex.exports.isAllyOnlyMove
     if eng then
       local ok, res = pcall(eng, id)
       if ok then return res == true end
@@ -6206,6 +6485,19 @@ vec4 effect(vec4 color, Image tex, vec2 tc, vec2 sc) {
     return self.isHorde == true
   end
 
+  -- 4v4 (layouts/4v4.lua's `fourVFour` flag): the picker's half of the
+  -- ruleset the g9.request_adjacency wrap enforces at resolution time.
+  -- In a 4v4 EVERY teammate and EVERY foe counts as adjacent (rule 1),
+  -- so a single-target move -- which is the only kind that ever reaches
+  -- the picker, since Screen:isSpreadMove sends a spread straight past it
+  -- -- offers the whole live board. The offensive-spread three-enemy cap
+  -- (rule 2) needs no picker handling at all: a spread never opens one.
+  -- Reads the same active-layout flag the wrap reads, so it is never
+  -- mistaken for a triples fight.
+  function Screen:isFourVFourFight()
+    return self.isFourVFour == true
+  end
+
   -- Can this picked move legally be aimed at a NON-adjacent foe (or ally)?
   -- Keyed on the move's own id, never its current type (the user's explicit
   -- Aerilate/Normalize clause) -- see the module-level NONADJACENT_MOVE_IDS
@@ -6219,9 +6511,13 @@ vec4 effect(vec4 color, Image tex, vec2 tc, vec2 sc) {
     return FN.canReachNonAdjacent(id, flagsFn)
   end
 
-  -- Neither proximity rule applies: offer the whole live board.
+  -- Neither proximity rule applies: offer the whole live board. A 4v4 is
+  -- added here on its own flag (everyone is adjacent by rule 1), while
+  -- its offensive spread cap is enforced entirely at resolution time, so
+  -- nothing about the picker can widen it.
   function Screen:reachAllSlots(picked)
-    return self:isBossFight() or self:isHordeFight() or self:canReachNonAdjacent(picked)
+    return self:isBossFight() or self:isHordeFight() or self:isFourVFourFight()
+      or self:canReachNonAdjacent(picked)
   end
 
   -- The acting player slot index (1-based), defaulting to the lead.
@@ -6338,15 +6634,22 @@ vec4 effect(vec4 color, Image tex, vec2 tc, vec2 sc) {
         if self.combat.isAlive(e) then aliveEnemies[#aliveEnemies + 1] = e end
       end
       local offeredEnemies = self:reachableEnemies(picked)
-      -- ROUND 26: a move that can legally be aimed at an ally (Heal Pulse,
-      -- Helping Hand, Aromatherapy-shaped support -- the engine's own
-      -- isAllyTargetable is the authority) also offers the acting
-      -- battler's OWN living teammates in the picker, listed first, so the
-      -- player can choose who to heal/support. Every other move keeps the
-      -- enemy-only picker exactly as before. ROUND 83 restricts those
-      -- teammates to the ones this move can genuinely reach from this slot.
+      -- ROUND 26 / 380: a move that can legally be aimed at an ally also
+      -- offers the acting battler's OWN living teammates in the picker,
+      -- listed first, so the player can choose who to heal/support/transform
+      -- into (the engine's own isAllyTargetable / isAllyOnlyMove are the
+      -- authority). An ALLY-ONLY move (Helping Hand, Heal Pulse, ...) offers
+      -- NO foe at all, so in singles it resolves to an empty list and is
+      -- used and failed rather than being applied to the lone enemy. ROUND 83
+      -- restricts candidates to the ones this move can genuinely reach from
+      -- this slot.
       local candidates = offeredEnemies
-      if self:isAllyTargetable(picked) then
+      if self:isAllyOnly(picked) then
+        candidates = {}
+        for _, a in ipairs(self:reachableAllies(picked)) do
+          candidates[#candidates + 1] = a
+        end
+      elseif self:isAllyTargetable(picked) then
         candidates = {}
         for _, a in ipairs(self:reachableAllies(picked)) do
           candidates[#candidates + 1] = a
@@ -6410,7 +6713,7 @@ vec4 effect(vec4 color, Image tex, vec2 tc, vec2 sc) {
     -- A refusal (0-PP pick) takes over F until acknowledged, the way the
     -- native screen's message box replaces the move list.
     if self.message then
-      FN.drawWrapped(self.message, self.fTextX, self.fTextY, self.fChars)
+      FN.drawWrapped(FN.localize(self.message), self.fTextX, self.fTextY, self.fChars)
       return
     end
     -- No "<name>'s move:" header -- the move list starts right at
@@ -6469,7 +6772,7 @@ vec4 effect(vec4 color, Image tex, vec2 tc, vec2 sc) {
   -- eighty-two) -- the stat readouts over the mons already carry that, and
   -- the selection is shown on the field by drawTargetMark.
   function Screen:drawTargetSelect()
-    Font.draw("Choose a target:", self.fTextX, self.fTextY)
+    Font.draw(FN.localize("Choose a target:"), self.fTextX, self.fTextY)
   end
 
   -- The picker's cursor, drawn on the FIELD: a small down-pointing triangle
@@ -6575,7 +6878,7 @@ vec4 effect(vec4 color, Image tex, vec2 tc, vec2 sc) {
   -- F carries only the prompt, exactly as the target picker does -- the
   -- field arrows (drawSwapMark) say the rest.
   function Screen:drawSwapSelect()
-    Font.draw("Switch with whom?", self.fTextX, self.fTextY)
+    Font.draw(FN.localize("Switch with whom?"), self.fTextX, self.fTextY)
   end
 
   function Screen:queueSwapAction(slotA, slotB)
@@ -7946,7 +8249,9 @@ vec4 effect(vec4 color, Image tex, vec2 tc, vec2 sc) {
   -- the once-per-battle limit exactly as it would for a native battle.  The
   -- emit is focused on the FORM's owner (see the GIMMICK SELECT section's
   -- FORMS OWNER block) because battle_forms' activate() reads battle.player,
-  -- and restored the moment the listener returns.
+  -- and restored the moment the listener returns.  The SAME region is wrapped
+  -- by FN.withFormsSpecies, because battle_forms decides Gigantamax from
+  -- mon.species -- the Gigantamax control block above is why.
   function Screen:applyGimmickActivation(formsMon, item)
     self.movesBegun = true
     -- The arm and the raise both happen INSIDE the focus, because arming a
@@ -7960,18 +8265,26 @@ vec4 effect(vec4 color, Image tex, vec2 tc, vec2 sc) {
     -- last-armed one.  The armed id is read AFTER the arm so the consumed
     -- check below is about this gimmick.
     local armedBefore
-    local emitted = FN.focusBattlePlayer(self, formsMon, function()
-      if item and item.id then
-        if not FN.battleFormsArm(item.id) then
-          -- battle_forms refused to arm it (a spent id, or a build without the
-          -- arm seam).  Raise nothing for this one: emitting with a stale armed
-          -- id would activate somebody else's gimmick.
-          return false
+    -- The species gate is the OUTER wrapper: battle_forms reads the mon's
+    -- species in BOTH the arm (the G-Max move picker) and the activation (the
+    -- G-Max form), so a Factor-less mon is handed the stand-in across the whole
+    -- focused region and its real species is put back the moment the region
+    -- returns.  A mon WITH the Factor is handed its real species, so an
+    -- eligible one Gigantamaxes exactly as before.
+    local emitted = FN.withFormsSpecies(self, formsMon, function()
+      return FN.focusBattlePlayer(self, formsMon, function()
+        if item and item.id then
+          if not FN.battleFormsArm(item.id) then
+            -- battle_forms refused to arm it (a spent id, or a build without
+            -- the arm seam).  Raise nothing for this one: emitting with a stale
+            -- armed id would activate somebody else's gimmick.
+            return false
+          end
         end
-      end
-      armedBefore = FN.battleFormsArmedId()
-      Runtime.emit("battle.turn_started", { battle = self.battle })
-      return true
+        armedBefore = FN.battleFormsArmedId()
+        Runtime.emit("battle.turn_started", { battle = self.battle })
+        return true
+      end)
     end)
     if emitted == false then return false end
     if formsMon and armedBefore ~= nil then
@@ -8271,8 +8584,14 @@ vec4 effect(vec4 color, Image tex, vec2 tc, vec2 sc) {
     if mon and type(mon.form) == "string" and mon.form ~= "" then
       return "gigantamax"
     end
+    -- The Factor is the gate, not mere eligibility: without it battle_forms is
+    -- handed a stand-in species (FN.withFormsSpecies) and Dynamaxes plainly, so
+    -- the pre-activation announcement and the HP skin must say "dynamax" too --
+    -- otherwise an eligible Factor-less mon would be ANNOUNCED as Gigantamaxing
+    -- and then, correctly, not be.
     local eng = screen.g9dex and screen.g9dex.exports
-    if mon and eng and type(eng.isGigantamaxEligibleSpecies) == "function" then
+    if mon and eng and type(eng.isGigantamaxEligibleSpecies) == "function"
+        and FN.hasGigantamaxFactor(mon) then
       local ok, eligible = pcall(eng.isGigantamaxEligibleSpecies, mon.species)
       if ok and eligible then return "gigantamax" end
     end
@@ -9334,12 +9653,36 @@ vec4 effect(vec4 color, Image tex, vec2 tc, vec2 sc) {
   -- the engine's classic learner, over the white sheet.  Both read lazily --
   -- the battle runs long after every mod's load -- and fail-open to the
   -- modern learner, which is the row's own default.
-  FN.modernMoveLearn = function()
+  -- The scene's own choice rows are read through this ONE normaliser so a
+  -- value shape can never silently flip a row.  The Mod Manager stores a
+  -- choice's VALUE, so the shipped "on"/"off" spellings are what a normal boot
+  -- sees -- but a boot (or save) that hands back a boolean, a number or a
+  -- differently-cased string must mean the same thing (the user's Android
+  -- report: MODERN MOVE LEARN ON + BACKGROUND AUTO still fell to the native
+  -- learner; the Android build reports its rows with a different shape).  ON-
+  -- ish is ON, OFF-ish is OFF, and an unreadable value answers nil so the
+  -- caller can fail open.
+  FN.optionOnOff = function(key)
     local options = mod and mod.options
-    if options and type(options.get) == "function" then
-      local ok, value = pcall(function() return options:get("modern_move_learn") end)
-      if ok and value ~= nil then return value == "on" end
+    if not (options and type(options.get) == "function") then return nil end
+    local ok, value = pcall(function() return options:get(key) end)
+    if not ok or value == nil then return nil end
+    if value == true then return true end
+    if value == false then return false end
+    if type(value) == "number" then return value ~= 0 end
+    if type(value) == "string" then
+      local v = value:lower()
+      if v == "on" or v == "true" or v == "yes" or v == "1" then return true end
+      if v == "off" or v == "false" or v == "no" or v == "0" or v == "" then
+        return false
+      end
     end
+    return nil
+  end
+
+  FN.modernMoveLearn = function()
+    local value = FN.optionOnOff("modern_move_learn")
+    if value ~= nil then return value end
     return true
   end
 
@@ -9438,7 +9781,8 @@ vec4 effect(vec4 color, Image tex, vec2 tc, vec2 sc) {
   -- live battlefield.  Builtin construction matches Screens.build (the same
   -- constructor arguments, the same screenId stamp).
   FN.pushLearner = function(game, mon, moveId, onDone)
-    if not FN.backgroundOff() and FN.modernMoveLearn() then
+    local modernWanted = (not FN.backgroundOff()) and FN.modernMoveLearn()
+    if modernWanted then
       -- g9-gui registers under the engine's own id, so the engine id is the
       -- fallback candidate: the modern path is found by the registry itself,
       -- not only by the published export.
@@ -9449,26 +9793,54 @@ vec4 effect(vec4 color, Image tex, vec2 tc, vec2 sc) {
       end
       local okS, Screens = pcall(require, "src.ui.Screens")
       if okS and type(Screens) == "table" and type(Screens.get) == "function" then
-        for _, id in ipairs(candidates) do
-          local okF, factory = pcall(Screens.get, game, id)
-          if okF and type(factory) == "table" and factory.__modOwned == true
-              and type(factory.new) == "function" then
-            local okB, inst = pcall(factory.new, game, mon, moveId, onDone, "Level_Up")
-            if okB and type(inst) == "table" then
-              inst.screenId = inst.screenId or id
-              game.stack:push(inst)
-              return true
-            end
-            -- A modern learner that really is registered but will not build is
-            -- why a boot asking for it would otherwise fall to the native
-            -- question: leave the reason in the log before the white fallback.
-            if mod and mod.log and type(mod.log.warn) == "function" then
-              pcall(mod.log.warn, mod.log,
-                "g9-Battle-Scene: modern learner '%s' failed to build (%s) "
-                  .. "-- using the classic learner on the white field",
-                tostring(id), tostring(inst))
+        -- Two passes: the second re-resolves after dropping the registry
+        -- cache, so a factory cached BEFORE g9-gui registered its record (a
+        -- load-order race that can differ by platform) can never shadow the
+        -- modern screen for the rest of the session.
+        local found = false
+        for pass = 1, 2 do
+          for _, id in ipairs(candidates) do
+            local okF, factory = pcall(Screens.get, game, id)
+            if okF and type(factory) == "table" and factory.__modOwned == true
+                and type(factory.new) == "function" then
+              found = true
+              local okB, inst = pcall(factory.new, game, mon, moveId, onDone, "Level_Up")
+              if okB and type(inst) == "table" then
+                inst.screenId = inst.screenId or id
+                game.stack:push(inst)
+                return true
+              end
+              -- A modern learner that really is registered but will not build
+              -- is why a boot asking for it would otherwise fall to the native
+              -- question: leave the reason in the log before the white
+              -- fallback.
+              if mod and mod.log and type(mod.log.warn) == "function" then
+                pcall(mod.log.warn, mod.log,
+                  "g9-Battle-Scene: modern learner '%s' failed to build (%s) "
+                    .. "-- using the classic learner on the white field",
+                  tostring(id), tostring(inst))
+              end
             end
           end
+          if pass == 1 and not found
+              and type(Screens.invalidate) == "function" then
+            pcall(Screens.invalidate)
+          else
+            break
+          end
+        end
+        -- The modern row is ON but nothing mod-owned resolved: say so, once,
+        -- with the id we asked for -- the one line that tells a platform whose
+        -- registry/g9-gui differs from the desktop boot why the classic
+        -- learner went up.
+        if not found and mod and mod.log and type(mod.log.warn) == "function"
+            and not FN.__learnerWarned then
+          FN.__learnerWarned = true
+          pcall(mod.log.warn, mod.log,
+            "g9-Battle-Scene: MODERN MOVE LEARN is ON but no modern learner "
+              .. "could be built (g9-gui id=%s; no mod-owned screen in the "
+              .. "registry) -- using the classic learner",
+            tostring(published))
         end
       end
     end
@@ -10715,7 +11087,7 @@ vec4 effect(vec4 color, Image tex, vec2 tc, vec2 sc) {
   function Screen:drawPromptF()
     local ask = self.prompt
     if not ask then return end
-    FN.drawWrapped(ask.text, self.fTextX, self.fTextY, self.fChars)
+    FN.drawWrapped(FN.localize(ask.text), self.fTextX, self.fTextY, self.fChars)
   end
 
   -- E: the two labels where FIGHT/BAG/PKMN/RUN normally sit, same rows,
@@ -11578,7 +11950,7 @@ vec4 effect(vec4 color, Image tex, vec2 tc, vec2 sc) {
         end
         love.graphics.setColor(0, 0, 0, 1)
         if self.phase == "intro" then
-          FN.drawWrapped(self.currentMessage or "", self.fTextX, self.fTextY, self.fChars)
+          FN.drawWrapped(FN.localize(self.currentMessage or ""), self.fTextX, self.fTextY, self.fChars)
         elseif self.phase == "actionMenu" then
           self:drawActionMenuF()
         elseif self.phase == "moveSelect" then
@@ -11592,9 +11964,9 @@ vec4 effect(vec4 color, Image tex, vec2 tc, vec2 sc) {
         elseif self.phase == PROMPT_PHASE then
           self:drawPromptF()
         elseif self.phase == "resolving" then
-          FN.drawWrapped(self.currentMessage or "", self.fTextX, self.fTextY, self.fChars)
+          FN.drawWrapped(FN.localize(self.currentMessage or ""), self.fTextX, self.fTextY, self.fChars)
         elseif self.phase == "over" then
-          FN.drawWrapped(self.overMessage or "", self.fTextX, self.fTextY, self.fChars)
+          FN.drawWrapped(FN.localize(self.overMessage or ""), self.fTextX, self.fTextY, self.fChars)
         end
       end)
 
@@ -11863,6 +12235,12 @@ vec4 effect(vec4 color, Image tex, vec2 tc, vec2 sc) {
   function Screen:sgbPalettes()
     return { { colors = false, x = 0, y = 0, w = CANVAS_W, h = CANVAS_H } }
   end
+
+  -- COLOR PROTECTION (g9-gui): the scene is a modern UI, so g9-gui's toggle
+  -- keeps the native COLORS / COLOR display mode off it too -- its Gen 1
+  -- opt-out above already covers this engine, and the flag extends that to the
+  -- Gen 2 CLASSIC present pass, which has no per-state opt-out of its own.
+  Screen.__g9modern = true
 
   -- The scene paints its own opaque field edge to edge; a window that is not
   -- 16:9 gets the display mode's paper in its bars rather than black, which

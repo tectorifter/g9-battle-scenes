@@ -200,14 +200,39 @@ return function(mod)
     return nil
   end
 
+  -- The symbol supplement (assets/fonts/g9-symbols.ttf): U+2640 FEMALE SIGN,
+  -- U+2642 MALE SIGN and U+2605 BLACK STAR -- the glyphs a translated name can
+  -- carry that Saira does not (Nidoran FEMALE/MALE, a held item's star; see
+  -- g9-gui's ui/translation.lua).  It is attached to every baked face as a
+  -- LOVE 11.3 Font:setFallbacks fallback, so a battle HUD, a party row or a
+  -- move name renders the symbol instead of a tofu box.  Built lazily per size;
+  -- without setFallbacks or the file the glyphs are simply missing.
+  local FONT_SYMBOLS = "assets/fonts/g9-symbols.ttf"
+  local symbolFonts = {}
+  local function symbolAt(size)
+    local hit = symbolFonts[size]
+    if hit ~= nil then return hit or nil end
+    local f = buildFont(FONT_SYMBOLS, size)
+    symbolFonts[size] = f or false
+    return f
+  end
+  local function withSymbols(font, size)
+    if not (font and type(size) == "number" and font.setFallbacks) then
+      return font
+    end
+    local sym = symbolAt(size)
+    if sym then pcall(font.setFallbacks, font, sym) end
+    return font
+  end
+
   -- Built once and kept: a battle allocates a Font per call otherwise.
   -- `game` is unused for now (the Saira bake is generation-independent) but
   -- kept in the signature so a later per-game tweak has somewhere to land.
   function F.fonts()
     if fonts then return fonts end
     local function face(rel, size)
-      return buildFont(rel, size) or buildFont(FONT_REGULAR, size)
-        or love.graphics.newFont(size)
+      return withSymbols(buildFont(rel, size) or buildFont(FONT_REGULAR, size)
+        or love.graphics.newFont(size), size)
     end
     fonts = {
       body = face(FONT_REGULAR, SIZE.body),
